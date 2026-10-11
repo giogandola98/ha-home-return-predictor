@@ -30,7 +30,7 @@ tramite il blueprint incluso, ma i sensori sono utilizzabili in qualsiasi automa
 13. [Plugin termici: confronto e combinazione consigliata](#plugin-termici-confronto-e-combinazione-consigliata)
 14. [Esempi di automazioni](#esempi-di-automazioni)
 15. [I primi giorni di apprendimento](#i-primi-giorni-di-apprendimento)
-16. [Modello sfidante scikit-learn (opzionale)](#modello-sfidante-scikit-learn-opzionale)
+16. [Modello sfidante (gradient boosting, opzionale)](#modello-sfidante-gradient-boosting-opzionale)
 17. [Per sviluppatori: simulazione e test](#per-sviluppatori-simulazione-e-test)
 18. [Limiti noti](#limiti-noti)
 
@@ -181,7 +181,7 @@ Opzioni (Configura):
 | Emivita | 28 giorni | Quanto velocemente si dimenticano le vecchie abitudini |
 | Intervallo di aggiornamento | 2 min | Ricalcolo periodico (oltre agli aggiornamenti sugli eventi) |
 | Calendario festività | — | `calendar.*` opzionale: i giorni con eventi sono trattati come festivi |
-| Modello sfidante scikit-learn | off | Installa scikit-learn e addestra in background un modello alternativo, usato solo se migliore (vedi [sotto](#modello-sfidante-scikit-learn-opzionale)) |
+| Modello sfidante (gradient boosting, numpy) | off | Addestra in background un modello alternativo con numpy, usato solo se migliore (vedi [sotto](#modello-sfidante-gradient-boosting-opzionale)) |
 
 ---
 
@@ -194,7 +194,7 @@ Per ogni persona `<p>`:
 | `binary_sensor.<p>_returning` | binary | On se la probabilità supera la soglia. Attributi: `probability`, `eta`, `mode`, `advisory`, `reason`, `active_model` |
 | `sensor.<p>_return_probability` | % | Probabilità di rientro entro l'orizzonte (100 se in casa) |
 | `sensor.<p>_return_eta` | timestamp | ETA stimata (pubblicata mentre la persona è fuori) |
-| `sensor.<p>_model_maturity` | % | Maturità. Attributi: `episodes`, `brier_score`, `baseline_brier_score`, `brier_skill_score`, `active_model`, `candidate_brier`, `challenger_enabled`, `sklearn_available` |
+| `sensor.<p>_model_maturity` | % | Maturità. Attributi: `episodes`, `brier_score`, `baseline_brier_score`, `brier_skill_score`, `active_model`, `candidate_brier`, `challenger_enabled`, `numpy_available` (`sklearn_available`: alias deprecato) |
 | `sensor.<p>_return_reason` | testo | Spiegazione leggibile della stima corrente |
 | `select.<p>_mode` | select | `auto` / `learning` / `live` |
 
@@ -479,33 +479,57 @@ turni variabili di più. Puoi forzare `live` dal select se ti fidi prima.
 
 ---
 
-## Modello sfidante scikit-learn (opzionale)
+## Modello sfidante (gradient boosting, opzionale)
 
 Schema **champion/challenger**: il modello integrato (bayesiano a kernel, Python
 puro) resta sempre il *campione*. Se abiliti l'opzione **Modello sfidante
-scikit-learn** (disattivata di default), l'integrazione addestra in background uno
-*sfidante* (`HistGradientBoostingClassifier`) sulle previsioni passate già
-verificate, e lo usa **solo quando è dimostrabilmente migliore**.
+(gradient boosting, numpy)** (disattivata di default), l'integrazione addestra in
+background uno *sfidante* sulle previsioni passate già verificate, e lo usa **solo
+quando è dimostrabilmente migliore**.
 
-- **Installazione a runtime**: all'attivazione Home Assistant installa
-  `scikit-learn>=1.5` (circa 100 MB, rispettando i vincoli di versione di HA). Se
-  l'installazione fallisce viene scritto un avviso nel log e si continua con il
-  modello integrato; nulla si rompe.
-- **Leggero anche su un N100**: un solo thread, modello piccolo (≤ 100 alberi da ≤ 15
-  foglie), addestramento in background al massimo ogni 6 ore (o dopo molte nuove
-  previsioni verificate), tipicamente ~1 s; un solo addestramento alla volta, mai
-  nel loop di Home Assistant. Il modello non viene salvato: si riaddestra dal log
-  persistito dopo il riavvio.
+**Perché non scikit-learn.** Le prime versioni usavano
+`HistGradientBoostingClassifier` di scikit-learn. In un'installazione reale su Home
+Assistant OS (Alpine Linux, musl, Python 3.14) l'installazione è fallita:
+scikit-learn non pubblica wheel *musllinux*, quindi pip prova a compilarlo dai
+sorgenti e si ferma (niente meson né compilatore nel container). numpy invece ha
+wheel musl ed è già una dipendenza di Home Assistant (versione fissata nei suoi
+vincoli). Lo sfidante è quindi ora un gradient boosting scritto in casa che usa solo
+numpy (`hrp_core/gbm.py`).
+
+- **Cos'è**: gradient boosting a istogrammi per la log-loss binaria: feature
+  discretizzate in ≤ 64 intervalli per quantili, alberi di profondità ≤ 3 con almeno
+  20 campioni per foglia, learning rate 0.1, ≤ 80 alberi, regolarizzazione L2 sulle
+  foglie, pesi per recenza. Le feature sono le stesse del log delle previsioni
+  (probabilità a priori, rapporto di verosimiglianza GPS, tempo fuori casa, ora di
+  uscita e ora attuale, festivo, distanza, velocità, probabilità bayesiana).
+- **Niente da installare (di solito)**: se numpy è già importabile, come nelle
+  normali installazioni di Home Assistant, non viene tentata alcuna installazione.
+  Altrimenti viene richiesto `numpy` senza versione (la risolvono i vincoli di HA).
+  Se fallisce, un avviso nel log e si continua con il modello integrato; nulla si
+  rompe.
+- **Costo su un Intel N100**: un solo thread, addestramento in background al massimo
+  ogni 6 ore (o dopo 150 nuove previsioni verificate), un solo addestramento alla
+  volta, mai nel loop di Home Assistant. Misurato su un N100 (simulazione di 120
+  giorni, log di 3000 previsioni): in media ~0.35 s (max ~0.5 s) per addestramento (valutazione +
+  riaddestramento completo). La previsione è Python puro (< 0.1 ms) e non usa numpy.
+- **Sopravvive al riavvio**: gli alberi esportati sono un piccolo JSON (circa 40 KB per
+  persona) salvato con lo stato, quindi uno sfidante promosso continua a servire
+  subito dopo un riavvio, senza aspettare il riaddestramento.
 - **Cambio automatico solo se migliore**: lo sfidante diventa attivo solo se, su dati
-  recenti **non visti in addestramento**, ha un Brier score migliore di almeno il
-  **3 %** per **2 valutazioni consecutive** e con almeno **400 previsioni
-  verificate**. Se poi peggiora, si torna **subito** al modello integrato.
+  recenti **non visti in addestramento** (l'ultimo 20 % delle previsioni verificate),
+  ha un Brier score migliore di almeno il **3 %** per **2 valutazioni consecutive** e
+  con almeno **400 previsioni verificate**. Se poi fa peggio del modello integrato,
+  si torna **subito** al modello integrato.
 - **Quale modello è attivo**: guarda gli attributi di
-  `sensor.<p>_model_maturity`: `active_model` (`kernel_bayes` = integrato),
-  `candidate_brier` (Brier di ogni candidato sull'ultima valutazione; più basso è
-  meglio), `challenger_enabled`, `sklearn_available`. `active_model` compare anche
-  su `binary_sensor.<p>_returning`, su `sensor.<p>_return_reason` (e nel testo
-  della spiegazione) e nei diagnostics.
+  `sensor.<p>_model_maturity`: `active_model` (`kernel_bayes` = integrato,
+  `learned_fusion` = fusione appresa, `gbm` = sfidante), `candidate_brier` (Brier di
+  ogni candidato sull'ultima valutazione; più basso è meglio), `challenger_enabled`,
+  `numpy_available` (`sklearn_available` resta per una versione come alias
+  deprecato). `active_model` compare anche su `binary_sensor.<p>_returning`, su
+  `sensor.<p>_return_reason` (e nel testo della spiegazione) e nei diagnostics.
+  Lo stato salvato con il vecchio nome `sklearn_gbm` viene letto come `gbm`; la
+  chiave dell'opzione (`enable_sklearn_challenger`) resta invariata per conservare
+  l'impostazione esistente.
 
 ---
 
@@ -517,6 +541,7 @@ puro, senza import di Home Assistant.
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements_test.txt
 .venv/bin/python scripts/simulate.py          # mesi di dati sintetici, curva di accuratezza/maturità
+.venv/bin/python scripts/simulate.py --gbm    # anche lo sfidante gradient boosting (tempi di addestramento)
 .venv/bin/python -m pytest                    # tutti i test
 .venv/bin/python -m pytest tests/model -q     # solo modello e preset_logic (senza HA)
 .venv/bin/python -m pytest tests/blueprint -q # blueprint VTherm eseguito in un HA di test
