@@ -449,6 +449,9 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         self.challenger_enabled = enabled
         for runtime in self.persons.values():
             await self._async_model_job(runtime, runtime.model.enable_challenger, enabled)
+        # Entities read these flags from the coordinator: show them right away.
+        if self.data is not None:
+            self.async_update_listeners()
         if enabled:
             _LOGGER.debug("gradient-boosting challenger enabled")
             await self.async_request_refresh()
