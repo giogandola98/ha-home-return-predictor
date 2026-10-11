@@ -1,0 +1,136 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Home Return Predictor",
+        "description": "Choisissez les personnes à suivre et la zone qui représente le domicile.",
+        "data": {
+          "persons": "Personnes",
+          "home_zone": "Zone du domicile"
+        },
+        "data_description": {
+          "persons": "Entités person dont le retour au domicile sera prédit.",
+          "home_zone": "Zone utilisée comme domicile (la distance et la présence sont calculées par rapport à elle)."
+        }
+      }
+    },
+    "error": {
+      "no_persons": "Sélectionnez au moins une personne."
+    },
+    "abort": {
+      "already_configured": "Home Return Predictor est déjà configuré."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Options de Home Return Predictor",
+        "data": {
+          "persons": "Personnes",
+          "return_threshold": "Seuil de retour",
+          "maturity_threshold": "Seuil de maturité",
+          "horizon_minutes": "Horizon de prédiction",
+          "half_life_days": "Demi-vie de l'historique",
+          "update_interval_minutes": "Intervalle de mise à jour",
+          "holiday_calendar": "Calendrier des jours fériés",
+          "enable_sklearn_challenger": "Modèle challenger (gradient boosting, numpy)"
+        },
+        "data_description": {
+          "persons": "Entités person dont le retour au domicile sera prédit.",
+          "return_threshold": "Probabilité (0-1) au-delà de laquelle une personne est considérée comme sur le retour.",
+          "maturity_threshold": "Maturité du modèle (0-1) requise pour que le mode automatique passe en direct.",
+          "horizon_minutes": "Fenêtre, en minutes, dans laquelle un retour est prédit.",
+          "half_life_days": "Les habitudes plus anciennes pèsent moitié moins après ce nombre de jours.",
+          "update_interval_minutes": "Fréquence de recalcul des prédictions, en minutes.",
+          "holiday_calendar": "Calendrier facultatif dont les événements marquent les jours fériés.",
+          "enable_sklearn_challenger": "Expérimental. Entraîne en arrière-plan un challenger gradient boosting avec numpy (déjà inclus dans Home Assistant sur la plupart des installations ; installé à l'exécution sinon). Un seul thread, toutes les quelques heures, moins d'une seconde sur un Intel N100. Il n'est utilisé que tant qu'il bat le modèle intégré sur des prédictions récentes et inédites ; sinon le modèle intégré continue de fonctionner."
+        }
+      }
+    },
+    "error": {
+      "no_persons": "Sélectionnez au moins une personne."
+    }
+  },
+  "device": {
+    "house": {
+      "name": "Maison"
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "returning": {
+        "name": "Sur le retour"
+      },
+      "house_someone_returning": {
+        "name": "Quelqu'un rentre"
+      }
+    },
+    "select": {
+      "mode": {
+        "name": "Mode",
+        "state": {
+          "auto": "Automatique",
+          "learning": "Apprentissage",
+          "live": "Direct"
+        }
+      }
+    },
+    "sensor": {
+      "return_probability": {
+        "name": "Probabilité de retour"
+      },
+      "return_eta": {
+        "name": "Heure de retour prévue"
+      },
+      "model_maturity": {
+        "name": "Maturité du modèle"
+      },
+      "return_reason": {
+        "name": "Raison du retour"
+      },
+      "house_return_probability": {
+        "name": "Probabilité de retour"
+      },
+      "house_next_return_eta": {
+        "name": "Prochaine heure de retour prévue"
+      }
+    }
+  },
+  "services": {
+    "retrain": {
+      "name": "Réentraîner",
+      "description": "Reconstruit les modèles à partir de l'historique du recorder.",
+      "fields": {
+        "person": {
+          "name": "Personne",
+          "description": "Personnes à réentraîner (toutes si vide)."
+        }
+      }
+    },
+    "reset": {
+      "name": "Réinitialiser",
+      "description": "Oublie tout ce qui a été appris pour les personnes indiquées.",
+      "fields": {
+        "person": {
+          "name": "Personne",
+          "description": "Personnes à réinitialiser."
+        }
+      }
+    },
+    "export_diagnostics": {
+      "name": "Exporter les diagnostics",
+      "description": "Écrit un fichier JSON de diagnostics dans le dossier de configuration."
+    }
+  },
+  "exceptions": {
+    "not_loaded": {
+      "message": "Home Return Predictor n'est pas configuré."
+    },
+    "unknown_person": {
+      "message": "{entity_id} n'est pas suivi par Home Return Predictor."
+    },
+    "update_failed": {
+      "message": "La prédiction a échoué pour {person} : {error}"
+    }
+  }
+}

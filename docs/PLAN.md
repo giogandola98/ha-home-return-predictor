@@ -19,7 +19,7 @@ ha-home-return-predictor/
 │   ├── entity.py              # base CoordinatorEntity, DeviceInfo per person + "house" device
 │   ├── sensor.py / binary_sensor.py / select.py
 │   ├── diagnostics.py         # async_get_config_entry_diagnostics (redacted coordinates)
-│   ├── services.yaml, strings.json, icons.json, translations/{en,it}.json
+│   ├── services.yaml, strings.json, icons.json, translations/{en,it,fr,de}.json
 │   └── hrp_core/              # PURE PYTHON, stdlib only, relative imports only
 │       ├── base.py            # ReturnModel ABC + dataclasses (THE contract, written first)
 │       ├── episodes.py        # presence transitions -> AbsenceEpisode, filters (<10 min, >36 h)
