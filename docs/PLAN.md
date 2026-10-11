@@ -182,3 +182,27 @@ HA side:
   back to the single house ETA/probability when the attribute is missing.
 - R3 pending observe tasks are awaited before the final save on unload.
 - R4 chunked recorder bootstrap ignores the synthetic first state of each chunk for fixes.
+
+## 8. Plan: replace scikit-learn with an in-house numpy GBM (after first real install)
+
+Real-world finding (logs/ from the user's HA OS, Python 3.14, Alpine/musl): scikit-learn
+publishes no musllinux wheels at all, so HA tries to compile it and fails (no meson /
+compiler). numpy and scipy do ship musl wheels, and HA pins numpy in package_constraints.
+
+- G1 `hrp_core/gbm.py`: histogram gradient boosting for binary log-loss in numpy only.
+  Quantile binning (≤ 64 bins), depth-limited trees (max_depth 3, min_samples_leaf 20),
+  shrinkage 0.1, ≤ 80 trees, L2 on leaf values, sample weights. Vectorised histogram
+  building (np.bincount) so the GIL is released and an N100 trains 3000×11 in < 1 s.
+  Trees exported to plain Python for serving (no numpy at predict time), as today.
+- G2 `challenger.py` uses `gbm.py`; candidate renamed `gbm` (stored `sklearn_gbm` selection
+  state maps to `gbm`). `numpy_available()` replaces `sklearn_available()` (keep the old
+  name as alias for one release). Selection rules unchanged.
+- G3 HA: option renamed in UI to "challenger model (gradient boosting)" (same config key
+  for compatibility); runtime requirement becomes `numpy` (resolved by HA's constraint
+  to the version HA already pins, musl wheel available). Failure → warning, built-in model.
+  No install attempt at all if numpy is already importable.
+- G4 tests: GBM learns a non-linear synthetic function better than logistic; matches
+  sklearn's HistGradientBoosting Brier within a tolerance in a dev-only test (skipped
+  when sklearn missing); timing < 1 s for 3000 rows; challenger/selection tests ported;
+  scikit-learn removed from requirements_test (kept optional for the comparison test).
+- G5 README + simulate.py `--gbm` (keep `--sklearn` as alias).
