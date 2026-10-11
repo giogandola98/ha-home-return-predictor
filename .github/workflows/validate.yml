@@ -21,9 +21,8 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
-          # Private repo: HACS cannot download hacs.json / manifest.json without auth, so
-          # those two checks run offline below (and hassfest validates the manifest).
-          ignore: brands description topics hacsjson integration_manifest
+          # No brand assets in home-assistant/brands yet.
+          ignore: brands
 
   hacs-offline:
     runs-on: ubuntu-latest

@@ -92,7 +92,7 @@ Per person, one `KernelBayesReturnModel` implementing `ReturnModel`:
         │
         ▼
  integrate & run full suite (me) -> independent verification agent (did not write code)
- -> code-review skill -> fixes -> GitHub private repo, small commits, tag v0.1.0
+ -> code-review skill -> fixes -> GitHub repo (private at first, later made public), small commits, tag v0.1.0
 ```
 
 ## 4. Verification per piece

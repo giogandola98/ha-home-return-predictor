@@ -9,7 +9,7 @@ tramite il blueprint incluso, ma i sensori sono utilizzabili in qualsiasi automa
 
 - Dominio: `home_return_predictor`
 - Nessuna dipendenza esterna, nessun servizio cloud: tutto gira in locale.
-- Si installa tramite HACS (repository custom, privato) o copia manuale.
+- Si installa tramite HACS (repository personalizzato) o copia manuale.
 
 ---
 
@@ -148,24 +148,12 @@ maturità, e attiva il blueprint quando sei convinto.
 
 ## Installazione
 
-### Tramite HACS (repository privato)
+### Tramite HACS
 
-Il repository `giogandola98/ha-home-return-predictor` è **privato**. HACS può
-scaricarlo solo se il token GitHub configurato in HACS ha accesso al repository:
-
-1. HACS usa il token GitHub ottenuto durante la sua configurazione iniziale
-   (login GitHub). L'**account GitHub di quel token deve avere accesso** al repo
-   privato (proprietario o collaboratore). Se HACS è stato configurato con un altro
-   account, riconfiguralo (Impostazioni → Dispositivi e servizi → HACS → Riconfigura)
-   oppure aggiungi quell'account come collaboratore del repo.
-2. HACS → menu ⋮ → **Repository personalizzati**.
-3. URL: `https://github.com/giogandola98/ha-home-return-predictor`, categoria
+1. HACS → menu ⋮ → **Repository personalizzati**.
+2. URL: `https://github.com/giogandola98/ha-home-return-predictor`, categoria
    **Integrazione** → Aggiungi.
-4. Cerca "Home Return Predictor" → Scarica → **riavvia Home Assistant**.
-
-Se HACS risponde "repository non trovato" o non mostra versioni, il suo token non
-vede i repo privati: usa l'installazione manuale qui sotto (gli aggiornamenti
-andranno ripetuti a mano) oppure rendi pubblico il repo.
+3. Cerca "Home Return Predictor" → Scarica → **riavvia Home Assistant**.
 
 ### Manuale
 
@@ -257,15 +245,16 @@ advisory: false
 | `blueprints/automation/home_return_predictor/vtherm_zone_preheat.yaml` | Sceglie il preset VTherm di **una zona** (un'automazione per zona) |
 | `blueprints/automation/home_return_predictor/presence_bridge.yaml` | Copia "qualcuno sta tornando" (e opzionalmente "qualcuno è in casa") in un `input_boolean`, per strumenti che accettano solo un'entità on/off |
 
-**Importazione.** Il pulsante/URL "Importa blueprint" di Home Assistant **non funziona
-con un repository privato** (HA scarica senza autenticazione). Copia i file YAML in:
+**Importazione.** Usa Impostazioni → Automazioni → Blueprint → **Importa blueprint**
+con questi URL:
 
-```
-<config>/blueprints/automation/home_return_predictor/
-```
+- `https://github.com/giogandola98/ha-home-return-predictor/blob/main/blueprints/automation/home_return_predictor/vtherm_zone_preheat.yaml`
+- `https://github.com/giogandola98/ha-home-return-predictor/blob/main/blueprints/automation/home_return_predictor/presence_bridge.yaml`
 
-poi Impostazioni → Automazioni → Blueprint → (ricarica) → crea un'automazione per
-ogni zona.
+[![Importa VTherm zone preheat](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https://github.com/giogandola98/ha-home-return-predictor/blob/main/blueprints/automation/home_return_predictor/vtherm_zone_preheat.yaml)
+
+In alternativa copia i file YAML in `<config>/blueprints/automation/home_return_predictor/`.
+Poi crea un'automazione per ogni zona.
 
 ### Input del blueprint VTherm
 

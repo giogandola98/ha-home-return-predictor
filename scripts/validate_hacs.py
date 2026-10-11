@@ -1,8 +1,4 @@
-"""Offline HACS checks for this repository.
-
-The official ``hacs/action`` cannot download files from a private repository, so its
-``hacsjson`` and ``integration_manifest`` checks are replaced by this script in CI.
-"""
+"""Offline HACS checks for this repository (fast local complement to ``hacs/action``)."""
 
 from __future__ import annotations
 
