@@ -142,3 +142,31 @@ promoted automatically only when it beats the stdlib model.
    hysteresis, no-sklearn fallback; integration test for the option and failed install;
    simulate.py `--sklearn` flag prints which model is active per day; timing check
    that one training on 5000 rows takes < 2 s.
+
+## 6. Fix plan after independent verification + code review
+
+Model side (hrp_core, tests/model):
+- M1 `load_history(..., replace: bool = False)`: default MERGES recorder episodes with stored
+  ones (dedupe by departure within 10 min) and keeps calibrator counts; `replace=True` = old
+  behaviour (used by reset-from-recorder only). Retrain no longer wipes months of learning.
+- M2 learned fusion: the weights evaluated by the selector are the weights served.
+- M3 `observe_transition` stays cheap (no stacker refit / sklearn probe); refits move to `resolve`.
+- M4 compact persistence: prediction log stored as rounded column arrays; target < 400 KB/person.
+- M5 training split for short locks: `challenger_snapshot() -> Any` (cheap copy),
+  `fit_challenger(snapshot, now) -> Any` (static-ish, heavy, touches no model state),
+  `apply_challenger(result) -> dict` (cheap). `train_challenger` remains as a wrapper.
+
+HA side:
+- H1 all model calls (incl. observe_transition) in executor under the per-person lock;
+  training uses M5 so locks are held only for snapshot/apply.
+- H2 listener unsubscribe registered with `config_entry.async_on_unload`.
+- H3 one return event per absence (keyed on left_at, persisted) + off-hysteresis 0.05.
+- H4 save only when state changed, delay 10 min, final save on unload/stop.
+- H5 house ETA published from away persons with p >= 0.25 (earliest; attribute `eta_person`),
+  person ETA published whenever away, so the blueprint medium tier works.
+- H6 unknown-state persons excluded from prediction/aggregation.
+- H7 history: `last_changed` for transitions, multi-day holiday expansion, inaccurate fix in
+  non-default zone = no information; chunked queries (7-day windows), fixes downsampled.
+- H8 bootstrap fixes left_at from history when no stored data.
+- H9 reason text reads `shift_label`; hacs.json minimum HA raised to the tested range.
+- Docs/CI: README baseline description, CI runs the whole test suite (incl. blueprint tests).
