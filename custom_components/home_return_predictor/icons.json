@@ -1,0 +1,37 @@
+{
+  "entity": {
+    "binary_sensor": {
+      "returning": {
+        "default": "mdi:home-import-outline",
+        "state": { "on": "mdi:home-import-outline", "off": "mdi:home-outline" }
+      },
+      "house_someone_returning": {
+        "default": "mdi:home-account",
+        "state": { "on": "mdi:home-import-outline", "off": "mdi:home-account" }
+      }
+    },
+    "select": {
+      "mode": {
+        "default": "mdi:tune-variant",
+        "state": {
+          "auto": "mdi:auto-mode",
+          "learning": "mdi:school-outline",
+          "live": "mdi:play-circle-outline"
+        }
+      }
+    },
+    "sensor": {
+      "return_probability": { "default": "mdi:percent-circle-outline" },
+      "return_eta": { "default": "mdi:clock-end" },
+      "model_maturity": { "default": "mdi:brain" },
+      "return_reason": { "default": "mdi:text-box-search-outline" },
+      "house_return_probability": { "default": "mdi:home-percent-outline" },
+      "house_next_return_eta": { "default": "mdi:home-clock-outline" }
+    }
+  },
+  "services": {
+    "retrain": { "service": "mdi:school" },
+    "reset": { "service": "mdi:restore" },
+    "export_diagnostics": { "service": "mdi:file-export-outline" }
+  }
+}

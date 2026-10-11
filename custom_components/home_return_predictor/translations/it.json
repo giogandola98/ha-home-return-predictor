@@ -1,0 +1,134 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Home Return Predictor",
+        "description": "Scegli le persone da seguire e la zona che rappresenta casa.",
+        "data": {
+          "persons": "Persone",
+          "home_zone": "Zona casa"
+        },
+        "data_description": {
+          "persons": "Entità persona di cui prevedere il rientro.",
+          "home_zone": "Zona usata come casa (distanza e presenza sono calcolate rispetto a essa)."
+        }
+      }
+    },
+    "error": {
+      "no_persons": "Seleziona almeno una persona."
+    },
+    "abort": {
+      "already_configured": "Home Return Predictor è già configurato."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Opzioni Home Return Predictor",
+        "data": {
+          "persons": "Persone",
+          "return_threshold": "Soglia di rientro",
+          "maturity_threshold": "Soglia di maturità",
+          "horizon_minutes": "Orizzonte di previsione",
+          "half_life_days": "Emivita dello storico",
+          "update_interval_minutes": "Intervallo di aggiornamento",
+          "holiday_calendar": "Calendario festività"
+        },
+        "data_description": {
+          "persons": "Entità persona di cui prevedere il rientro.",
+          "return_threshold": "Probabilità (0-1) oltre la quale una persona è considerata in rientro.",
+          "maturity_threshold": "Maturità del modello (0-1) richiesta perché la modalità automatica passi a operativa.",
+          "horizon_minutes": "Finestra, in minuti, entro cui si prevede il rientro.",
+          "half_life_days": "Le abitudini più vecchie pesano la metà dopo questo numero di giorni.",
+          "update_interval_minutes": "Ogni quanti minuti ricalcolare le previsioni.",
+          "holiday_calendar": "Calendario opzionale i cui eventi indicano i giorni festivi."
+        }
+      }
+    },
+    "error": {
+      "no_persons": "Seleziona almeno una persona."
+    }
+  },
+  "device": {
+    "house": {
+      "name": "Casa"
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "returning": {
+        "name": "In rientro"
+      },
+      "house_someone_returning": {
+        "name": "Qualcuno in rientro"
+      }
+    },
+    "select": {
+      "mode": {
+        "name": "Modalità",
+        "state": {
+          "auto": "Automatica",
+          "learning": "Apprendimento",
+          "live": "Operativa"
+        }
+      }
+    },
+    "sensor": {
+      "return_probability": {
+        "name": "Probabilità di rientro"
+      },
+      "return_eta": {
+        "name": "Orario di rientro"
+      },
+      "model_maturity": {
+        "name": "Maturità del modello"
+      },
+      "return_reason": {
+        "name": "Motivo del rientro"
+      },
+      "house_return_probability": {
+        "name": "Probabilità di rientro"
+      },
+      "house_next_return_eta": {
+        "name": "Prossimo rientro"
+      }
+    }
+  },
+  "services": {
+    "retrain": {
+      "name": "Riaddestra",
+      "description": "Ricostruisce i modelli dallo storico del recorder.",
+      "fields": {
+        "person": {
+          "name": "Persona",
+          "description": "Persone da riaddestrare (tutte se vuoto)."
+        }
+      }
+    },
+    "reset": {
+      "name": "Azzera",
+      "description": "Dimentica tutto ciò che è stato appreso per le persone indicate.",
+      "fields": {
+        "person": {
+          "name": "Persona",
+          "description": "Persone da azzerare."
+        }
+      }
+    },
+    "export_diagnostics": {
+      "name": "Esporta diagnostica",
+      "description": "Scrive un file JSON di diagnostica nella cartella di configurazione."
+    }
+  },
+  "exceptions": {
+    "not_loaded": {
+      "message": "Home Return Predictor non è configurato."
+    },
+    "unknown_person": {
+      "message": "{entity_id} non è seguito da Home Return Predictor."
+    },
+    "update_failed": {
+      "message": "Previsione non riuscita per {person}: {error}"
+    }
+  }
+}

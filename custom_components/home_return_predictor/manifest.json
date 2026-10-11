@@ -1,0 +1,14 @@
+{
+  "domain": "home_return_predictor",
+  "name": "Home Return Predictor",
+  "after_dependencies": ["recorder"],
+  "codeowners": ["@giogandola98"],
+  "config_flow": true,
+  "dependencies": ["person", "zone"],
+  "documentation": "https://github.com/giogandola98/ha-home-return-predictor",
+  "integration_type": "service",
+  "iot_class": "calculated",
+  "issue_tracker": "https://github.com/giogandola98/ha-home-return-predictor/issues",
+  "requirements": [],
+  "version": "0.1.0"
+}

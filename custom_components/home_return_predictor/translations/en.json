@@ -1,0 +1,134 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Home Return Predictor",
+        "description": "Choose the people to track and the zone that represents home.",
+        "data": {
+          "persons": "People",
+          "home_zone": "Home zone"
+        },
+        "data_description": {
+          "persons": "Person entities whose return home will be predicted.",
+          "home_zone": "Zone used as home (distance and presence are computed against it)."
+        }
+      }
+    },
+    "error": {
+      "no_persons": "Select at least one person."
+    },
+    "abort": {
+      "already_configured": "Home Return Predictor is already configured."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Home Return Predictor options",
+        "data": {
+          "persons": "People",
+          "return_threshold": "Return threshold",
+          "maturity_threshold": "Maturity threshold",
+          "horizon_minutes": "Prediction horizon",
+          "half_life_days": "History half-life",
+          "update_interval_minutes": "Update interval",
+          "holiday_calendar": "Holiday calendar"
+        },
+        "data_description": {
+          "persons": "Person entities whose return home will be predicted.",
+          "return_threshold": "Probability (0-1) above which a person is considered returning.",
+          "maturity_threshold": "Model maturity (0-1) required for automatic mode to switch to live.",
+          "horizon_minutes": "Window, in minutes, within which a return is predicted.",
+          "half_life_days": "Older habits weigh half after this many days.",
+          "update_interval_minutes": "How often predictions are recomputed, in minutes.",
+          "holiday_calendar": "Optional calendar whose events mark holidays."
+        }
+      }
+    },
+    "error": {
+      "no_persons": "Select at least one person."
+    }
+  },
+  "device": {
+    "house": {
+      "name": "House"
+    }
+  },
+  "entity": {
+    "binary_sensor": {
+      "returning": {
+        "name": "Returning"
+      },
+      "house_someone_returning": {
+        "name": "Someone returning"
+      }
+    },
+    "select": {
+      "mode": {
+        "name": "Mode",
+        "state": {
+          "auto": "Automatic",
+          "learning": "Learning",
+          "live": "Live"
+        }
+      }
+    },
+    "sensor": {
+      "return_probability": {
+        "name": "Return probability"
+      },
+      "return_eta": {
+        "name": "Return ETA"
+      },
+      "model_maturity": {
+        "name": "Model maturity"
+      },
+      "return_reason": {
+        "name": "Return reason"
+      },
+      "house_return_probability": {
+        "name": "Return probability"
+      },
+      "house_next_return_eta": {
+        "name": "Next return ETA"
+      }
+    }
+  },
+  "services": {
+    "retrain": {
+      "name": "Retrain",
+      "description": "Rebuild models from recorder history.",
+      "fields": {
+        "person": {
+          "name": "Person",
+          "description": "People to retrain (all when empty)."
+        }
+      }
+    },
+    "reset": {
+      "name": "Reset",
+      "description": "Forget everything learnt for the given people.",
+      "fields": {
+        "person": {
+          "name": "Person",
+          "description": "People to reset."
+        }
+      }
+    },
+    "export_diagnostics": {
+      "name": "Export diagnostics",
+      "description": "Write a diagnostics JSON file to the configuration folder."
+    }
+  },
+  "exceptions": {
+    "not_loaded": {
+      "message": "Home Return Predictor is not set up."
+    },
+    "unknown_person": {
+      "message": "{entity_id} is not tracked by Home Return Predictor."
+    },
+    "update_failed": {
+      "message": "Prediction failed for {person}: {error}"
+    }
+  }
+}
