@@ -30,7 +30,7 @@ jobs:
       - run: pip install -r requirements_test.txt
       - name: Pure model tests (no Home Assistant)
         run: pytest tests/model -q
-      - name: Integration tests
-        run: pytest tests/integration -q
+      - name: Integration and blueprint tests
+        run: pytest tests/integration tests/blueprint -q
       - name: Simulation smoke test
         run: python scripts/simulate.py --days 45 --seed 1

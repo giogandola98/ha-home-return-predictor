@@ -109,9 +109,10 @@ La maturità cresce con:
 - **quantità di dati**: numero di assenze (pesate per recenza);
 - **bravura dimostrata**: il modello registra le proprie previsioni e, a posteriori,
   le confronta con la realtà. Calcola il **Brier score** (errore quadratico medio,
-  più basso = meglio) e lo confronta con una **baseline** che prevede sempre la
-  frequenza media. Il *Brier skill score* (`1 − brier / baseline`) dice quanto il
-  modello batte la baseline; serve almeno qualche decina di previsioni verificate.
+  più basso = meglio) e lo confronta con una **baseline** volutamente semplice: la
+  probabilità di rientro calcolata solo da "da quanto tempo è fuori", senza ora di
+  uscita né giorno. Il *Brier skill score* (`1 − brier / baseline`) misura quindi
+  quanto valgono le abitudini imparate; servono almeno 30 previsioni verificate.
 
 Una probabilità del 90% con maturità 20% è un'ipotesi; con maturità 85% è una
 previsione su cui agire.
@@ -200,7 +201,7 @@ Per ogni persona `<p>`:
 |---|---|---|
 | `binary_sensor.<p>_returning` | binary | On se la probabilità supera la soglia. Attributi: `probability`, `eta`, `mode`, `advisory`, `reason`, `active_model` |
 | `sensor.<p>_return_probability` | % | Probabilità di rientro entro l'orizzonte (100 se in casa) |
-| `sensor.<p>_return_eta` | timestamp | ETA stimata |
+| `sensor.<p>_return_eta` | timestamp | ETA stimata (pubblicata mentre la persona è fuori) |
 | `sensor.<p>_model_maturity` | % | Maturità. Attributi: `episodes`, `brier_score`, `baseline_brier_score`, `brier_skill_score`, `active_model`, `candidate_brier`, `challenger_enabled`, `sklearn_available` |
 | `sensor.<p>_return_reason` | testo | Spiegazione leggibile della stima corrente |
 | `select.<p>_mode` | select | `auto` / `learning` / `live` |
@@ -210,7 +211,7 @@ Casa:
 | Entità | Contenuto |
 |---|---|
 | `sensor.house_return_probability` | % che almeno una persona fuori rientri entro l'orizzonte; **100 se qualcuno è in casa** |
-| `sensor.house_next_return_eta` | ETA più vicina tra le persone che stanno tornando |
+| `sensor.house_next_return_eta` | ETA più vicina tra le persone fuori con probabilità ≥ 25% (attributo `eta_person`), così il blueprint può usare anche la fascia "probabilità media" |
 | `binary_sensor.house_someone_returning` | On se almeno una persona sta tornando |
 
 Tutte le entità casa hanno gli attributi `occupied`, `persons_home`,
@@ -461,11 +462,11 @@ Cosa guardare in `sensor.<p>_model_maturity` e negli altri sensori:
   zona di casa sia corretta.
 - **`brier_score` vs `baseline_brier_score`**: il primo deve scendere sotto il
   secondo. Finché sono simili il modello non batte "la media" e resta in learning.
-- **`brier_skill_score`**: > 0 significa che il modello aggiunge informazione; verso
-  0.25 e oltre la maturità sale rapidamente.
-- **`sensor.<p>_return_reason`**: spiega la stima ("abitudine: di solito rientra
-  verso le 18:30", "si sta avvicinando a 40 km/h"…). È il modo più rapido per capire
-  previsioni strane.
+- **`brier_skill_score`**: > 0 significa che il modello aggiunge informazione; a 0.5
+  il contributo della bravura alla maturità è pieno.
+- **`sensor.<p>_return_reason`**: spiega la stima in forma compatta (in inglese), es.
+  `left 06:10 (morning); approaching 45 km/h, 12.3 km; habit P 0.42, GPS LR 4.0`.
+  È il modo più rapido per capire previsioni strane.
 - Nel blueprint attiva temporaneamente **"Scrivi decisioni nel logbook"** per vedere
   perché ogni zona ha preso un certo preset.
 
