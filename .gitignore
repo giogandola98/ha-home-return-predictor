@@ -7,3 +7,6 @@ __pycache__/
 htmlcov/
 *.egg-info/
 .DS_Store
+logs/
+*.log
+home_return_predictor_diagnostics_*.json
