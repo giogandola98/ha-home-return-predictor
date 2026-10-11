@@ -1,7 +1,8 @@
 # Standalone "Home Return Predictor" dashboard (raw configuration).
 # Settings -> Dashboards -> Add dashboard -> New dashboard from scratch -> open it ->
 # pencil -> three dots -> Raw configuration editor -> replace everything with this file.
-# Replace COMPAGNA with the object id of the second person (person.COMPAGNA).
+# Replace `PERSON_A` / `PERSON_B` with your person object ids
+# (person.alice -> alice). The other entity ids are fixed by the integration.
 title: Home Return Predictor
 views:
   - title: Debug
@@ -10,201 +11,201 @@ views:
     cards:
       # ---------------------------------------------------------------- house
       - type: entities
-        title: Casa
+        title: House
         state_color: true
         entities:
           - entity: binary_sensor.house_someone_returning
-            name: Qualcuno sta tornando
+            name: Someone returning
           - entity: sensor.house_return_probability
-            name: Probabilità rientro casa
+            name: House return probability
           - entity: sensor.house_next_return_eta
-            name: Prossimo arrivo
+            name: Next arrival
             format: time
           - type: attribute
             entity: sensor.house_return_probability
             attribute: away_probability
-            name: Probabilità (solo persone fuori)
+            name: Probability (away people only)
             suffix: "%"
           - type: attribute
             entity: sensor.house_return_probability
             attribute: occupied
-            name: Casa occupata
+            name: House occupied
           - type: attribute
             entity: sensor.house_return_probability
             attribute: mode
-            name: Modalità casa
+            name: House mode
       - type: markdown
-        title: Candidati per il blueprint
+        title: Blueprint candidates
         content: |
           {% set c = state_attr('sensor.house_next_return_eta', 'candidates') or [] %}
-          {% if c | count == 0 %}Nessuna persona fuori con probabilità ≥ 25%.{% else %}
-          | Persona | Prob. | ETA |
+          {% if c | count == 0 %}No away person with probability ≥ 25%.{% else %}
+          | Person | Prob. | ETA |
           |---|---|---|
           {% for x in c -%}
           | {{ state_attr(x.person, 'friendly_name') or x.person }} | {{ x.probability | round(0) }}% | {{ as_timestamp(x.eta) | timestamp_custom('%H:%M') if x.eta else '—' }} |
           {% endfor %}{% endif %}
 
-          **In casa:** {{ (state_attr('sensor.house_return_probability', 'persons_home') or []) | map('state_attr', 'friendly_name') | join(', ') or 'nessuno' }}
-          · **Stanno tornando:** {{ (state_attr('sensor.house_return_probability', 'returning_persons') or []) | map('state_attr', 'friendly_name') | join(', ') or 'nessuno' }}
+          **Home:** {{ (state_attr('sensor.house_return_probability', 'persons_home') or []) | map('state_attr', 'friendly_name') | join(', ') or 'nobody' }}
+          · **Returning:** {{ (state_attr('sensor.house_return_probability', 'returning_persons') or []) | map('state_attr', 'friendly_name') | join(', ') or 'nobody' }}
 
       # ------------------------------------------------------------- person A
       - type: entities
-        title: Giorgio
+        title: PERSON_A
         state_color: true
         entities:
-          - entity: person.giorgio
-            name: Posizione
-          - entity: select.giorgio_mode
-            name: Modalità (auto / learning / live)
-          - entity: binary_sensor.giorgio_returning
-            name: Sta tornando
-          - entity: sensor.giorgio_return_probability
-            name: Probabilità rientro
-          - entity: sensor.giorgio_return_eta
+          - entity: person.PERSON_A
+            name: Location
+          - entity: select.PERSON_A_mode
+            name: Mode (auto / learning / live)
+          - entity: binary_sensor.PERSON_A_returning
+            name: Returning
+          - entity: sensor.PERSON_A_return_probability
+            name: Return probability
+          - entity: sensor.PERSON_A_return_eta
             name: ETA
             format: time
-          - entity: sensor.giorgio_model_maturity
-            name: Maturità modello
+          - entity: sensor.PERSON_A_model_maturity
+            name: Model maturity
           - type: attribute
-            entity: binary_sensor.giorgio_returning
+            entity: binary_sensor.PERSON_A_returning
             attribute: mode
-            name: Modalità effettiva
+            name: Effective mode
           - type: attribute
-            entity: binary_sensor.giorgio_returning
+            entity: binary_sensor.PERSON_A_returning
             attribute: advisory
-            name: Solo consultivo
+            name: Advisory only
       - type: markdown
-        title: Giorgio — dettagli modello
+        title: PERSON_A — model details
         content: |
-          {% set p = 'giorgio' %}
+          {% set p = 'PERSON_A' %}
           {% set m = 'sensor.' ~ p ~ '_model_maturity' %}
           {% set r = 'binary_sensor.' ~ p ~ '_returning' %}
-          **Motivo:** {{ states('sensor.' ~ p ~ '_return_reason') }}
+          **Reason:** {{ states('sensor.' ~ p ~ '_return_reason') }}
 
           | | |
           |---|---|
-          | Prob. abitudine | {{ (state_attr(r, 'prior_probability') | float(0) * 100) | round(0) ~ "%" if state_attr(r, 'prior_probability') is not none else "—" }} |
+          | Habit prob. | {{ (state_attr(r, 'prior_probability') | float(0) * 100) | round(0) ~ "%" if state_attr(r, 'prior_probability') is not none else "—" }} |
           | LR GPS | {{ state_attr(r, 'likelihood_ratio') | float(1) | round(2) }} |
-          | Velocità avvicinamento | {{ state_attr(r, 'approach_speed_kmh') | float(0) | round(0) ~ ' km/h' if state_attr(r, 'approach_speed_kmh') is not none else '—' }} |
-          | Distanza | {{ state_attr(r, 'distance_km') | float(0) | round(1) ~ ' km' if state_attr(r, 'distance_km') is not none else '—' }} |
-          | ETA abitudine / GPS | {{ as_timestamp(state_attr(r, 'eta_habit')) | timestamp_custom('%H:%M') if state_attr(r, 'eta_habit') else '—' }} / {{ as_timestamp(state_attr(r, 'eta_position')) | timestamp_custom('%H:%M') if state_attr(r, 'eta_position') else '—' }} |
-          | Episodi (effettivi) | {{ state_attr(m, 'episodes') }} ({{ state_attr(m, 'effective_episodes') | float(0) | round(1) }}) |
-          | Previsioni verificate | {{ state_attr(m, 'resolved_predictions') }} |
-          | Brier modello / baseline | {{ state_attr(m, 'brier_score') | float(0) | round(3) if state_attr(m, 'brier_score') is not none else '—' }} / {{ state_attr(m, 'baseline_brier_score') | float(0) | round(3) if state_attr(m, 'baseline_brier_score') is not none else '—' }} |
+          | Approach speed | {{ state_attr(r, 'approach_speed_kmh') | float(0) | round(0) ~ ' km/h' if state_attr(r, 'approach_speed_kmh') is not none else '—' }} |
+          | Distance | {{ state_attr(r, 'distance_km') | float(0) | round(1) ~ ' km' if state_attr(r, 'distance_km') is not none else '—' }} |
+          | ETA habit / GPS | {{ as_timestamp(state_attr(r, 'eta_habit')) | timestamp_custom('%H:%M') if state_attr(r, 'eta_habit') else '—' }} / {{ as_timestamp(state_attr(r, 'eta_position')) | timestamp_custom('%H:%M') if state_attr(r, 'eta_position') else '—' }} |
+          | Episodes (effective) | {{ state_attr(m, 'episodes') }} ({{ state_attr(m, 'effective_episodes') | float(0) | round(1) }}) |
+          | Verified predictions | {{ state_attr(m, 'resolved_predictions') }} |
+          | Brier model / baseline | {{ state_attr(m, 'brier_score') | float(0) | round(3) if state_attr(m, 'brier_score') is not none else '—' }} / {{ state_attr(m, 'baseline_brier_score') | float(0) | round(3) if state_attr(m, 'baseline_brier_score') is not none else '—' }} |
           | Brier skill score | {{ state_attr(m, 'brier_skill_score') | float(0) | round(2) if state_attr(m, 'brier_skill_score') is not none else '—' }} |
-          | Modello attivo | {{ state_attr(m, 'active_model') }} |
-          | Sfidante attivo / numpy | {{ state_attr(m, 'challenger_enabled') }} / {{ state_attr(m, 'numpy_available') if state_attr(m, 'numpy_available') is not none else state_attr(m, 'sklearn_available') }} |
+          | Active model | {{ state_attr(m, 'active_model') }} |
+          | Challenger enabled / numpy | {{ state_attr(m, 'challenger_enabled') }} / {{ state_attr(m, 'numpy_available') if state_attr(m, 'numpy_available') is not none else state_attr(m, 'sklearn_available') }} |
           {% set cb = state_attr(m, 'candidate_brier') or {} %}{% for k, v in cb.items() %}| Brier {{ k }} | {{ v | round(3) if v is not none else '—' }} |
           {% endfor %}
       - type: history-graph
-        title: Giorgio — ultime 24 ore
+        title: PERSON_A — last 24 hours
         hours_to_show: 24
         entities:
-          - entity: sensor.giorgio_return_probability
-          - entity: sensor.giorgio_model_maturity
-          - entity: binary_sensor.giorgio_returning
-          - entity: person.giorgio
+          - entity: sensor.PERSON_A_return_probability
+          - entity: sensor.PERSON_A_model_maturity
+          - entity: binary_sensor.PERSON_A_returning
+          - entity: person.PERSON_A
 
       # ------------------------------------------------------------- person B
       - type: entities
-        title: Compagna
+        title: PERSON_B
         state_color: true
         entities:
-          - entity: person.COMPAGNA
-            name: Posizione
-          - entity: select.COMPAGNA_mode
-            name: Modalità (auto / learning / live)
-          - entity: binary_sensor.COMPAGNA_returning
-            name: Sta tornando
-          - entity: sensor.COMPAGNA_return_probability
-            name: Probabilità rientro
-          - entity: sensor.COMPAGNA_return_eta
+          - entity: person.PERSON_B
+            name: Location
+          - entity: select.PERSON_B_mode
+            name: Mode (auto / learning / live)
+          - entity: binary_sensor.PERSON_B_returning
+            name: Returning
+          - entity: sensor.PERSON_B_return_probability
+            name: Return probability
+          - entity: sensor.PERSON_B_return_eta
             name: ETA
             format: time
-          - entity: sensor.COMPAGNA_model_maturity
-            name: Maturità modello
+          - entity: sensor.PERSON_B_model_maturity
+            name: Model maturity
           - type: attribute
-            entity: binary_sensor.COMPAGNA_returning
+            entity: binary_sensor.PERSON_B_returning
             attribute: mode
-            name: Modalità effettiva
+            name: Effective mode
           - type: attribute
-            entity: binary_sensor.COMPAGNA_returning
+            entity: binary_sensor.PERSON_B_returning
             attribute: advisory
-            name: Solo consultivo
+            name: Advisory only
       - type: markdown
-        title: Compagna — dettagli modello
+        title: PERSON_B — model details
         content: |
-          {% set p = 'COMPAGNA' %}
+          {% set p = 'PERSON_B' %}
           {% set m = 'sensor.' ~ p ~ '_model_maturity' %}
           {% set r = 'binary_sensor.' ~ p ~ '_returning' %}
-          **Motivo:** {{ states('sensor.' ~ p ~ '_return_reason') }}
+          **Reason:** {{ states('sensor.' ~ p ~ '_return_reason') }}
 
           | | |
           |---|---|
-          | Prob. abitudine | {{ (state_attr(r, 'prior_probability') | float(0) * 100) | round(0) ~ "%" if state_attr(r, 'prior_probability') is not none else "—" }} |
+          | Habit prob. | {{ (state_attr(r, 'prior_probability') | float(0) * 100) | round(0) ~ "%" if state_attr(r, 'prior_probability') is not none else "—" }} |
           | LR GPS | {{ state_attr(r, 'likelihood_ratio') | float(1) | round(2) }} |
-          | Velocità avvicinamento | {{ state_attr(r, 'approach_speed_kmh') | float(0) | round(0) ~ ' km/h' if state_attr(r, 'approach_speed_kmh') is not none else '—' }} |
-          | Distanza | {{ state_attr(r, 'distance_km') | float(0) | round(1) ~ ' km' if state_attr(r, 'distance_km') is not none else '—' }} |
-          | ETA abitudine / GPS | {{ as_timestamp(state_attr(r, 'eta_habit')) | timestamp_custom('%H:%M') if state_attr(r, 'eta_habit') else '—' }} / {{ as_timestamp(state_attr(r, 'eta_position')) | timestamp_custom('%H:%M') if state_attr(r, 'eta_position') else '—' }} |
-          | Episodi (effettivi) | {{ state_attr(m, 'episodes') }} ({{ state_attr(m, 'effective_episodes') | float(0) | round(1) }}) |
-          | Previsioni verificate | {{ state_attr(m, 'resolved_predictions') }} |
-          | Brier modello / baseline | {{ state_attr(m, 'brier_score') | float(0) | round(3) if state_attr(m, 'brier_score') is not none else '—' }} / {{ state_attr(m, 'baseline_brier_score') | float(0) | round(3) if state_attr(m, 'baseline_brier_score') is not none else '—' }} |
+          | Approach speed | {{ state_attr(r, 'approach_speed_kmh') | float(0) | round(0) ~ ' km/h' if state_attr(r, 'approach_speed_kmh') is not none else '—' }} |
+          | Distance | {{ state_attr(r, 'distance_km') | float(0) | round(1) ~ ' km' if state_attr(r, 'distance_km') is not none else '—' }} |
+          | ETA habit / GPS | {{ as_timestamp(state_attr(r, 'eta_habit')) | timestamp_custom('%H:%M') if state_attr(r, 'eta_habit') else '—' }} / {{ as_timestamp(state_attr(r, 'eta_position')) | timestamp_custom('%H:%M') if state_attr(r, 'eta_position') else '—' }} |
+          | Episodes (effective) | {{ state_attr(m, 'episodes') }} ({{ state_attr(m, 'effective_episodes') | float(0) | round(1) }}) |
+          | Verified predictions | {{ state_attr(m, 'resolved_predictions') }} |
+          | Brier model / baseline | {{ state_attr(m, 'brier_score') | float(0) | round(3) if state_attr(m, 'brier_score') is not none else '—' }} / {{ state_attr(m, 'baseline_brier_score') | float(0) | round(3) if state_attr(m, 'baseline_brier_score') is not none else '—' }} |
           | Brier skill score | {{ state_attr(m, 'brier_skill_score') | float(0) | round(2) if state_attr(m, 'brier_skill_score') is not none else '—' }} |
-          | Modello attivo | {{ state_attr(m, 'active_model') }} |
-          | Sfidante attivo / numpy | {{ state_attr(m, 'challenger_enabled') }} / {{ state_attr(m, 'numpy_available') if state_attr(m, 'numpy_available') is not none else state_attr(m, 'sklearn_available') }} |
+          | Active model | {{ state_attr(m, 'active_model') }} |
+          | Challenger enabled / numpy | {{ state_attr(m, 'challenger_enabled') }} / {{ state_attr(m, 'numpy_available') if state_attr(m, 'numpy_available') is not none else state_attr(m, 'sklearn_available') }} |
           {% set cb = state_attr(m, 'candidate_brier') or {} %}{% for k, v in cb.items() %}| Brier {{ k }} | {{ v | round(3) if v is not none else '—' }} |
           {% endfor %}
       - type: history-graph
-        title: Compagna — ultime 24 ore
+        title: PERSON_B — last 24 hours
         hours_to_show: 24
         entities:
-          - entity: sensor.COMPAGNA_return_probability
-          - entity: sensor.COMPAGNA_model_maturity
-          - entity: binary_sensor.COMPAGNA_returning
-          - entity: person.COMPAGNA
+          - entity: sensor.PERSON_B_return_probability
+          - entity: sensor.PERSON_B_model_maturity
+          - entity: binary_sensor.PERSON_B_returning
+          - entity: person.PERSON_B
 
       # ------------------------------------------------------------- tools
       - type: grid
-        title: Strumenti
+        title: Tools
         columns: 3
         square: false
         cards:
           - type: button
-            name: Retrain (tutti)
+            name: Retrain (all)
             icon: mdi:database-refresh
             tap_action:
               action: perform-action
               perform_action: home_return_predictor.retrain
               confirmation:
-                text: Rileggere lo storico del recorder? (gli episodi già imparati restano)
+                text: Re-read recorder history? (episodes already learnt are kept)
           - type: button
-            name: Esporta diagnostica
+            name: Export diagnostics
             icon: mdi:file-export
             tap_action:
               action: perform-action
               perform_action: home_return_predictor.export_diagnostics
           - type: button
-            name: Reset Giorgio
+            name: Reset PERSON_A
             icon: mdi:restore-alert
             tap_action:
               action: perform-action
               perform_action: home_return_predictor.reset
               data:
-                person: person.giorgio
+                person: person.PERSON_A
               confirmation:
-                text: Cancellare tutto ciò che il modello ha imparato su Giorgio?
+                text: Clear everything the model has learnt about PERSON_A?
           - type: button
-            name: Reset Compagna
+            name: Reset PERSON_B
             icon: mdi:restore-alert
             tap_action:
               action: perform-action
               perform_action: home_return_predictor.reset
               data:
-                person: person.COMPAGNA
+                person: person.PERSON_B
               confirmation:
-                text: Cancellare tutto ciò che il modello ha imparato sulla compagna?
+                text: Clear everything the model has learnt about PERSON_B?
       - type: history-graph
-        title: Casa — ultime 48 ore
+        title: House — last 48 hours
         hours_to_show: 48
         entities:
           - entity: sensor.house_return_probability

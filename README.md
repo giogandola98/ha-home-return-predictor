@@ -1,426 +1,432 @@
 # Home Return Predictor
 
-Integrazione custom per Home Assistant che **impara quando ogni persona di casa torna**
-e pubblica, per persona e per la casa intera, la **probabilità di rientro** entro un
-orizzonte (default 90 minuti), l'**orario stimato di arrivo (ETA)** e quanto il
-modello è **affidabile** (maturità). Pensata per pre‑riscaldare le zone con
-[Versatile Thermostat](https://github.com/jmcollin78/versatile_thermostat) (VTherm)
-tramite il blueprint incluso, ma i sensori sono utilizzabili in qualsiasi automazione.
+A custom Home Assistant integration that **learns when each member of the household
+comes home** and publishes, per person and for the whole house, the **probability of
+returning** within a horizon (default 90 minutes), the **estimated time of arrival
+(ETA)** and how **reliable** the model is (maturity). It is designed to pre-heat zones
+with [Versatile Thermostat](https://github.com/jmcollin78/versatile_thermostat) (VTherm)
+through the included blueprint, but the sensors can be used in any automation.
 
-- Dominio: `home_return_predictor`
-- Nessuna dipendenza esterna, nessun servizio cloud: tutto gira in locale.
-- Si installa tramite HACS (repository personalizzato) o copia manuale.
-
----
-
-## Indice
-
-1. [Cosa fa / cosa non fa](#cosa-fa--cosa-non-fa)
-2. [Come funziona](#come-funziona)
-3. [Probabilità e maturità](#probabilità-e-maturità)
-4. [Modalità: learning, live, auto](#modalità-learning-live-auto)
-5. [Installazione](#installazione)
-6. [Configurazione e opzioni](#configurazione-e-opzioni)
-7. [Entità](#entità)
-8. [Evento e servizi](#evento-e-servizi)
-9. [Blueprint](#blueprint)
-10. [Gerarchia di controllo con VTherm](#gerarchia-di-controllo-con-vtherm)
-11. [Priorità delle decisioni](#priorità-delle-decisioni)
-12. [Esempi multi‑zona e notte](#esempi-multi-zona-e-notte)
-13. [Plugin termici: confronto e combinazione consigliata](#plugin-termici-confronto-e-combinazione-consigliata)
-14. [Esempi di automazioni](#esempi-di-automazioni)
-15. [I primi giorni di apprendimento](#i-primi-giorni-di-apprendimento)
-16. [Modello sfidante (gradient boosting, opzionale)](#modello-sfidante-gradient-boosting-opzionale)
-17. [Per sviluppatori: simulazione e test](#per-sviluppatori-simulazione-e-test)
-18. [Limiti noti](#limiti-noti)
+- Domain: `home_return_predictor`
+- No external dependencies, no cloud services: everything runs locally.
+- Install via HACS (custom repository) or by manual copy.
+- Related: [Room Thermal Model](https://github.com/giogandola98/ha-room-thermal-model),
+  a companion integration that learns how long each room takes to heat up and feeds
+  the blueprint's pre-heat minutes (see [Thermal plugins](#thermal-plugins-comparison-and-recommended-setup)).
 
 ---
 
-## Cosa fa / cosa non fa
+## Contents
 
-**Fa**
-
-- Ricostruisce dallo storico del recorder (fino a 120 giorni) le assenze di ogni
-  `person` e continua a imparare in tempo reale.
-- Stima, mentre una persona è fuori, la probabilità che rientri entro l'orizzonte e
-  l'ETA, combinando le **abitudini** con la **posizione GPS** (se disponibile).
-- Misura da sola quanto è affidabile (Brier score contro una baseline) e passa da
-  *learning* a *live* quando lo merita.
-- Aggrega a livello casa: probabilità che qualcuno rientri, prima ETA, "qualcuno sta
-  tornando".
-- Fornisce un blueprint che sceglie il **preset** di ogni zona VTherm.
-
-**Non fa**
-
-- **L'integrazione non comanda nessuna entità.** Pubblica solo sensori ed eventi.
-  Solo il blueprint (o le tue automazioni) agiscono sui termostati, e sei tu a
-  scegliere per ogni zona quali preset usare.
-- Non imposta mai temperature: il blueprint cambia solo i preset di VTherm.
-- Non modella la termica delle stanze (quanto ci mette una stanza a scaldarsi): per
-  questo vedi [Plugin termici](#plugin-termici-confronto-e-combinazione-consigliata).
-- Non sostituisce il rilevamento finestre o le sicurezze di VTherm.
+1. [What it does / does not do](#what-it-does--does-not-do)
+2. [How it works](#how-it-works)
+3. [Probability and maturity](#probability-and-maturity)
+4. [Modes: learning, live, auto](#modes-learning-live-auto)
+5. [Installation](#installation)
+6. [Configuration and options](#configuration-and-options)
+7. [Entities](#entities)
+8. [Event and services](#event-and-services)
+9. [Blueprints](#blueprints)
+10. [Control hierarchy with VTherm](#control-hierarchy-with-vtherm)
+11. [Decision priority](#decision-priority)
+12. [Multi-zone and night examples](#multi-zone-and-night-examples)
+13. [Thermal plugins: comparison and recommended setup](#thermal-plugins-comparison-and-recommended-setup)
+14. [Automation examples](#automation-examples)
+15. [The first days of learning](#the-first-days-of-learning)
+16. [Challenger model (gradient boosting, optional)](#challenger-model-gradient-boosting-optional)
+17. [For developers: simulation and tests](#for-developers-simulation-and-tests)
+18. [Known limitations](#known-limitations)
 
 ---
 
-## Come funziona
+## What it does / does not do
 
-Per ogni persona il modello combina due fonti di informazione.
+**Does**
 
-1. **Prior dalle abitudini.** Le assenze passate (< 10 min scartate come rumore GPS,
-   > 36 h trattate come viaggi) vengono pesate per somiglianza con quella in corso:
-   - ora di uscita simile (kernel circolare, ±75 min circa);
-   - stesso giorno della settimana / stessa classe feriale‑festivo (calendario
-     festività opzionale);
-   - recenza (emivita configurabile, default 28 giorni), così un cambio di
-     abitudini viene assorbito in poche settimane.
+- Rebuilds each `person`'s absences from recorder history (up to 120 days) and keeps
+  learning in real time.
+- While a person is away, estimates the probability that they return within the
+  horizon and their ETA, combining **habits** with **GPS position** (when available).
+- Measures its own reliability (Brier score against a baseline) and switches from
+  *learning* to *live* once it has earned it.
+- Aggregates at house level: probability that someone returns, earliest ETA,
+  "someone is returning".
+- Provides a blueprint that chooses the **preset** of each VTherm zone.
 
-   La probabilità è una stima di sopravvivenza: "tra le assenze simili che erano
-   ancora in corso dopo lo stesso tempo, quante sono finite entro l'orizzonte?".
-   Funziona anche con i **turni**: chi esce alle 6 torna a un'ora diversa da chi esce
-   alle 14, e il modello lo distingue dall'ora di uscita. Con pochi dati simili la
-   stima viene attenuata verso un valore medio, invece di diventare estrema.
-2. **Evidenza GPS.** Dalle posizioni recenti (precisione peggiore di 250 m scartata)
-   calcola la velocità di avvicinamento a casa e la classifica (si allontana, fermo,
-   si avvicina piano/veloce…). Ogni classe ha un **likelihood ratio auto‑calibrato**:
-   impara da solo quanto "si sta avvicinando" significhi davvero "sta tornando" per
-   quella persona (chi passa spesso vicino casa senza rientrare abbassa il peso di
-   quel segnale).
-3. **Fusione.** `logit(P) = logit(prior) + log(LR)`, limitata tra 1% e 99%. Nessuna
-   regola scritta a mano per tipo di persona: abitudini nette dominano, abitudini
-   confuse lasciano più spazio al GPS.
-4. **ETA.** Media pesata (per incertezza) tra l'ETA da abitudine e l'ETA da
-   distanza/velocità quando ci si muove a più di 5 km/h.
+**Does not**
 
-Una persona **in casa** ha probabilità 100% e `returning` spento.
+- **The integration does not control any entity.** It only publishes sensors and
+  events. Only the blueprint (or your own automations) act on thermostats, and you
+  choose which presets to use for each zone.
+- Never sets temperatures: the blueprint only changes VTherm presets.
+- Does not model room thermals (how long a room takes to heat up): see
+  [Thermal plugins](#thermal-plugins-comparison-and-recommended-setup).
+- Does not replace VTherm's window detection or safety features.
 
 ---
 
-## Probabilità e maturità
+## How it works
 
-Sono due numeri diversi e vanno letti insieme.
+For each person the model combines two sources of information.
 
-| | Domanda a cui risponde | Dove |
+1. **Habit prior.** Past absences (< 10 min discarded as GPS noise, > 36 h treated as
+   trips) are weighted by similarity to the current one:
+   - similar departure time (circular kernel, roughly ±75 min);
+   - same weekday / same workday-vs-holiday class (optional holiday calendar);
+   - recency (configurable half-life, default 28 days), so a change of habits is
+     absorbed within a few weeks.
+
+   The probability is a survival estimate: "among similar absences that were still
+   ongoing after the same amount of time, how many ended within the horizon?".
+   It also works with **shift work**: someone leaving at 06:00 returns at a different
+   time than someone leaving at 14:00, and the model tells them apart by departure
+   time. With little similar data the estimate is shrunk towards an average value
+   instead of becoming extreme.
+2. **GPS evidence.** From recent positions (accuracy worse than 250 m discarded) it
+   computes the speed of approach to home and classifies it (moving away, stationary,
+   approaching slowly/fast…). Each class has a **self-calibrating likelihood ratio**:
+   it learns how much "approaching" really means "returning" for that person (someone
+   who often passes near home without coming in lowers the weight of that signal).
+3. **Fusion.** `logit(P) = logit(prior) + log(LR)`, clamped between 1% and 99%. No
+   hand-written rules per type of person: clear habits dominate, fuzzy habits leave
+   more room for GPS.
+4. **ETA.** Uncertainty-weighted average of the habit ETA and the distance/speed ETA
+   when moving faster than 5 km/h.
+
+A person **at home** has probability 100% and `returning` off.
+
+---
+
+## Probability and maturity
+
+These are two different numbers and should be read together.
+
+| | Question it answers | Where |
 |---|---|---|
-| **Probabilità** | "Quanto è probabile che torni entro 90 minuti, adesso?" | `sensor.<p>_return_probability` |
-| **Maturità** | "Quanto mi posso fidare di queste probabilità, in generale?" | `sensor.<p>_model_maturity` |
+| **Probability** | "How likely is it that they return within 90 minutes, right now?" | `sensor.<p>_return_probability` |
+| **Maturity** | "How far can I trust these probabilities, in general?" | `sensor.<p>_model_maturity` |
 
-La maturità cresce con:
+Maturity grows with:
 
-- **quantità di dati**: numero di assenze (pesate per recenza);
-- **bravura dimostrata**: il modello registra le proprie previsioni e, a posteriori,
-  le confronta con la realtà. Calcola il **Brier score** (errore quadratico medio,
-  più basso = meglio) e lo confronta con una **baseline** volutamente semplice: la
-  probabilità di rientro calcolata solo da "da quanto tempo è fuori", senza ora di
-  uscita né giorno. Il *Brier skill score* (`1 − brier / baseline`) misura quindi
-  quanto valgono le abitudini imparate; servono almeno 30 previsioni verificate.
+- **amount of data**: number of absences (recency-weighted);
+- **demonstrated skill**: the model logs its own predictions and later compares them
+  with what actually happened. It computes the **Brier score** (mean squared error,
+  lower = better) and compares it with a deliberately simple **baseline**: the return
+  probability computed only from "how long they have been away", without departure
+  time or weekday. The *Brier skill score* (`1 − brier / baseline`) therefore measures
+  how much the learnt habits are worth; at least 30 verified predictions are needed.
 
-Una probabilità del 90% con maturità 20% è un'ipotesi; con maturità 85% è una
-previsione su cui agire.
+A 90% probability with 20% maturity is a guess; with 85% maturity it is a prediction
+you can act on.
 
 ---
 
-## Modalità: learning, live, auto
+## Modes: learning, live, auto
 
-Ogni persona ha un `select.<p>_mode`:
+Each person has a `select.<p>_mode`:
 
-| Modalità | Comportamento |
+| Mode | Behaviour |
 |---|---|
-| `learning` | Tutto viene calcolato e pubblicato (anche `returning`), ma con attributo `advisory: true`. Pensato per osservare senza agire. |
-| `live` | Previsioni pienamente operative, `advisory: false`. |
-| `auto` (default) | Passa a live quando la maturità supera la soglia (default 70%) e torna a learning se scende sotto soglia − 10 punti (**isteresi**: niente avanti e indietro). |
+| `learning` | Everything is computed and published (including `returning`), but with attribute `advisory: true`. Meant for observing without acting. |
+| `live` | Fully operational predictions, `advisory: false`. |
+| `auto` (default) | Switches to live when maturity exceeds the threshold (default 70%) and back to learning if it drops below threshold − 10 points (**hysteresis**: no flip-flopping). |
 
-I sensori casa hanno `mode: live` se almeno una delle persone rilevanti (quelle che
-stanno tornando, altrimenti tutte) è in live, e `advisory` di conseguenza.
+The house sensors have `mode: live` if at least one of the relevant people (those
+returning, otherwise everyone) is live, and `advisory` accordingly.
 
-Il blueprint VTherm ha l'input **"Agisci sulle previsioni solo in modalità live"**,
-**attivo di default**. Finché il modello impara, il blueprint si comporta come una
-classica automazione presenza + calendario + letto (quindi può sostituire da subito
-le vecchie automazioni della zona), ma **ignora il rientro previsto**: niente
-pre‑riscaldamenti su previsioni immature. Quando la persona passa in live, il
-pre‑riscaldo si attiva da solo. Disattiva l'input se vuoi il pre‑riscaldo da subito,
-accettando qualche accensione inutile nelle prime settimane.
+The VTherm blueprint has the input **"Act on predictions only in live mode"**,
+**enabled by default**. While the model is learning, the blueprint behaves like a
+classic presence + schedule + bed automation (so it can replace a zone's existing
+automations right away), but **ignores predicted returns**: no pre-heating on
+immature predictions. When the person switches to live, pre-heating turns on by
+itself. Disable the input if you want pre-heating from day one, accepting a few
+unnecessary heating cycles in the first weeks.
 
-Se preferisci tenere le tue automazioni attuali durante l'apprendimento, non creare
-ancora le automazioni del blueprint: osserva `binary_sensor.<p>_returning` e la
-maturità, e attiva il blueprint quando sei convinto.
-
----
-
-## Installazione
-
-### Tramite HACS
-
-1. HACS → menu ⋮ → **Repository personalizzati**.
-2. URL: `https://github.com/giogandola98/ha-home-return-predictor`, categoria
-   **Integrazione** → Aggiungi.
-3. Cerca "Home Return Predictor" → Scarica → **riavvia Home Assistant**.
-
-### Manuale
-
-Copia `custom_components/home_return_predictor/` in
-`<config>/custom_components/home_return_predictor/` e riavvia.
-
-Requisiti: Home Assistant 2026.1 o successivo, `recorder` attivo, persone (`person`)
-con tracker (meglio se l'app Companion con GPS).
+If you prefer to keep your current automations while the model learns, don't create
+the blueprint automations yet: watch `binary_sensor.<p>_returning` and the maturity,
+and enable the blueprint once you are convinced.
 
 ---
 
-## Configurazione e opzioni
+## Installation
 
-Impostazioni → Dispositivi e servizi → Aggiungi integrazione → **Home Return
-Predictor**: scegli le persone e la zona di casa (default `zone.home`). Lo storico
-viene importato subito dal recorder.
+### Via HACS
 
-Opzioni (Configura):
+1. HACS → ⋮ menu → **Custom repositories**.
+2. URL: `https://github.com/giogandola98/ha-home-return-predictor`, category
+   **Integration** → Add.
+3. Search for "Home Return Predictor" → Download → **restart Home Assistant**.
 
-| Opzione | Default | Significato |
+### Manual
+
+Copy `custom_components/home_return_predictor/` to
+`<config>/custom_components/home_return_predictor/` and restart.
+
+Requirements: Home Assistant 2026.1 or later, `recorder` enabled, `person` entities
+with trackers (ideally the Companion app with GPS).
+
+---
+
+## Configuration and options
+
+Settings → Devices & services → Add integration → **Home Return Predictor**: choose
+the people and the home zone (default `zone.home`). History is imported from the
+recorder immediately.
+
+Options (Configure):
+
+| Option | Default | Meaning |
 |---|---|---|
-| Soglia di rientro | 0.6 | Probabilità sopra la quale `returning` si accende |
-| Soglia di maturità | 0.7 | Maturità per il passaggio automatico a live |
-| Orizzonte | 90 min | Finestra della domanda "torna entro…?" |
-| Emivita | 28 giorni | Quanto velocemente si dimenticano le vecchie abitudini |
-| Intervallo di aggiornamento | 2 min | Ricalcolo periodico (oltre agli aggiornamenti sugli eventi) |
-| Calendario festività | — | `calendar.*` opzionale: i giorni con eventi sono trattati come festivi |
-| Modello sfidante (gradient boosting, numpy) | off | Addestra in background un modello alternativo con numpy, usato solo se migliore (vedi [sotto](#modello-sfidante-gradient-boosting-opzionale)) |
+| Return threshold | 0.6 | Probability above which `returning` turns on |
+| Maturity threshold | 0.7 | Maturity for the automatic switch to live |
+| Horizon | 90 min | Window of the question "will they be back within…?" |
+| Half-life | 28 days | How quickly old habits are forgotten |
+| Update interval | 2 min | Periodic recalculation (in addition to event-driven updates) |
+| Holiday calendar | — | Optional `calendar.*`: days with events are treated as holidays |
+| Challenger model (gradient boosting, numpy) | off | Trains an alternative numpy model in the background, used only if it is better (see [below](#challenger-model-gradient-boosting-optional)) |
 
 ---
 
-## Entità
+## Entities
 
-Per ogni persona `<p>`:
+For each person `<p>`:
 
-| Entità | Tipo | Contenuto |
+| Entity | Type | Content |
 |---|---|---|
-| `binary_sensor.<p>_returning` | binary | On se la probabilità supera la soglia. Attributi: `probability`, `eta`, `mode`, `advisory`, `reason`, `active_model` |
-| `sensor.<p>_return_probability` | % | Probabilità di rientro entro l'orizzonte (100 se in casa) |
-| `sensor.<p>_return_eta` | timestamp | ETA stimata (pubblicata mentre la persona è fuori) |
-| `sensor.<p>_model_maturity` | % | Maturità. Attributi: `episodes`, `brier_score`, `baseline_brier_score`, `brier_skill_score`, `active_model`, `candidate_brier`, `challenger_enabled`, `numpy_available` (`sklearn_available`: alias deprecato) |
-| `sensor.<p>_return_reason` | testo | Spiegazione leggibile della stima corrente |
+| `binary_sensor.<p>_returning` | binary | On when the probability exceeds the threshold. Attributes: `probability`, `eta`, `mode`, `advisory`, `reason`, `active_model` |
+| `sensor.<p>_return_probability` | % | Probability of returning within the horizon (100 when at home) |
+| `sensor.<p>_return_eta` | timestamp | Estimated ETA (published while the person is away) |
+| `sensor.<p>_model_maturity` | % | Maturity. Attributes: `episodes`, `brier_score`, `baseline_brier_score`, `brier_skill_score`, `active_model`, `candidate_brier`, `challenger_enabled`, `numpy_available` (`sklearn_available`: deprecated alias) |
+| `sensor.<p>_return_reason` | text | Human-readable explanation of the current estimate |
 | `select.<p>_mode` | select | `auto` / `learning` / `live` |
 
-Casa:
+House:
 
-| Entità | Contenuto |
+| Entity | Content |
 |---|---|
-| `sensor.house_return_probability` | % che almeno una persona fuori rientri entro l'orizzonte; **100 se qualcuno è in casa** |
-| `sensor.house_next_return_eta` | ETA più vicina tra le persone fuori con probabilità ≥ 25% (attributo `eta_person`), così il blueprint può usare anche la fascia "probabilità media" |
-| `binary_sensor.house_someone_returning` | On se almeno una persona sta tornando |
+| `sensor.house_return_probability` | % that at least one away person returns within the horizon; **100 when someone is home** |
+| `sensor.house_next_return_eta` | Earliest ETA among away people with probability ≥ 25% (attribute `eta_person`), so the blueprint can also use the "medium probability" band |
+| `binary_sensor.house_someone_returning` | On when at least one person is returning |
 
-Tutte le entità casa hanno gli attributi `occupied`, `persons_home`,
-`returning_persons`, `mode`, `advisory`, `away_probability` e `candidates` (il
-binary sensor anche `returning_names`). `candidates` è la lista delle persone fuori
-con probabilità ≥ 25%, ordinata per ETA: `[{person, probability, eta}]` con
-`probability` in **%** (come i sensori) ed `eta` in ISO 8601 (o `null`).
+All house entities have the attributes `occupied`, `persons_home`,
+`returning_persons`, `mode`, `advisory`, `away_probability` and `candidates` (the
+binary sensor also `returning_names`). `candidates` is the list of away people with
+probability ≥ 25%, sorted by ETA: `[{person, probability, eta}]` with `probability`
+in **%** (like the sensors) and `eta` in ISO 8601 (or `null`).
 
 ---
 
-## Evento e servizi
+## Event and services
 
-**Evento** `home_return_predictor_return_detected`, emesso quando una persona passa a
-"sta tornando":
+**Event** `home_return_predictor_return_detected`, fired when a person switches to
+"returning":
 
 ```yaml
-person: person.giorgio
-name: Giorgio
+person: person.alice
+name: Alice
 probability: 0.82
 eta: "2026-10-12T18:40:00+02:00"
 mode: live
 advisory: false
 ```
 
-**Servizi**
+**Services**
 
-| Servizio | Effetto |
+| Service | Effect |
 |---|---|
-| `home_return_predictor.retrain` | Ricostruisce il modello dallo storico (persone opzionali) |
-| `home_return_predictor.reset` | Cancella il modello appreso per le persone indicate |
-| `home_return_predictor.export_diagnostics` | Esporta lo stato del modello (coordinate oscurate) |
+| `home_return_predictor.retrain` | Rebuilds the model from history (people optional) |
+| `home_return_predictor.reset` | Clears the learnt model for the given people |
+| `home_return_predictor.export_diagnostics` | Exports the model state (coordinates redacted) |
 
 ---
 
-## Blueprint
+## Blueprints
 
-| File | Scopo |
+| File | Purpose |
 |---|---|
-| `blueprints/automation/home_return_predictor/vtherm_zone_preheat.yaml` | Sceglie il preset VTherm di **una zona** (un'automazione per zona) |
-| `blueprints/automation/home_return_predictor/presence_bridge.yaml` | Copia "qualcuno sta tornando" (e opzionalmente "qualcuno è in casa") in un `input_boolean`, per strumenti che accettano solo un'entità on/off |
+| `blueprints/automation/home_return_predictor/vtherm_zone_preheat.yaml` | Chooses the VTherm preset of **one zone** (one automation per zone) |
+| `blueprints/automation/home_return_predictor/presence_bridge.yaml` | Mirrors "someone is returning" (and optionally "someone is home") into an `input_boolean`, for tools that only accept an on/off entity |
 
-**Importazione.** Usa Impostazioni → Automazioni → Blueprint → **Importa blueprint**
-con questi URL:
+**Import.** Use Settings → Automations → Blueprints → **Import blueprint** with these
+URLs:
 
 - `https://github.com/giogandola98/ha-home-return-predictor/blob/main/blueprints/automation/home_return_predictor/vtherm_zone_preheat.yaml`
 - `https://github.com/giogandola98/ha-home-return-predictor/blob/main/blueprints/automation/home_return_predictor/presence_bridge.yaml`
 
-[![Importa VTherm zone preheat](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https://github.com/giogandola98/ha-home-return-predictor/blob/main/blueprints/automation/home_return_predictor/vtherm_zone_preheat.yaml)
+[![Import VTherm zone preheat](https://my.home-assistant.io/badges/blueprint_import.svg)](https://my.home-assistant.io/redirect/blueprint_import/?blueprint_url=https://github.com/giogandola98/ha-home-return-predictor/blob/main/blueprints/automation/home_return_predictor/vtherm_zone_preheat.yaml)
 
-In alternativa copia i file YAML in `<config>/blueprints/automation/home_return_predictor/`.
-Poi crea un'automazione per ogni zona.
+Alternatively copy the YAML files to `<config>/blueprints/automation/home_return_predictor/`.
+Then create one automation per zone.
 
-### Input del blueprint VTherm
+### VTherm blueprint inputs
 
-| Input | Default | Note |
+| Input | Default | Notes |
 |---|---|---|
-| Termostati VTherm | — | Una o più entità `climate` della zona |
-| Tipo di zona | `day` | `day` (giorno), `night` (notte), `always` (sempre usata, es. bagno) |
-| Calendario zona | — | Helper `schedule`: quando la zona è usata. Vuoto = sempre |
-| Sensore occupazione zona | — | `binary_sensor`: se on, con qualcuno in casa forza comfort |
-| Interruttore letto/notte | — | `input_boolean`/`switch`/`binary_sensor` |
-| Probabilità casa | `sensor.house_return_probability` | |
-| ETA casa | `sensor.house_next_return_eta` | |
-| Sensore "qualcuno torna" | `binary_sensor.house_someone_returning` | Attributi `mode`/`advisory` |
-| Fonte "qualcuno in casa" | `zone.home` | Stato zona = numero di persone; anche person/group/binary_sensor |
-| Agisci solo in live | **on** | Vedi [Modalità](#modalità-learning-live-auto) |
-| Minuti di pre‑riscaldo fissi | 30 | |
-| Sensore minuti di pre‑riscaldo | — | Se numerico vince sul valore fisso (es. `sensor.<zona>_predicted_duration` di ha‑preheat) |
-| **Preset comfort** | `comfort` | Zona in uso, letto (zone notte), rientro molto probabile |
-| **Preset probabilità media** | `eco` | Rientro con probabilità media |
-| **Preset assenza** | `frost` | Nessuno in casa e nessun rientro probabile |
-| **Preset zona non in uso** | `eco` | Qualcuno in casa ma zona fuori calendario |
-| **Preset notte (zone giorno)** | `eco` | Zone giorno con interruttore letto acceso |
-| Soglia alta | 70% | ≥ soglia → preset comfort |
-| Soglia media | 40% | ≥ soglia → preset probabilità media |
-| Isteresi | 5% | Evita il ping‑pong tra preset |
-| Scrivi decisioni nel logbook | off | Utile per capire perché ha scelto un preset |
+| VTherm thermostats | — | One or more `climate` entities of the zone |
+| Zone type | `day` | `day`, `night`, `always` (always used, e.g. bathroom) |
+| Zone schedule | — | `schedule` helper: when the zone is used. Empty = always |
+| Zone occupancy sensor | — | `binary_sensor`: when on, with someone home, forces comfort |
+| Bed / night switch | — | `input_boolean`/`switch`/`binary_sensor` |
+| House return probability | `sensor.house_return_probability` | |
+| House next return ETA | `sensor.house_next_return_eta` | |
+| House "someone returning" sensor | `binary_sensor.house_someone_returning` | `mode`/`advisory` attributes |
+| Someone-home source | `zone.home` | Zone state = number of people; also person/group/binary_sensor |
+| Act on predictions only in live mode | **on** | See [Modes](#modes-learning-live-auto) |
+| Fixed pre-heat minutes | 30 | |
+| Pre-heat minutes sensor | — | When numeric it overrides the fixed value (e.g. `sensor.<zone>_preheat_minutes` from [Room Thermal Model](https://github.com/giogandola98/ha-room-thermal-model), or `sensor.<zone>_predicted_duration` from ha-preheat) |
+| **Comfort preset** | `comfort` | Zone in use, bed (night zones), return very likely |
+| **Medium-probability preset** | `eco` | Return with medium probability |
+| **Absent preset** | `frost` | Nobody home and no likely return |
+| **Unused-zone preset** | `eco` | Someone home but zone outside its schedule |
+| **Night preset for day zones** | `eco` | Day zones with the bed switch on |
+| High probability threshold | 70% | ≥ threshold → comfort preset |
+| Medium probability threshold | 40% | ≥ threshold → medium-probability preset |
+| Hysteresis | 5% | Prevents ping-pong between presets |
+| Write decisions to the logbook | off | Useful to understand why a preset was chosen |
 
-Tutti i preset sono scelti **per zona** tra `frost`/`eco`/`comfort`/`boost`, oppure
-scrivendo un altro nome di preset VTherm. Se il preset scelto non esiste su un
-termostato, quel termostato non viene toccato.
+All presets are chosen **per zone** from `frost`/`eco`/`comfort`/`boost`, or by typing
+another VTherm preset name. If the chosen preset does not exist on a thermostat, that
+thermostat is left untouched.
 
-> **Perché `frost` e non `away`?** In VTherm il preset `away` è nascosto e **non
-> selezionabile** quando la funzione presenza di VTherm è disattivata (come deve
-> essere, vedi sotto). Per questo l'assenza usa `frost` di default.
+> **Why `frost` and not `away`?** In VTherm the `away` preset is hidden and **not
+> selectable** when VTherm's presence feature is disabled (as it should be, see
+> below). That is why absence uses `frost` by default.
 
-Il blueprint gira ogni 2 minuti, all'avvio di HA e a ogni cambio delle entità in
-ingresso. La logica Jinja è identica a
-`custom_components/home_return_predictor/hrp_core/preset_logic.py`, coperta da test.
+The blueprint runs every 2 minutes, at HA startup and on every change of its input
+entities. Its Jinja logic is identical to
+`custom_components/home_return_predictor/hrp_core/preset_logic.py`, which is covered
+by tests.
 
 ---
 
-## Gerarchia di controllo con VTherm
+## Control hierarchy with VTherm
 
-Regola fondamentale: **un solo "cervello" cambia i preset di una zona.**
+Golden rule: **only one "brain" changes a zone's presets.**
 
 ```
-Home Return Predictor  →  chi torna, quando, con che certezza (solo sensori)
+Home Return Predictor  →  who returns, when, how certain (sensors only)
           │
-Blueprint VTherm zona  →  UNICO che chiama climate.set_preset_mode
+VTherm zone blueprint  →  the ONLY caller of climate.set_preset_mode
           │
-Versatile Thermostat   →  temperature dei preset, regolazione, finestre, sicurezze
+Versatile Thermostat   →  preset temperatures, regulation, windows, safety
 ```
 
-- **Disattiva la funzione presenza di VTherm** (menu *Funzioni* del termostato:
-  `use_presence_feature` off) e anche il **movimento**. Se restano attive, VTherm
-  cambia temperature in base alla presenza per conto suo e le due logiche si
-  contraddicono (e `away` diventerebbe l'unico modo di gestire l'assenza).
-- **Lascia attivi** rilevamento finestre e sicurezza (safety) di VTherm, ed
-  eventuale gestione potenza: il blueprint li rispetta e non tocca il termostato
-  mentre sono attivi.
-- Il blueprint **non imposta mai temperature**. Cambiare a mano la temperatura in
-  VTherm porta il preset a `none`: al giro successivo il blueprint rimetterà il
-  preset calcolato. Se vuoi un controllo manuale prolungato, disattiva
-  l'automazione della zona.
-- Disattiva le vecchie automazioni che cambiano i preset delle stesse zone quando
-  attivi il blueprint: due automazioni sulla stessa zona si contraddicono.
+- **Disable VTherm's presence feature** (thermostat *Features* menu:
+  `use_presence_feature` off) and also **motion**. If they stay enabled, VTherm
+  changes temperatures based on presence on its own and the two logics contradict
+  each other (and `away` would become the only way to handle absence).
+- **Keep enabled** VTherm's window detection and safety, and power management if you
+  use it: the blueprint respects them and does not touch the thermostat while they
+  are active.
+- The blueprint **never sets temperatures**. Changing the temperature manually in
+  VTherm sets the preset to `none`: on the next run the blueprint restores the
+  computed preset. For extended manual control, disable the zone's automation.
+- When you enable the blueprint, disable any old automations that change presets of
+  the same zones: two automations on the same zone will fight each other.
 
 ---
 
-## Priorità delle decisioni
+## Decision priority
 
-Per ogni termostato della zona, dalla più alta alla più bassa:
+For each thermostat in the zone, from highest to lowest:
 
-| # | Condizione | Risultato |
+| # | Condition | Result |
 |---|---|---|
-| 1 | Protezioni VTherm: finestra aperta (senza bypass), safety, sovraccarico potenza, preset `safety`/`power`, HVAC spento, termostato bloccato | **Non tocca nulla** |
-| 2 | Interruttore letto acceso **e** qualcuno in casa | Zone giorno → preset notte; zone notte/sempre → comfort |
-| 3 | Qualcuno in casa | Zona in uso (occupazione on, nessun calendario, o calendario attivo ora) → comfort; altrimenti → preset zona non in uso |
-| 4 | Rientro previsto (se consentito dalla modalità) | Se adesso ≥ ETA − minuti di pre‑riscaldo (o l'ETA è già passata) **e** il calendario della zona è attivo all'ETA: p ≥ alta → comfort, p ≥ media → preset media, altrimenti → assenza |
+| 1 | VTherm protections: window open (without bypass), safety, power overload, `safety`/`power` preset, HVAC off, thermostat locked | **Touches nothing** |
+| 2 | Bed switch on **and** someone home | Day zones → night preset; night/always zones → comfort |
+| 3 | Someone home | Zone in use (occupancy on, no schedule, or schedule active now) → comfort; otherwise → unused-zone preset |
+| 4 | Predicted return (if allowed by the mode) | If now ≥ ETA − pre-heat minutes (or the ETA has already passed) **and** the zone schedule is active at the ETA: p ≥ high → comfort, p ≥ medium → medium-probability preset, otherwise → absent preset |
 
-Regole aggiuntive:
+Additional rules:
 
-- Con qualcuno in casa, il rientro di un'altra persona può solo **alzare** il preset,
-  mai abbassarlo (ordine: assenza/frost < eco < comfort < boost).
-- Con nessuno in casa vale il punto 4, o il preset assenza.
-- **Isteresi**: se il preset attuale è comfort, resta comfort finché p ≥ alta − 5;
-  se è eco (o superiore), resta almeno eco finché p ≥ media − 5.
-- **Ogni rientro è valutato da solo**: il blueprint legge l'attributo `candidates`
-  del sensore ETA casa e applica il punto 4 a ogni persona con la *sua*
-  probabilità, la *sua* ETA e il calendario alla *sua* ETA; vince il preset più
-  alto. La probabilità combinata della casa non viene mai abbinata all'ETA di
-  un'altra persona (es. Alice 30% alle 17:00 e Bob 80% alle 21:00: comfort dalle
-  20:30, non 86% alle 17:00) e due rientri poco probabili non si sommano.
-- Senza attributo `candidates` (integrazione più vecchia) o con lista vuota il
-  blueprint usa la coppia probabilità casa / ETA casa.
-- Con qualcuno in casa la probabilità casa vale 100%; il blueprint usa allora
-  l'attributo `away_probability` se l'integrazione lo fornisce, altrimenti considera
-  100% quando esiste un'ETA (cioè qualcuno sta già tornando).
-- Il calendario è valutato con lo stato attuale e `next_event` dell'helper
-  `schedule`: se è spento e si accende prima dell'ETA, si assume che resti acceso
-  all'arrivo (approssimazione adeguata per orizzonti di poche ore).
+- With someone home, another person's return can only **raise** the preset, never
+  lower it (order: absent/frost < eco < comfort < boost).
+- With nobody home, rule 4 applies, or the absent preset.
+- **Hysteresis**: if the current preset is comfort, it stays comfort while
+  p ≥ high − 5; if it is eco (or higher), it stays at least eco while p ≥ medium − 5.
+- **Each return is judged on its own**: the blueprint reads the `candidates`
+  attribute of the house ETA sensor and applies rule 4 to each person with *their*
+  probability, *their* ETA and the schedule at *their* ETA; the highest preset wins.
+  The combined house probability is never paired with another person's ETA (e.g.
+  Alice 30% at 17:00 and Bob 80% at 21:00: comfort from 20:30, not 86% at 17:00), and
+  two unlikely returns do not add up.
+- Without the `candidates` attribute (older integration) or with an empty list, the
+  blueprint uses the house probability / house ETA pair.
+- With someone home the house probability is 100%; the blueprint then uses the
+  `away_probability` attribute if the integration provides it, otherwise it assumes
+  100% when an ETA exists (i.e. someone is already returning).
+- The schedule is evaluated from the current state and the `next_event` of the
+  `schedule` helper: if it is off and turns on before the ETA, it is assumed to still
+  be on at arrival (a fair approximation for horizons of a few hours).
 
 ---
 
-## Esempi multi‑zona e notte
+## Multi-zone and night examples
 
-Configurazione tipica, un'automazione per zona:
+Typical setup, one automation per zone:
 
-| Zona | Tipo | Calendario | Altro |
+| Zone | Type | Schedule | Other |
 |---|---|---|---|
-| Soggiorno + cucina | `day` | 07:00–23:00 | interruttore letto |
-| Camera | `night` | 20:00–07:00 | interruttore letto |
-| Bagno | `always` | 06:00–08:00, 19:00–23:30 | — |
-| Studio | `day` | 08:30–18:00 feriali | sensore occupazione |
+| Living room + kitchen | `day` | 07:00–23:00 | bed switch |
+| Bedroom | `night` | 20:00–07:00 | bed switch |
+| Bathroom | `always` | 06:00–08:00, 19:00–23:30 | — |
+| Office | `day` | 08:30–18:00 weekdays | occupancy sensor |
 
-**Rientro previsto alle 23:30, casa vuota, pre‑riscaldo 30 min, p = 85%.**
+**Return predicted at 23:30, house empty, pre-heat 30 min, p = 85%.**
 
-- Alle 22:30 tutte le zone sono in `frost` (fuori dalla finestra di pre‑riscaldo).
-- Alle 23:00 la **camera** passa a `comfort`: siamo nella finestra e il suo
-  calendario (20–07) è attivo alle 23:30.
-- Il **soggiorno** resta in `frost`: il suo calendario finisce alle 23:00, quindi
-  all'arrivo non sarà in uso.
-- Il **bagno** resta in `frost`: il suo calendario finisce alle 23:30, quindi
-  all'ora di arrivo non è più attivo. Se il calendario arrivasse fino a mezzanotte,
-  passerebbe a `comfort` alle 23:00 come la camera.
+- At 22:30 all zones are on `frost` (outside the pre-heat window).
+- At 23:00 the **bedroom** switches to `comfort`: we are inside the window and its
+  schedule (20–07) is active at 23:30.
+- The **living room** stays on `frost`: its schedule ends at 23:00, so it will not be
+  in use at arrival.
+- The **bathroom** stays on `frost`: its schedule ends at 23:30, so it is no longer
+  active at arrival time. If its schedule ran until midnight, it would switch to
+  `comfort` at 23:00 like the bedroom.
 
-**Stessa sera, ma qualcuno è già in casa.** Camera in comfort (calendario attivo),
-soggiorno in comfort fino alle 23:00 e poi nel preset "non in uso" (eco): il rientro
-alle 23:30 non lo riporta in comfort perché la zona non è in calendario all'arrivo.
+**Same evening, but someone is already home.** Bedroom on comfort (schedule active),
+living room on comfort until 23:00 and then on the "unused zone" preset (eco): the
+23:30 return does not bring it back to comfort because the zone is not scheduled at
+arrival.
 
-**Letto.** Quando accendi l'interruttore letto con qualcuno in casa: soggiorno e
-studio passano al preset notte (eco), camera e bagno in comfort, indipendentemente
-da calendari e rientri. Se tutti escono e il letto resta acceso per errore, viene
-ignorato.
+**Bed.** When you turn on the bed switch with someone home: living room and office
+switch to the night preset (eco), bedroom and bathroom to comfort, regardless of
+schedules and returns. If everyone leaves and the bed switch is accidentally left on,
+it is ignored.
 
 ---
 
-## Plugin termici: confronto e combinazione consigliata
+## Thermal plugins: comparison and recommended setup
 
-Home Return Predictor sa **quando** arriva qualcuno; non sa **quanto ci mette una
-stanza a scaldarsi**. Per i minuti di pre‑riscaldo si può usare un valore fisso o un
-plugin termico.
+Home Return Predictor knows **when** someone arrives; it does not know **how long a
+room takes to heat up**. For the pre-heat minutes you can use a fixed value or a
+thermal plugin.
 
-| Progetto | Cosa fa | Compatibilità con VTherm a preset |
+| Project | What it does | Compatibility with preset-based VTherm |
 |---|---|---|
-| [Ecronika/ha-preheat](https://github.com/Ecronika/ha-preheat) (v2.11.x) | Impara per zona massa termica, dispersione e tempo morto (profili Radiatore/Pavimento/AC). **Non scrive setpoint**: si controlla col suo blueprint (comfort/eco). Entità per zona `binary_sensor.<zona>_preheat_active`, `sensor.<zona>_next_preheat_start`, `sensor.<zona>_predicted_duration` (minuti); casa `sensor.preheat_house_next_arrival`, `binary_sensor.preheat_house_incoming`. Richiede un `binary_sensor` di occupazione per zona; `schedule_entity` e `global_presence` opzionali. Ha un proprio predittore di arrivo | **Buona** come fonte dei minuti: usa `sensor.<zona>_predicted_duration` nel nostro blueprint. **Non** usare contemporaneamente il suo blueprint di controllo (un solo controllore). La nostra ETA non può essere iniettata come obiettivo; `binary_sensor.house_someone_returning` può essere passato come indizio di presenza tramite il blueprint *presence bridge* (uso dedotto, non documentato da ha‑preheat) |
-| [nic6911/ha-predictive-heating](https://github.com/nic6911/ha-predictive-heating) | Orientato al riscaldamento a pavimento; scrive i setpoint con `climate.set_temperature` (esiste una modalità advisory); entità `sensor.*_recommended_setpoint`, `*_predicted_temperature`; nessun ingresso di presenza/occupazione/calendario/arrivo | **Sconsigliato** con radiatori + VTherm: un cambio manuale di temperatura mette il preset VTherm a `none` e va in conflitto con il controllo a preset |
-| [silkyclouds/ha-smart-preheat](https://github.com/silkyclouds/ha-smart-preheat) | Package YAML per una stanza; formula fisica `minuti = 60·ΔT·C / (P − UA·(T_target − T_est))` con C, UA, P tarati a mano; espone `sensor.preheat_minutes_needed`; scrive i setpoint da sé con `script.preheat_apply` | Solo come **fonte dei minuti**, rimuovendo lo script di controllo |
+| [Room Thermal Model](https://github.com/giogandola98/ha-room-thermal-model) (companion integration) | Generic per-zone learnt RC thermal model (time constant, heating rate, dead time), trained on all history, with outdoor temperature / weather forecast. **Does not control anything**: sensors only. Per zone `sensor.<zone>_preheat_minutes`, `sensor.<zone>_model_maturity`, and with an arrival sensor (e.g. `sensor.house_next_return_eta`) `sensor.<zone>_preheat_start`, `binary_sensor.<zone>_preheat_now` | **Recommended**: use `sensor.<zone>_preheat_minutes` as the blueprint's pre-heat minutes sensor. Designed to pair with this integration, no second controller |
+| [Ecronika/ha-preheat](https://github.com/Ecronika/ha-preheat) (v2.11.x) | Learns per-zone thermal mass, heat loss and dead time (Radiator/Floor/AC profiles). **Does not write setpoints**: it is driven by its own blueprint (comfort/eco). Per-zone entities `binary_sensor.<zone>_preheat_active`, `sensor.<zone>_next_preheat_start`, `sensor.<zone>_predicted_duration` (minutes); house `sensor.preheat_house_next_arrival`, `binary_sensor.preheat_house_incoming`. Requires a per-zone occupancy `binary_sensor`; `schedule_entity` and `global_presence` optional. Has its own arrival predictor | **Good** alternative source of minutes: use `sensor.<zone>_predicted_duration` in our blueprint. **Do not** run its control blueprint at the same time (one controller only). Our ETA cannot be injected as its target; `binary_sensor.house_someone_returning` can be passed as a presence hint via the *presence bridge* blueprint (inferred usage, not documented by ha-preheat) |
+| [nic6911/ha-predictive-heating](https://github.com/nic6911/ha-predictive-heating) | Aimed at underfloor heating; writes setpoints with `climate.set_temperature` (an advisory mode exists); entities `sensor.*_recommended_setpoint`, `*_predicted_temperature`; no presence/occupancy/schedule/arrival inputs | **Not recommended** with radiators + VTherm: a manual temperature change sets the VTherm preset to `none` and conflicts with preset-based control |
+| [silkyclouds/ha-smart-preheat](https://github.com/silkyclouds/ha-smart-preheat) | YAML package for a single room; physical formula `minutes = 60·ΔT·C / (P − UA·(T_target − T_out))` with hand-tuned C, UA, P; exposes `sensor.preheat_minutes_needed`; writes setpoints itself via `script.preheat_apply` | Only as a **source of minutes**, removing the control script |
 
-**Combinazione consigliata per radiatori + valvole termostatiche + VTherm**
+**Recommended setup for radiators + thermostatic valves + VTherm**
 
-1. **Home Return Predictor**: chi torna, quando, con che certezza.
-2. **Blueprint VTherm zona**: unico controllore, solo preset.
-3. **Minuti di pre‑riscaldo**: `sensor.<zona>_predicted_duration` di Ecronika
-   ha‑preheat (appreso per zona, profilo radiatore) senza il suo blueprint di
-   controllo; oppure, per iniziare, un numero fisso (30–45 min per radiatori).
-4. **VTherm**: presenza e movimento **disattivati**; finestre e sicurezza **attive**.
+1. **Home Return Predictor**: who returns, when, how certain.
+2. **VTherm zone blueprint**: the only controller, presets only.
+3. **Pre-heat minutes**: `sensor.<zone>_preheat_minutes` from
+   [Room Thermal Model](https://github.com/giogandola98/ha-room-thermal-model)
+   (learnt per zone); alternatively `sensor.<zone>_predicted_duration` from Ecronika
+   ha-preheat (radiator profile) without its control blueprint; or, to start with, a
+   fixed number (30–45 min for radiators).
+4. **VTherm**: presence and motion **disabled**; windows and safety **enabled**.
 
 ---
 
-## Esempi di automazioni
+## Automation examples
 
-**Notifica quando qualcuno sta tornando (solo previsioni live)**
+**Notify when someone is returning (live predictions only)**
 
 ```yaml
-alias: Notifica rientro previsto
+alias: Notify predicted return
 triggers:
   - trigger: event
     event_type: home_return_predictor_return_detected
@@ -428,152 +434,150 @@ conditions:
   - condition: template
     value_template: "{{ not trigger.event.data.advisory }}"
 actions:
-  - action: notify.mobile_app_telefono
+  - action: notify.mobile_app_phone
     data:
-      title: In arrivo
+      title: On the way
       message: >
-        {{ trigger.event.data.name }} dovrebbe arrivare alle
+        {{ trigger.event.data.name }} should arrive at
         {{ as_timestamp(trigger.event.data.eta) | timestamp_custom('%H:%M') }}
         ({{ (trigger.event.data.probability * 100) | round }}%).
 ```
 
-**Usare il sensore in learning come semplice avviso**
+**Use the sensor in learning mode as a simple notice**
 
 ```yaml
-alias: Avviso rientro (anche in apprendimento)
+alias: Return notice (also while learning)
 triggers:
   - trigger: state
-    entity_id: binary_sensor.giorgio_returning
+    entity_id: binary_sensor.alice_returning
     to: "on"
 actions:
   - action: persistent_notification.create
     data:
       title: >
-        {{ 'Previsione (in apprendimento)' if state_attr('binary_sensor.giorgio_returning', 'advisory') else 'Rientro previsto' }}
+        {{ 'Prediction (learning)' if state_attr('binary_sensor.alice_returning', 'advisory') else 'Return predicted' }}
       message: >
-        Probabilità {{ (state_attr('binary_sensor.giorgio_returning', 'probability') * 100) | round }}%,
-        motivo: {{ state_attr('binary_sensor.giorgio_returning', 'reason') }}
+        Probability {{ (state_attr('binary_sensor.alice_returning', 'probability') * 100) | round }}%,
+        reason: {{ state_attr('binary_sensor.alice_returning', 'reason') }}
 ```
 
 ---
 
-## I primi giorni di apprendimento
+## The first days of learning
 
-Cosa guardare in `sensor.<p>_model_maturity` e negli altri sensori:
+What to look at in `sensor.<p>_model_maturity` and the other sensors:
 
-- **`episodes`**: numero di assenze usate. Dopo l'import dello storico dovrebbe già
-  essere > 0; se è 0, controlla che la persona abbia storia nel recorder e che la
-  zona di casa sia corretta.
-- **`brier_score` vs `baseline_brier_score`**: il primo deve scendere sotto il
-  secondo. Finché sono simili il modello non batte "la media" e resta in learning.
-- **`brier_skill_score`**: > 0 significa che il modello aggiunge informazione; a 0.5
-  il contributo della bravura alla maturità è pieno.
-- **`sensor.<p>_return_reason`**: spiega la stima in forma compatta (in inglese), es.
+- **`episodes`**: number of absences used. After the history import it should already
+  be > 0; if it is 0, check that the person has recorder history and that the home
+  zone is correct.
+- **`brier_score` vs `baseline_brier_score`**: the first must drop below the second.
+  While they are similar the model does not beat "the average" and stays in learning.
+- **`brier_skill_score`**: > 0 means the model adds information; at 0.5 the skill
+  contribution to maturity is maxed out.
+- **`sensor.<p>_return_reason`**: explains the estimate compactly, e.g.
   `left 06:10 (morning); approaching 45 km/h, 12.3 km; habit P 0.42, GPS LR 4.0`.
-  È il modo più rapido per capire previsioni strane.
-- Nel blueprint attiva temporaneamente **"Scrivi decisioni nel logbook"** per vedere
-  perché ogni zona ha preso un certo preset.
+  It is the quickest way to understand odd predictions.
+- In the blueprint, temporarily enable **"Write decisions to the logbook"** to see why
+  each zone picked a given preset.
 
-Con abitudini regolari servono in genere 2–3 settimane per arrivare in live; con
-turni variabili di più. Puoi forzare `live` dal select se ti fidi prima.
-
----
-
-## Modello sfidante (gradient boosting, opzionale)
-
-Schema **champion/challenger**: il modello integrato (bayesiano a kernel, Python
-puro) resta sempre il *campione*. Se abiliti l'opzione **Modello sfidante
-(gradient boosting, numpy)** (disattivata di default), l'integrazione addestra in
-background uno *sfidante* sulle previsioni passate già verificate, e lo usa **solo
-quando è dimostrabilmente migliore**.
-
-**Perché non scikit-learn.** Le prime versioni usavano
-`HistGradientBoostingClassifier` di scikit-learn. In un'installazione reale su Home
-Assistant OS (Alpine Linux, musl, Python 3.14) l'installazione è fallita:
-scikit-learn non pubblica wheel *musllinux*, quindi pip prova a compilarlo dai
-sorgenti e si ferma (niente meson né compilatore nel container). numpy invece ha
-wheel musl ed è già una dipendenza di Home Assistant (versione fissata nei suoi
-vincoli). Lo sfidante è quindi ora un gradient boosting scritto in casa che usa solo
-numpy (`hrp_core/gbm.py`).
-
-- **Cos'è**: gradient boosting a istogrammi per la log-loss binaria: feature
-  discretizzate in ≤ 64 intervalli per quantili, alberi di profondità ≤ 3 con almeno
-  20 campioni per foglia, learning rate 0.1, ≤ 80 alberi, regolarizzazione L2 sulle
-  foglie, pesi per recenza. Le feature sono le stesse del log delle previsioni
-  (probabilità a priori, rapporto di verosimiglianza GPS, tempo fuori casa, ora di
-  uscita e ora attuale, festivo, distanza, velocità, probabilità bayesiana).
-- **Niente da installare (di solito)**: se numpy è già importabile, come nelle
-  normali installazioni di Home Assistant, non viene tentata alcuna installazione.
-  Altrimenti viene richiesto `numpy` senza versione (la risolvono i vincoli di HA).
-  Se fallisce, un avviso nel log e si continua con il modello integrato; nulla si
-  rompe.
-- **Costo su un Intel N100**: un solo thread, addestramento in background al massimo
-  ogni 6 ore (o dopo 150 nuove previsioni verificate), un solo addestramento alla
-  volta, mai nel loop di Home Assistant. Misurato su un N100 (simulazione di 120
-  giorni, log di 3000 previsioni): in media ~0.35 s (max ~0.5 s) per addestramento (valutazione +
-  riaddestramento completo). La previsione è Python puro (< 0.1 ms) e non usa numpy.
-- **Sopravvive al riavvio**: gli alberi esportati sono un piccolo JSON (circa 40 KB per
-  persona) salvato con lo stato, quindi uno sfidante promosso continua a servire
-  subito dopo un riavvio, senza aspettare il riaddestramento.
-- **Cambio automatico solo se migliore**: lo sfidante diventa attivo solo se, su dati
-  recenti **non visti in addestramento** (l'ultimo 20 % delle previsioni verificate),
-  ha un Brier score migliore di almeno il **3 %** per **2 valutazioni consecutive** e
-  con almeno **400 previsioni verificate**. Se poi fa peggio del modello integrato,
-  si torna **subito** al modello integrato.
-- **Quale modello è attivo**: guarda gli attributi di
-  `sensor.<p>_model_maturity`: `active_model` (`kernel_bayes` = integrato,
-  `learned_fusion` = fusione appresa, `gbm` = sfidante), `candidate_brier` (Brier di
-  ogni candidato sull'ultima valutazione; più basso è meglio), `challenger_enabled`,
-  `numpy_available` (`sklearn_available` resta per una versione come alias
-  deprecato). `active_model` compare anche su `binary_sensor.<p>_returning`, su
-  `sensor.<p>_return_reason` (e nel testo della spiegazione) e nei diagnostics.
-  Lo stato salvato con il vecchio nome `sklearn_gbm` viene letto come `gbm`; la
-  chiave dell'opzione (`enable_sklearn_challenger`) resta invariata per conservare
-  l'impostazione esistente.
+With regular habits it usually takes 2–3 weeks to reach live; with variable shifts
+(e.g. one person has fixed hours, the other works rotating shifts) it takes longer for
+the shift worker. You can force `live` from the select if you trust it earlier.
 
 ---
 
-## Per sviluppatori: simulazione e test
+## Challenger model (gradient boosting, optional)
 
-Il cuore del modello (`custom_components/home_return_predictor/hrp_core/`) è Python
-puro, senza import di Home Assistant.
+A **champion/challenger** scheme: the built-in model (kernel Bayesian, pure Python)
+always remains the *champion*. If you enable the **Challenger model (gradient
+boosting, numpy)** option (off by default), the integration trains a *challenger* in
+the background on past verified predictions, and uses it **only when it is
+demonstrably better**.
+
+**Why not scikit-learn.** Early versions used scikit-learn's
+`HistGradientBoostingClassifier`. On a real Home Assistant OS install (Alpine Linux,
+musl, Python 3.14) installation failed: scikit-learn does not publish *musllinux*
+wheels, so pip tries to build it from source and stops (no meson or compiler in the
+container). numpy, on the other hand, has musl wheels and is already a Home Assistant
+dependency (version pinned in its constraints). The challenger is therefore now a
+home-grown gradient boosting implementation that uses only numpy (`hrp_core/gbm.py`).
+
+- **What it is**: histogram gradient boosting for binary log-loss: features binned
+  into ≤ 64 quantile bins, trees of depth ≤ 3 with at least 20 samples per leaf,
+  learning rate 0.1, ≤ 80 trees, L2 regularisation on leaves, recency weights. The
+  features are the same as in the prediction log (prior probability, GPS likelihood
+  ratio, time away, departure time and current time, holiday, distance, speed,
+  Bayesian probability).
+- **Nothing to install (usually)**: if numpy is already importable, as in normal Home
+  Assistant installs, no installation is attempted. Otherwise `numpy` is requested
+  without a version (HA's constraints resolve it). If that fails, a warning is logged
+  and the built-in model carries on; nothing breaks.
+- **Cost on an Intel N100**: a single thread, background training at most every 6
+  hours (or after 150 new verified predictions), one training at a time, never in the
+  Home Assistant event loop. Measured on an N100 (120-day simulation, log of 3000
+  predictions): on average ~0.35 s (max ~0.5 s) per training (evaluation + full
+  retraining). Prediction is pure Python (< 0.1 ms) and does not use numpy.
+- **Survives restarts**: the exported trees are a small JSON (about 40 KB per person)
+  saved with the state, so a promoted challenger keeps serving right after a restart,
+  without waiting for retraining.
+- **Automatic switch only when better**: the challenger becomes active only if, on
+  recent data **not seen in training** (the last 20% of verified predictions), it has
+  a Brier score at least **3%** better for **2 consecutive evaluations** and with at
+  least **400 verified predictions**. If it then does worse than the built-in model,
+  it switches back to the built-in model **immediately**.
+- **Which model is active**: see the attributes of `sensor.<p>_model_maturity`:
+  `active_model` (`kernel_bayes` = built-in, `learned_fusion` = learnt fusion, `gbm` =
+  challenger), `candidate_brier` (Brier of each candidate at the last evaluation;
+  lower is better), `challenger_enabled`, `numpy_available` (`sklearn_available` is
+  kept for one release as a deprecated alias). `active_model` also appears on
+  `binary_sensor.<p>_returning`, on `sensor.<p>_return_reason` (and in the explanation
+  text) and in the diagnostics. State saved under the old name `sklearn_gbm` is read
+  as `gbm`; the option key (`enable_sklearn_challenger`) is unchanged to preserve the
+  existing setting.
+
+---
+
+## For developers: simulation and tests
+
+The model core (`custom_components/home_return_predictor/hrp_core/`) is pure Python,
+with no Home Assistant imports.
 
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements_test.txt
-.venv/bin/python scripts/simulate.py          # mesi di dati sintetici, curva di accuratezza/maturità
-.venv/bin/python scripts/simulate.py --gbm    # anche lo sfidante gradient boosting (tempi di addestramento)
-.venv/bin/python -m pytest                    # tutti i test
-.venv/bin/python -m pytest tests/model -q     # solo modello e preset_logic (senza HA)
-.venv/bin/python -m pytest tests/blueprint -q # blueprint VTherm eseguito in un HA di test
+.venv/bin/python scripts/simulate.py          # months of synthetic data, accuracy/maturity curve
+.venv/bin/python scripts/simulate.py --gbm    # also the gradient boosting challenger (training times)
+.venv/bin/python -m pytest                    # all tests
+.venv/bin/python -m pytest tests/model -q     # model and preset_logic only (no HA)
+.venv/bin/python -m pytest tests/blueprint -q # VTherm blueprint run in a test HA
 .venv/bin/ruff check . && .venv/bin/ruff format --check .
 ```
 
-- `tests/model/test_preset_logic.py`: tabella di verità della logica preset (zone
-  giorno/notte/sempre, calendario valutato all'ETA, letto, priorità, mai declassare,
-  isteresi senza ping‑pong, occupazione, protezioni).
-- `tests/blueprint/`: carica il blueprint YAML, lo esegue in un Home Assistant di
-  test con stati finti e verifica i preset richiesti, per garantire che il Jinja
-  corrisponda a `preset_logic.py`.
+- `tests/model/test_preset_logic.py`: truth table of the preset logic (day/night/always
+  zones, schedule evaluated at the ETA, bed, priorities, never downgrade, hysteresis
+  without ping-pong, occupancy, protections).
+- `tests/blueprint/`: loads the YAML blueprint, runs it in a test Home Assistant with
+  fake states and checks the requested presets, to guarantee that the Jinja matches
+  `preset_logic.py`.
 
 ---
 
-## Limiti noti
+## Known limitations
 
-- Serve un tracker affidabile per ogni persona; senza GPS il modello usa solo le
-  abitudini.
-- Il primo rientro dopo un cambio radicale di abitudini (nuovo lavoro, ferie) sarà
-  previsto male; l'emivita regola quanto in fretta si adatta.
-- La probabilità casa è "qualcuno rientra"; con più persone fuori l'ETA è quella del
-  primo rientro previsto.
-- Il calendario delle zone è letto con l'approssimazione descritta sopra (un blocco
-  che inizia prima dell'ETA si assume ancora attivo all'arrivo).
-- Le condizioni sulle entità opzionali (calendario, letto, occupazione) vengono
-  rilevate subito sui cambi on/off; tutto il resto al più entro 2 minuti.
-- Ospiti e persone non tracciate non sono visti dal modello: usa la fonte "qualcuno
-  in casa" (es. un `input_boolean` o un gruppo) per includerli.
-- Altri modelli: tutto il codice di Home Assistant parla con il modello tramite
-  l'interfaccia astratta `ReturnModel` (`hrp_core/base.py`: `load_history`,
+- A reliable tracker is needed for each person; without GPS the model uses habits
+  only.
+- The first return after a radical change of habits (new job, holidays) will be
+  poorly predicted; the half-life controls how quickly it adapts.
+- The house probability means "someone returns"; with several people away the ETA is
+  that of the first predicted return.
+- Zone schedules are read with the approximation described above (a block starting
+  before the ETA is assumed to still be active at arrival).
+- Conditions on optional entities (schedule, bed, occupancy) are picked up
+  immediately on on/off changes; everything else within 2 minutes at most.
+- Guests and untracked people are invisible to the model: use the "someone home"
+  source (e.g. an `input_boolean` or a group) to include them.
+- Other models: all Home Assistant code talks to the model through the abstract
+  `ReturnModel` interface (`hrp_core/base.py`: `load_history`,
   `observe_transition`, `predict`, `log_prediction`, `resolve`, `maturity`,
-  `to_dict`/`from_dict`); in futuro altri backend (es. modelli di sopravvivenza o
-  altre librerie ML) possono essere aggiunti come nuove implementazioni o come
-  ulteriori sfidanti, senza toccare entità e blueprint.
+  `to_dict`/`from_dict`); in the future other backends (e.g. survival models or other
+  ML libraries) can be added as new implementations or as additional challengers,
+  without touching entities and blueprints.

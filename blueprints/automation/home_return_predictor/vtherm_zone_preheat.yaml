@@ -144,7 +144,8 @@ blueprint:
         preheat_sensor:
           name: Pre-heat minutes sensor (optional)
           description: >
-            Sensor giving the needed minutes, e.g. Ecronika ha-preheat
+            Sensor giving the needed minutes, e.g. Room Thermal Model
+            `sensor.<zone>_preheat_minutes` or Ecronika ha-preheat
             `sensor.<zone>_predicted_duration`. Used when numeric, otherwise the
             fixed value above is used.
           default: ""
