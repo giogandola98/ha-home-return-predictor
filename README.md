@@ -30,8 +30,9 @@ tramite il blueprint incluso, ma i sensori sono utilizzabili in qualsiasi automa
 13. [Plugin termici: confronto e combinazione consigliata](#plugin-termici-confronto-e-combinazione-consigliata)
 14. [Esempi di automazioni](#esempi-di-automazioni)
 15. [I primi giorni di apprendimento](#i-primi-giorni-di-apprendimento)
-16. [Per sviluppatori: simulazione e test](#per-sviluppatori-simulazione-e-test)
-17. [Limiti noti](#limiti-noti)
+16. [Modello sfidante scikit-learn (opzionale)](#modello-sfidante-scikit-learn-opzionale)
+17. [Per sviluppatori: simulazione e test](#per-sviluppatori-simulazione-e-test)
+18. [Limiti noti](#limiti-noti)
 
 ---
 
@@ -187,6 +188,7 @@ Opzioni (Configura):
 | Emivita | 28 giorni | Quanto velocemente si dimenticano le vecchie abitudini |
 | Intervallo di aggiornamento | 2 min | Ricalcolo periodico (oltre agli aggiornamenti sugli eventi) |
 | Calendario festività | — | `calendar.*` opzionale: i giorni con eventi sono trattati come festivi |
+| Modello sfidante scikit-learn | off | Installa scikit-learn e addestra in background un modello alternativo, usato solo se migliore (vedi [sotto](#modello-sfidante-scikit-learn-opzionale)) |
 
 ---
 
@@ -196,10 +198,10 @@ Per ogni persona `<p>`:
 
 | Entità | Tipo | Contenuto |
 |---|---|---|
-| `binary_sensor.<p>_returning` | binary | On se la probabilità supera la soglia. Attributi: `probability`, `eta`, `mode`, `advisory`, `reason` |
+| `binary_sensor.<p>_returning` | binary | On se la probabilità supera la soglia. Attributi: `probability`, `eta`, `mode`, `advisory`, `reason`, `active_model` |
 | `sensor.<p>_return_probability` | % | Probabilità di rientro entro l'orizzonte (100 se in casa) |
 | `sensor.<p>_return_eta` | timestamp | ETA stimata |
-| `sensor.<p>_model_maturity` | % | Maturità. Attributi: `episodes`, `brier_score`, `baseline_brier_score`, `brier_skill_score` |
+| `sensor.<p>_model_maturity` | % | Maturità. Attributi: `episodes`, `brier_score`, `baseline_brier_score`, `brier_skill_score`, `active_model`, `candidate_brier`, `challenger_enabled`, `sklearn_available` |
 | `sensor.<p>_return_reason` | testo | Spiegazione leggibile della stima corrente |
 | `select.<p>_mode` | select | `auto` / `learning` / `live` |
 
@@ -472,6 +474,36 @@ turni variabili di più. Puoi forzare `live` dal select se ti fidi prima.
 
 ---
 
+## Modello sfidante scikit-learn (opzionale)
+
+Schema **champion/challenger**: il modello integrato (bayesiano a kernel, Python
+puro) resta sempre il *campione*. Se abiliti l'opzione **Modello sfidante
+scikit-learn** (disattivata di default), l'integrazione addestra in background uno
+*sfidante* (`HistGradientBoostingClassifier`) sulle previsioni passate già
+verificate, e lo usa **solo quando è dimostrabilmente migliore**.
+
+- **Installazione a runtime**: all'attivazione Home Assistant installa
+  `scikit-learn>=1.5` (circa 100 MB, rispettando i vincoli di versione di HA). Se
+  l'installazione fallisce viene scritto un avviso nel log e si continua con il
+  modello integrato; nulla si rompe.
+- **Leggero anche su un N100**: un solo thread, modello piccolo (≤ 100 alberi da ≤ 15
+  foglie), addestramento in background al massimo ogni 6 ore (o dopo molte nuove
+  previsioni verificate), tipicamente ~1 s; un solo addestramento alla volta, mai
+  nel loop di Home Assistant. Il modello non viene salvato: si riaddestra dal log
+  persistito dopo il riavvio.
+- **Cambio automatico solo se migliore**: lo sfidante diventa attivo solo se, su dati
+  recenti **non visti in addestramento**, ha un Brier score migliore di almeno il
+  **3 %** per **2 valutazioni consecutive** e con almeno **400 previsioni
+  verificate**. Se poi peggiora, si torna **subito** al modello integrato.
+- **Quale modello è attivo**: guarda gli attributi di
+  `sensor.<p>_model_maturity`: `active_model` (`kernel_bayes` = integrato),
+  `candidate_brier` (Brier di ogni candidato sull'ultima valutazione; più basso è
+  meglio), `challenger_enabled`, `sklearn_available`. `active_model` compare anche
+  su `binary_sensor.<p>_returning`, su `sensor.<p>_return_reason` (e nel testo
+  della spiegazione) e nei diagnostics.
+
+---
+
 ## Per sviluppatori: simulazione e test
 
 Il cuore del modello (`custom_components/home_return_predictor/hrp_core/`) è Python
@@ -509,3 +541,9 @@ python -m venv .venv && .venv/bin/pip install -r requirements_test.txt
   rilevate subito sui cambi on/off; tutto il resto al più entro 2 minuti.
 - Ospiti e persone non tracciate non sono visti dal modello: usa la fonte "qualcuno
   in casa" (es. un `input_boolean` o un gruppo) per includerli.
+- Altri modelli: tutto il codice di Home Assistant parla con il modello tramite
+  l'interfaccia astratta `ReturnModel` (`hrp_core/base.py`: `load_history`,
+  `observe_transition`, `predict`, `log_prediction`, `resolve`, `maturity`,
+  `to_dict`/`from_dict`); in futuro altri backend (es. modelli di sopravvivenza o
+  altre librerie ML) possono essere aggiunti come nuove implementazioni o come
+  ulteriori sfidanti, senza toccare entità e blueprint.
