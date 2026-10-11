@@ -13,6 +13,7 @@ from .base import (
     ReturnModel,
 )
 from .bayes_model import KernelBayesReturnModel
+from .challenger import sklearn_available
 from .evidence import haversine_m
 
 
@@ -33,4 +34,5 @@ __all__ = [
     "ReturnModel",
     "create_model",
     "haversine_m",
+    "sklearn_available",
 ]

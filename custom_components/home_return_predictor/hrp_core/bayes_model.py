@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Iterable
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -16,6 +17,13 @@ from .base import (
     PresenceTransition,
     ReturnModel,
 )
+from .challenger import (
+    N_CHALLENGER_FEATURES,
+    SklearnChallenger,
+    bayes_from_challenger_features,
+    build_challenger_features,
+    sklearn_available,
+)
 from .episodes import (
     KIND_EPISODE,
     KIND_TRIP,
@@ -26,15 +34,28 @@ from .episodes import (
     to_local,
     to_utc,
 )
-from .evidence import LRCalibrator, compute_evidence
+from .evidence import CalibrationSegments, LRCalibrator, compute_evidence
 from .fusion import combine_eta, fuse_probability, position_eta_minutes
 from .maturity import LogEntry, PredictionLog, maturity_report, resolve_entries
-from .prior import EpisodeKey, episode_keys, estimate_prior
-from .stacker import Stacker, build_features
+from .prior import EpisodeKey, duration_baseline, episode_keys, estimate_prior, is_rest_day
+from .selection import (
+    FUSION_ALIAS,
+    KERNEL_BAYES,
+    LEARNED_FUSION,
+    RULES,
+    SKLEARN_GBM,
+    Selector,
+    chronological_split,
+    recency_weights,
+    weighted_brier,
+)
+from .stacker import N_FEATURES, Stacker, apply_weights, build_features, fit_weights
 
 STATE_VERSION = 1
 EPISODE_RETENTION_HALF_LIVES = 10.0
 STACKER_REFIT_EVERY = 150  # newly resolved entries between stacker refits
+CHALLENGER_RETRAIN_HOURS = 6.0
+CHALLENGER_RETRAIN_ENTRIES = 150
 
 
 def shift_label(local_hour: int) -> str:
@@ -88,15 +109,23 @@ class KernelBayesReturnModel(ReturnModel):
         self.stacker = Stacker()
         self._log = PredictionLog()
         self._calib_pending: list[LogEntry] = []
-        self._seen_key: str | None = None
-        self._seen_classes: list[str] = []
+        self._segments = CalibrationSegments()
         self._since_refit = 0
+        self.selector = Selector()
+        # Challenger: only the enable flag and the selection state are persisted.
+        self._challenger_enabled = False
+        self._challenger = SklearnChallenger()
+        self._last_training: datetime | None = None
+        self._resolved_total = 0  # resolved entries seen in this process
+        self._resolved_at_training = 0
         # Prior keys cache; set to None whenever episodes/trips change.
         self._key_cache: tuple[list[EpisodeKey], list[EpisodeKey]] | None = None
 
     # ------------------------------------------------------------------ lifecycle
     def reset(self) -> None:
+        enabled = self._challenger_enabled
         self.__init__(self.config)  # type: ignore[misc]
+        self._challenger_enabled = enabled
 
     def load_history(
         self,
@@ -109,7 +138,7 @@ class KernelBayesReturnModel(ReturnModel):
         self._key_cache = None
         self._is_home, self._away_since = built.is_home, built.away_since
         self._away_is_holiday = False
-        self._seen_key, self._seen_classes = None, []
+        self._segments = CalibrationSegments()
         fix_list = sorted(fixes, key=lambda f: to_utc(f.ts))
         if fix_list:
             self._warm_calibration(fix_list)
@@ -121,11 +150,12 @@ class KernelBayesReturnModel(ReturnModel):
         times = [to_utc(f.ts) for f in fixes]
         window = timedelta(minutes=cfg.regression_window_minutes)
         idx = 0
+        segments = CalibrationSegments()
         for ep in sorted((*self._episodes, *self._trips), key=lambda e: e.left_at):
             while idx < len(times) and times[idx] < ep.left_at:
                 idx += 1
             start = idx
-            seen: set[str] = set()
+            key = ep.left_at.isoformat()
             j = idx
             while j < len(times) and times[j] < ep.returned_at:
                 lo = start
@@ -139,8 +169,7 @@ class KernelBayesReturnModel(ReturnModel):
                     cfg.max_fix_accuracy_m,
                 )
                 cls = ev.approach_class
-                if cls is not None and cls not in seen:
-                    seen.add(cls)
+                if cls is not None and segments.observe(times[j], cls, key, cfg.horizon_minutes):
                     returned = minutes_between(times[j], ep.returned_at) <= cfg.horizon_minutes
                     self.calibrator.update(cls, returned)
                 j += 1
@@ -156,7 +185,6 @@ class KernelBayesReturnModel(ReturnModel):
             self._is_home = False
             self._away_since = ts
             self._away_is_holiday = is_holiday
-            self._seen_key, self._seen_classes = None, []
             return None
 
         was_away = self._is_home is False
@@ -208,7 +236,11 @@ class KernelBayesReturnModel(ReturnModel):
                 approach_class=None,
                 distance_m=None,
                 is_home=True,
-                reason={"at_home": True, "fusion": "bayes"},
+                reason={
+                    "at_home": True,
+                    "fusion": FUSION_ALIAS[self._serving_model()],
+                    "active_model": self._serving_model(),
+                },
             )
 
         left_at = to_utc(model_input.left_at) if model_input.left_at else self._away_since
@@ -231,10 +263,25 @@ class KernelBayesReturnModel(ReturnModel):
             model_input.fixes, now, cfg.regression_window_minutes, cfg.max_fix_accuracy_m
         )
         lr = self.calibrator.likelihood_ratio(ev.approach_class)
-        features = self._features(now, prior.probability, lr, minutes_away, ev.distance_m)
         p_bayes = fuse_probability(prior.probability, lr)
-        fusion = "learned" if self.stacker.active else "bayes"
-        probability = self.stacker.predict(features) if self.stacker.active else p_bayes
+        active = self._serving_model()
+        if active == LEARNED_FUSION:
+            features = self._features(now, prior.probability, lr, minutes_away, ev.distance_m)
+            probability = self.stacker.predict(features)
+        elif active == SKLEARN_GBM:
+            row = self._challenger_row(
+                now,
+                left_at,
+                minutes_away,
+                prior.probability,
+                lr,
+                ev.distance_m,
+                ev.speed_kmh,
+                model_input.is_holiday,
+            )
+            probability = self._challenger.predict_proba(row)
+        else:
+            probability = p_bayes
 
         habit_min = (
             prior.eta_duration_minutes - minutes_away
@@ -257,7 +304,8 @@ class KernelBayesReturnModel(ReturnModel):
             "distance_km": round(ev.distance_m / 1000.0, 2) if ev.distance_m is not None else None,
             "lr": round(lr, 3),
             "eta_source": eta_source,
-            "fusion": fusion,
+            "fusion": FUSION_ALIAS[active],
+            "active_model": active,
             "probability_bayes": round(p_bayes, 4),
         }
         return Prediction(
@@ -294,6 +342,50 @@ class KernelBayesReturnModel(ReturnModel):
             local_now.hour + local_now.minute / 60.0,
         )
 
+    def _challenger_row(
+        self,
+        now: datetime,
+        left_at: datetime | None,
+        minutes_away: float,
+        prior: float,
+        lr: float,
+        distance_m: float | None,
+        speed_kmh: float | None,
+        is_holiday: bool,
+    ) -> list[float]:
+        tz = self.config.timezone
+        local_now = to_local(now, tz)
+        local_dep = to_local(left_at, tz) if left_at is not None else None
+        ref = local_dep or local_now
+        return build_challenger_features(
+            prior=prior,
+            likelihood_ratio=lr,
+            minutes_away=minutes_away,
+            horizon_minutes=self.config.horizon_minutes,
+            departure_hour=(
+                local_dep.hour + local_dep.minute / 60.0 if local_dep is not None else None
+            ),
+            local_hour=local_now.hour + local_now.minute / 60.0,
+            rest_day=is_rest_day(ref.weekday(), is_holiday),
+            distance_m=distance_m,
+            speed_kmh=speed_kmh,
+            has_gps=distance_m is not None,
+            p_bayes=fuse_probability(prior, lr),
+        )
+
+    def _serving_model(self) -> str:
+        """Champion, or the next-best candidate while the champion cannot serve."""
+        champ = self.selector.champion
+        if champ != SKLEARN_GBM:
+            return champ
+        if self._challenger_enabled and self._challenger.trained:
+            return SKLEARN_GBM
+        brier = self.selector.brier
+        learned, bayes = brier.get(LEARNED_FUSION), brier.get(KERNEL_BAYES)
+        if learned is not None and bayes is not None and learned < bayes:
+            return LEARNED_FUSION
+        return KERNEL_BAYES
+
     # ------------------------------------------------------------ logging/scoring
     def log_prediction(self, model_input: ModelInput, prediction: Prediction) -> bool:
         if model_input.is_home or prediction.is_home:
@@ -302,8 +394,9 @@ class KernelBayesReturnModel(ReturnModel):
         horizon_end = now + timedelta(minutes=self.config.horizon_minutes)
         left_at = to_utc(model_input.left_at) if model_input.left_at else self._away_since
         features: list[float] = []
+        row: list[float] = []
+        minutes_away = max(minutes_between(left_at, now), 0.0) if left_at else 0.0
         if prediction.prior_probability is not None:
-            minutes_away = max(minutes_between(left_at, now), 0.0) if left_at else 0.0
             features = self._features(
                 now,
                 prediction.prior_probability,
@@ -311,13 +404,20 @@ class KernelBayesReturnModel(ReturnModel):
                 minutes_away,
                 prediction.distance_m,
             )
-        key = _iso(left_at)
-        if key != self._seen_key:
-            self._seen_key, self._seen_classes = key, []
+            row = self._challenger_row(
+                now,
+                left_at,
+                minutes_away,
+                prediction.prior_probability,
+                prediction.likelihood_ratio,
+                prediction.distance_m,
+                prediction.approach_speed_kmh,
+                model_input.is_holiday,
+            )
         cls = prediction.approach_class
-        if cls is not None and cls not in self._seen_classes:
-            # Calibration observation: first time this class is seen in this absence.
-            self._seen_classes.append(cls)
+        if self._segments.observe(now, cls, _iso(left_at), self.config.horizon_minutes):
+            # Calibration observation: first time this class is seen in this
+            # absence (still/away) or approach segment (approach classes).
             self._calib_pending.append(
                 LogEntry(
                     now, prediction.probability, prediction.prior_probability, cls, horizon_end
@@ -330,6 +430,21 @@ class KernelBayesReturnModel(ReturnModel):
             cls,
             horizon_end,
             features=features,
+            x=row,
+        )
+        if self._log.last_logged is not None and (
+            minutes_between(self._log.last_logged, now)
+            < self.config.prediction_log_interval_minutes
+        ):
+            return False
+        ep_keys, trip_keys = self._keys()
+        entry.base = duration_baseline(
+            ep_keys,
+            trip_keys,
+            now=now,
+            minutes_away=minutes_away,
+            horizon_minutes=self.config.horizon_minutes,
+            half_life_days=self.config.half_life_days,
         )
         return self._log.add(entry, self.config.prediction_log_interval_minutes)
 
@@ -346,10 +461,117 @@ class KernelBayesReturnModel(ReturnModel):
             return 0
         self._log.settle(resolved, ref)
         self._since_refit += len(resolved)
+        self._resolved_total += len(resolved)
         if self._since_refit >= STACKER_REFIT_EVERY:
             self._since_refit = 0
             self.stacker.fit(self._log.resolved, ref, self.config.half_life_days)
+            if not self._challenger_mode():
+                # Without the challenger, the stacker's own holdout drives selection.
+                self.selector.update(
+                    {
+                        KERNEL_BAYES: self.stacker.holdout_brier_bayes,
+                        LEARNED_FUSION: self.stacker.holdout_brier_learned,
+                    },
+                    self.stacker.trained_on,
+                )
         return len(resolved)
+
+    # ----------------------------------------------------------------- challenger
+    def _challenger_rows(self) -> list[LogEntry]:
+        return [
+            e
+            for e in self._log.resolved
+            if e.outcome is not None
+            and len(e.x) == N_CHALLENGER_FEATURES
+            and len(e.features) == N_FEATURES
+        ]
+
+    def _challenger_mode(self) -> bool:
+        """True when train_challenger (not the stacker refit) drives selection."""
+        return (
+            self._challenger_enabled
+            and sklearn_available()
+            and len(self._challenger_rows()) >= RULES[SKLEARN_GBM].min_entries
+        )
+
+    def enable_challenger(self, enabled: bool) -> None:
+        """Switch the optional scikit-learn challenger on or off."""
+        self._challenger_enabled = bool(enabled)
+        if not enabled:
+            self._challenger = SklearnChallenger()
+            self._last_training = None
+
+    def challenger_due(self, now: datetime) -> bool:
+        """True when ``train_challenger`` should run (cheap; call from the event loop)."""
+        if not self._challenger_enabled or not sklearn_available():
+            return False
+        if self._last_training is None:
+            return len(self._challenger_rows()) >= RULES[SKLEARN_GBM].min_entries
+        elapsed_h = minutes_between(self._last_training, to_utc(now)) / 60.0
+        new = self._resolved_total - self._resolved_at_training
+        return elapsed_h >= CHALLENGER_RETRAIN_HOURS or new >= CHALLENGER_RETRAIN_ENTRIES
+
+    def train_challenger(self, now: datetime) -> dict[str, Any]:
+        """Train + evaluate the challenger and update the selection (blocking).
+
+        Run in an executor. Holdout = last 20 % of resolved entries (chronological);
+        the stacker and the GBM are fit on the first 80 % for the evaluation, then
+        the GBM is refit on everything for serving.
+        """
+        started = time.perf_counter()
+        now = to_utc(now)
+        rows = self._challenger_rows()
+
+        def summary(trained: bool, reason: str, brier: dict[str, Any]) -> dict[str, Any]:
+            return {
+                "trained": trained,
+                "reason": reason,
+                "rows": len(rows),
+                "seconds": round(time.perf_counter() - started, 3),
+                "brier": brier,
+                "active_model": self._serving_model(),
+            }
+
+        if not self._challenger_enabled:
+            return summary(False, "disabled", {})
+        if not sklearn_available():
+            return summary(False, "sklearn_unavailable", {})
+        self._last_training = now
+        self._resolved_at_training = self._resolved_total
+        if len(rows) < RULES[SKLEARN_GBM].min_entries:
+            return summary(False, "insufficient_data", {})
+
+        hl = self.config.half_life_days
+        train, hold = chronological_split(rows)
+        w_train = recency_weights([e.ts for e in train], now, hl)
+        w_hold = recency_weights([e.ts for e in hold], now, hl)
+        y_train = [int(e.outcome or 0) for e in train]
+        y_hold = [int(e.outcome or 0) for e in hold]
+
+        weights = fit_weights([e.features for e in train], y_train, w_train)
+        candidate = SklearnChallenger()
+        candidate.fit([e.x for e in train], y_train, w_train)
+        brier = {
+            KERNEL_BAYES: weighted_brier(
+                [bayes_from_challenger_features(e.x) for e in hold], y_hold, w_hold
+            ),
+            LEARNED_FUSION: weighted_brier(
+                [apply_weights(weights, e.features) for e in hold], y_hold, w_hold
+            ),
+            SKLEARN_GBM: weighted_brier(
+                candidate.predict_many([e.x for e in hold]), y_hold, w_hold
+            ),
+        }
+        self.selector.update(brier, len(rows))
+
+        serving = SklearnChallenger()
+        serving.fit(
+            [e.x for e in rows],
+            [int(e.outcome or 0) for e in rows],
+            recency_weights([e.ts for e in rows], now, hl),
+        )
+        self._challenger = serving
+        return summary(True, "ok", brier)
 
     def resolve(self, now: datetime, is_home: bool) -> int:
         now = to_utc(now)
@@ -366,7 +588,9 @@ class KernelBayesReturnModel(ReturnModel):
             self._log.resolved,
             to_utc(now),
             self.config.half_life_days,
-            fusion="learned" if self.stacker.active else "bayes",
+            fusion=FUSION_ALIAS[self._serving_model()],
+            active_model=self._serving_model(),
+            candidate_brier=dict(self.selector.brier),
         )
 
     def episodes(self) -> list[AbsenceEpisode]:
@@ -389,9 +613,10 @@ class KernelBayesReturnModel(ReturnModel):
             "stacker": self.stacker.to_dict(),
             "log": self._log.to_dict(),
             "calib_pending": [e.to_dict() for e in self._calib_pending],
-            "seen_key": self._seen_key,
-            "seen_classes": list(self._seen_classes),
+            "segments": self._segments.to_dict(),
             "since_refit": self._since_refit,
+            "selection": self.selector.to_dict(),
+            "challenger_enabled": self._challenger_enabled,
         }
 
     @classmethod
@@ -408,7 +633,11 @@ class KernelBayesReturnModel(ReturnModel):
         model.stacker = Stacker.from_dict(data.get("stacker", {}))
         model._log = PredictionLog.from_dict(data.get("log", {}))
         model._calib_pending = [LogEntry.from_dict(e) for e in data.get("calib_pending", [])]
-        model._seen_key = data.get("seen_key")
-        model._seen_classes = list(data.get("seen_classes", []))
+        model._segments = CalibrationSegments.from_dict(data.get("segments") or {})
         model._since_refit = int(data.get("since_refit", 0))
+        if "selection" in data:
+            model.selector = Selector.from_dict(data["selection"] or {})
+        elif model.stacker.active:  # state written before the generic selection existed
+            model.selector.champion = LEARNED_FUSION
+        model._challenger_enabled = bool(data.get("challenger_enabled", False))
         return model

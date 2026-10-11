@@ -1,2 +1,3 @@
 pytest-homeassistant-custom-component
 ruff
+scikit-learn>=1.5
