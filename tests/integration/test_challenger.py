@@ -1,4 +1,4 @@
-"""Optional scikit-learn challenger: option, runtime install, background training."""
+"""Optional gradient-boosting challenger: option, numpy on demand, background training."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ from homeassistant.requirements import RequirementsNotFound
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.home_return_predictor.const import (
-    CONF_ENABLE_SKLEARN,
+    CONF_ENABLE_CHALLENGER,
     CONF_HALF_LIFE_DAYS,
     CONF_HORIZON_MINUTES,
     CONF_MATURITY_THRESHOLD,
@@ -25,7 +25,7 @@ from custom_components.home_return_predictor.const import (
     CONF_RETURN_THRESHOLD,
     CONF_UPDATE_INTERVAL_MINUTES,
     DOMAIN,
-    SKLEARN_REQUIREMENT,
+    NUMPY_REQUIREMENT,
 )
 from custom_components.home_return_predictor.hrp_core import KernelBayesReturnModel
 
@@ -52,7 +52,7 @@ def _enabled_entry(hass: HomeAssistant) -> MockConfigEntry:
         title="Home Return Predictor",
         unique_id=DOMAIN,
         data={CONF_PERSONS: [ALICE, BOB], "home_zone": "zone.home"},
-        options={CONF_PERSONS: [ALICE, BOB], CONF_ENABLE_SKLEARN: True},
+        options={CONF_PERSONS: [ALICE, BOB], CONF_ENABLE_CHALLENGER: True},
     )
     entry.add_to_hass(hass)
     return entry
@@ -66,7 +66,7 @@ async def _setup(hass: HomeAssistant, entry: MockConfigEntry) -> None:
 async def test_options_flow_enables_challenger(
     hass: HomeAssistant, loaded_entry: MockConfigEntry, enable_calls: list[tuple[int, bool]]
 ) -> None:
-    """The boolean option is saved; the reload installs scikit-learn and enables it."""
+    """The boolean option is saved (historical key); the reload enables the challenger."""
     assert loaded_entry.runtime_data.challenger_enabled is False
     result = await hass.config_entries.options.async_init(loaded_entry.entry_id)
     assert result["type"] is FlowResultType.FORM
@@ -77,18 +77,19 @@ async def test_options_flow_enables_challenger(
         CONF_HORIZON_MINUTES: 90,
         CONF_HALF_LIFE_DAYS: 28,
         CONF_UPDATE_INTERVAL_MINUTES: 2,
-        CONF_ENABLE_SKLEARN: True,
+        CONF_ENABLE_CHALLENGER: True,
     }
     install = AsyncMock(return_value=None)
     with (
         patch(f"{COORD}.async_process_requirements", install),
-        patch(f"{COORD}.sklearn_available", return_value=True),
+        patch(f"{COORD}.numpy_available", return_value=True),
     ):
         result = await hass.config_entries.options.async_configure(result["flow_id"], user_input)
         await hass.async_block_till_done(wait_background_tasks=True)
     assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert loaded_entry.options[CONF_ENABLE_SKLEARN] is True
-    install.assert_awaited_once_with(hass, DOMAIN, [SKLEARN_REQUIREMENT])
+    assert loaded_entry.options[CONF_ENABLE_CHALLENGER] is True
+    assert loaded_entry.options["enable_sklearn_challenger"] is True  # stored key unchanged
+    install.assert_not_awaited()  # numpy importable: nothing to install
     coordinator = loaded_entry.runtime_data
     assert coordinator.challenger_requested is True
     assert coordinator.challenger_enabled is True
@@ -114,6 +115,7 @@ async def test_disabled_by_default_never_installs(
     assert attrs["challenger_enabled"] is False
     assert attrs["active_model"] == "kernel_bayes"
     assert "candidate_brier" in attrs and "sklearn_available" in attrs
+    assert attrs["numpy_available"] == attrs["sklearn_available"]
     assert hass.states.get("binary_sensor.alice_returning").attributes["active_model"] == (
         "kernel_bayes"
     )
@@ -122,20 +124,43 @@ async def test_disabled_by_default_never_installs(
     )
 
 
-async def test_enable_install_success(
+async def test_enable_with_numpy_present_skips_install(
     hass: HomeAssistant, setup_home: None, enable_calls: list[tuple[int, bool]]
 ) -> None:
-    """Successful install enables the challenger on every person's model."""
+    """numpy already importable (the usual HA case): no install attempt at all."""
     entry = _enabled_entry(hass)
     with (
         patch(f"{COORD}.async_process_requirements", AsyncMock(return_value=None)) as install,
-        patch(f"{COORD}.sklearn_available", return_value=True),
+        patch.object(KernelBayesReturnModel, "challenger_due", return_value=False),
+    ):
+        await _setup(hass, entry)  # the real numpy_available (numpy is a test dependency)
+    install.assert_not_awaited()
+    coordinator = entry.runtime_data
+    assert coordinator.challenger_enabled is True
+    assert coordinator.numpy_available is True
+    models = {id(rt.model) for rt in coordinator.persons.values()}
+    assert {mid for mid, enabled in enable_calls if enabled} == models
+    attrs = hass.states.get("sensor.alice_model_maturity").attributes
+    assert attrs["challenger_enabled"] is True
+    assert attrs["numpy_available"] is True
+    assert attrs["sklearn_available"] is True  # deprecated alias
+
+
+async def test_enable_install_success(
+    hass: HomeAssistant, setup_home: None, enable_calls: list[tuple[int, bool]]
+) -> None:
+    """numpy missing: it is installed (unversioned) and the challenger enabled."""
+    entry = _enabled_entry(hass)
+    with (
+        patch(f"{COORD}.async_process_requirements", AsyncMock(return_value=None)) as install,
+        patch(f"{COORD}.numpy_available", side_effect=[False, True]),
         patch.object(KernelBayesReturnModel, "challenger_due", return_value=False),
     ):
         await _setup(hass, entry)
-    install.assert_awaited_once_with(hass, DOMAIN, [SKLEARN_REQUIREMENT])
+    install.assert_awaited_once_with(hass, DOMAIN, ["numpy"])
     coordinator = entry.runtime_data
     assert coordinator.challenger_enabled is True
+    assert coordinator.numpy_available is True
     assert coordinator.sklearn_available is True
     models = {id(rt.model) for rt in coordinator.persons.values()}
     assert {mid for mid, enabled in enable_calls if enabled} == models
@@ -152,11 +177,11 @@ async def test_enable_install_failure(
 ) -> None:
     """A failed install only logs a warning; the champion keeps predicting."""
     entry = _enabled_entry(hass)
-    install = AsyncMock(side_effect=RequirementsNotFound(DOMAIN, [SKLEARN_REQUIREMENT]))
+    install = AsyncMock(side_effect=RequirementsNotFound(DOMAIN, [NUMPY_REQUIREMENT]))
     caplog.set_level(logging.WARNING)
     with (
         patch(f"{COORD}.async_process_requirements", install),
-        patch(f"{COORD}.sklearn_available", return_value=False),
+        patch(f"{COORD}.numpy_available", return_value=False),
     ):
         await _setup(hass, entry)
     coordinator = entry.runtime_data
@@ -164,6 +189,7 @@ async def test_enable_install_failure(
     assert all(not enabled for _, enabled in enable_calls)
     warnings = [r for r in caplog.records if "challenger stays disabled" in r.getMessage()]
     assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
+    install.assert_awaited_once_with(hass, DOMAIN, [NUMPY_REQUIREMENT])
     assert hass.states.get("sensor.alice_return_probability").state not in (
         "unavailable",
         "unknown",
@@ -211,7 +237,7 @@ async def test_training_scheduled_once_at_a_time(
 
     with (
         patch(f"{COORD}.async_process_requirements", AsyncMock(return_value=None)),
-        patch(f"{COORD}.sklearn_available", return_value=True),
+        patch(f"{COORD}.numpy_available", return_value=True),
         patch.object(KernelBayesReturnModel, "challenger_due", _due),
         patch.object(KernelBayesReturnModel, "challenger_snapshot", _snapshot),
         patch.object(KernelBayesReturnModel, "fit_challenger", staticmethod(_fit)),
@@ -261,14 +287,14 @@ async def test_reset_during_fit_discards_stale_result(
     def _fit(snapshot: dict[str, Any], now: datetime) -> dict[str, Any]:
         started.set()
         release.wait(5)
-        # A result that would promote sklearn_gbm if it were applied.
+        # A result that would promote gbm if it were applied.
         return {
             "status": "ok",
             "rows": 5000,
             "resolved_total": 1234,
             "generation": snapshot["generation"],
             "seconds": 0.0,
-            "brier": {"kernel_bayes": 0.2, "learned_fusion": 0.2, "sklearn_gbm": 0.01},
+            "brier": {"kernel_bayes": 0.2, "learned_fusion": 0.2, "gbm": 0.01},
             "weights": [0.0] * 8,
             "challenger": object(),
         }
@@ -280,7 +306,7 @@ async def test_reset_during_fit_discards_stale_result(
 
     with (
         patch(f"{COORD}.async_process_requirements", AsyncMock(return_value=None)),
-        patch(f"{COORD}.sklearn_available", return_value=True),
+        patch(f"{COORD}.numpy_available", return_value=True),
         patch.object(KernelBayesReturnModel, "challenger_due", _due),
         patch.object(KernelBayesReturnModel, "fit_challenger", staticmethod(_fit)),
         patch.object(KernelBayesReturnModel, "apply_challenger", _apply),

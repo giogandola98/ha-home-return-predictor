@@ -17,7 +17,7 @@ from homeassistant.helpers.selector import (
 )
 
 from .const import (
-    CONF_ENABLE_SKLEARN,
+    CONF_ENABLE_CHALLENGER,
     CONF_HALF_LIFE_DAYS,
     CONF_HOLIDAY_CALENDAR,
     CONF_HOME_ZONE,
@@ -26,7 +26,7 @@ from .const import (
     CONF_PERSONS,
     CONF_RETURN_THRESHOLD,
     CONF_UPDATE_INTERVAL_MINUTES,
-    DEFAULT_ENABLE_SKLEARN,
+    DEFAULT_ENABLE_CHALLENGER,
     DEFAULT_HALF_LIFE_DAYS,
     DEFAULT_HOME_ZONE,
     DEFAULT_HORIZON_MINUTES,
@@ -102,7 +102,7 @@ class HomeReturnPredictorOptionsFlow(OptionsFlowWithReload):
             CONF_HORIZON_MINUTES: DEFAULT_HORIZON_MINUTES,
             CONF_HALF_LIFE_DAYS: DEFAULT_HALF_LIFE_DAYS,
             CONF_UPDATE_INTERVAL_MINUTES: DEFAULT_UPDATE_INTERVAL_MINUTES,
-            CONF_ENABLE_SKLEARN: DEFAULT_ENABLE_SKLEARN,
+            CONF_ENABLE_CHALLENGER: DEFAULT_ENABLE_CHALLENGER,
         }
         current.update({k: v for k, v in entry.options.items() if k != CONF_PERSONS})
         if user_input is not None:
@@ -118,7 +118,7 @@ class HomeReturnPredictorOptionsFlow(OptionsFlowWithReload):
                 vol.Optional(CONF_HOLIDAY_CALENDAR): EntitySelector(
                     EntitySelectorConfig(domain="calendar")
                 ),
-                vol.Optional(CONF_ENABLE_SKLEARN): BooleanSelector(),
+                vol.Optional(CONF_ENABLE_CHALLENGER): BooleanSelector(),
             }
         )
         return self.async_show_form(

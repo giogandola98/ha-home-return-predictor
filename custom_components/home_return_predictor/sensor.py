@@ -148,7 +148,8 @@ class ModelMaturitySensor(HRPPersonSensor):
                 active_model=result.active_model,
                 candidate_brier=dict(getattr(report, "candidate_brier", None) or {}),
                 challenger_enabled=self.coordinator.challenger_enabled,
-                sklearn_available=self.coordinator.sklearn_available,
+                numpy_available=self.coordinator.numpy_available,
+                sklearn_available=self.coordinator.numpy_available,  # deprecated alias
                 selected_mode=result.mode,
                 effective_mode=result.effective_mode,
             )

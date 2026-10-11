@@ -32,6 +32,7 @@ async def test_diagnostics(hass: HomeAssistant, loaded_entry: MockConfigEntry) -
     assert data["challenger"] == {
         "requested": False,
         "enabled": False,
-        "sklearn_available": data["challenger"]["sklearn_available"],
+        "numpy_available": data["challenger"]["numpy_available"],
+        "sklearn_available": data["challenger"]["numpy_available"],
         "training": [],
     }

@@ -33,7 +33,7 @@
           "half_life_days": "Emivita dello storico",
           "update_interval_minutes": "Intervallo di aggiornamento",
           "holiday_calendar": "Calendario festività",
-          "enable_sklearn_challenger": "Abilita il modello sfidante scikit-learn"
+          "enable_sklearn_challenger": "Modello sfidante (gradient boosting, numpy)"
         },
         "data_description": {
           "persons": "Entità persona di cui prevedere il rientro.",
@@ -43,7 +43,7 @@
           "half_life_days": "Le abitudini più vecchie pesano la metà dopo questo numero di giorni.",
           "update_interval_minutes": "Ogni quanti minuti ricalcolare le previsioni.",
           "holiday_calendar": "Calendario opzionale i cui eventi indicano i giorni festivi.",
-          "enable_sklearn_challenger": "Sperimentale. Installa scikit-learn (circa 100 MB) durante l'esecuzione e addestra in background un modello sfidante gradient boosting (un solo thread, ogni qualche ora). Viene usato solo finché batte il modello integrato sulle previsioni recenti non viste in addestramento; altrimenti resta attivo il modello integrato. Lascialo disattivato su sistemi molto piccoli."
+          "enable_sklearn_challenger": "Sperimentale. Addestra in background un modello sfidante gradient boosting con numpy (già incluso in Home Assistant nella maggior parte delle installazioni; altrimenti viene installato durante l'esecuzione). Un solo thread, ogni qualche ora, meno di un secondo su un Intel N100. Viene usato solo finché batte il modello integrato sulle previsioni recenti non viste in addestramento; altrimenti resta attivo il modello integrato."
         }
       }
     },

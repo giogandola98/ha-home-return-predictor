@@ -48,7 +48,8 @@ async def async_get_config_entry_diagnostics(
             "challenger": {
                 "requested": coordinator.challenger_requested,
                 "enabled": coordinator.challenger_enabled,
-                "sklearn_available": coordinator.sklearn_available,
+                "numpy_available": coordinator.numpy_available,
+                "sklearn_available": coordinator.numpy_available,  # deprecated alias
                 "training": sorted(coordinator.training_persons),
             },
             "persons": persons,

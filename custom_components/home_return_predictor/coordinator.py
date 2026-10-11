@@ -37,7 +37,7 @@ from homeassistant.requirements import RequirementsNotFound, async_process_requi
 from homeassistant.util import dt as dt_util
 
 from .const import (
-    CONF_ENABLE_SKLEARN,
+    CONF_ENABLE_CHALLENGER,
     CONF_HALF_LIFE_DAYS,
     CONF_HOLIDAY_CALENDAR,
     CONF_HOME_ZONE,
@@ -47,7 +47,7 @@ from .const import (
     CONF_RETURN_THRESHOLD,
     CONF_UPDATE_INTERVAL_MINUTES,
     DEFAULT_ACTIVE_MODEL,
-    DEFAULT_ENABLE_SKLEARN,
+    DEFAULT_ENABLE_CHALLENGER,
     DEFAULT_HALF_LIFE_DAYS,
     DEFAULT_HOME_ZONE,
     DEFAULT_HORIZON_MINUTES,
@@ -64,8 +64,8 @@ from .const import (
     MODE_LEARNING,
     MODE_LIVE,
     MODES,
+    NUMPY_REQUIREMENT,
     RETURNING_OFF_HYSTERESIS,
-    SKLEARN_REQUIREMENT,
 )
 from .history import (
     HomeZone,
@@ -74,7 +74,7 @@ from .history import (
     state_is_home,
     state_to_fix,
 )
-from .hrp_core import KernelBayesReturnModel, create_model, sklearn_available
+from .hrp_core import KernelBayesReturnModel, create_model, numpy_available
 from .hrp_core.base import (
     MaturityReport,
     ModelConfig,
@@ -218,9 +218,9 @@ class _Computed:
     snapshot_changed: bool
 
 
-def _sklearn_installed() -> bool:
-    """Cheap check (no import) whether scikit-learn is installed."""
-    return importlib.util.find_spec("sklearn") is not None
+def _numpy_installed() -> bool:
+    """Cheap check (no import) whether numpy is installed."""
+    return importlib.util.find_spec("numpy") is not None
 
 
 def _fmt_dt(value: datetime | None) -> str | None:
@@ -294,10 +294,10 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         self.last_predictions: dict[str, Prediction] = {}
         self._lock = asyncio.Lock()
         self.challenger_requested: bool = bool(
-            options.get(CONF_ENABLE_SKLEARN, DEFAULT_ENABLE_SKLEARN)
+            options.get(CONF_ENABLE_CHALLENGER, DEFAULT_ENABLE_CHALLENGER)
         )
-        self.challenger_enabled: bool = False  # requested and scikit-learn installed
-        self.sklearn_available: bool = False
+        self.challenger_enabled: bool = False  # requested and numpy importable
+        self.numpy_available: bool = False
         self._train_lock = asyncio.Lock()  # one challenger fit at a time
         self._training: set[str] = set()  # persons with a scheduled/running training
         self._unsub_tracking: CALLBACK_TYPE | None = None
@@ -410,37 +410,47 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                 self.hass, self.async_retrain(to_bootstrap, bootstrap=True), f"{DOMAIN}_bootstrap"
             )
 
+    @property
+    def sklearn_available(self) -> bool:
+        """Deprecated alias of ``numpy_available`` (attribute kept for one release)."""
+        return self.numpy_available
+
     async def _async_setup_challenger(self) -> None:
-        """Install scikit-learn on demand and switch the challenger on/off."""
+        """Make numpy available on demand and switch the challenger on/off.
+
+        numpy ships with Home Assistant on most installs: then nothing is installed.
+        Otherwise it is requested without a version (HA's constraints pin it).
+        """
         enabled = False
         if self.challenger_requested:
-            try:
-                await async_process_requirements(self.hass, DOMAIN, [SKLEARN_REQUIREMENT])
-            except (RequirementsNotFound, OSError) as err:
-                _LOGGER.warning(
-                    "Could not install %s (%s); the scikit-learn challenger stays disabled "
-                    "and the built-in model keeps working",
-                    SKLEARN_REQUIREMENT,
-                    err,
-                )
-            else:
-                enabled = True
-        if self.challenger_requested:
-            self.sklearn_available = await self.hass.async_add_executor_job(sklearn_available)
+            available = await self.hass.async_add_executor_job(numpy_available)
+            if not available:
+                try:
+                    await async_process_requirements(self.hass, DOMAIN, [NUMPY_REQUIREMENT])
+                except (RequirementsNotFound, OSError) as err:
+                    _LOGGER.warning(
+                        "Could not install %s (%s); the gradient-boosting challenger stays "
+                        "disabled and the built-in model keeps working",
+                        NUMPY_REQUIREMENT,
+                        err,
+                    )
+                else:
+                    available = await self.hass.async_add_executor_job(numpy_available)
+                    if not available:
+                        _LOGGER.warning(
+                            "%s reported installed but cannot be imported; the "
+                            "gradient-boosting challenger stays disabled",
+                            NUMPY_REQUIREMENT,
+                        )
+            self.numpy_available = enabled = available
         else:
-            # Do not import scikit-learn (memory) when the challenger is off.
-            self.sklearn_available = await self.hass.async_add_executor_job(_sklearn_installed)
-        if enabled and not self.sklearn_available:
-            _LOGGER.warning(
-                "%s reported installed but cannot be imported; challenger disabled",
-                SKLEARN_REQUIREMENT,
-            )
-            enabled = False
+            # Challenger off: only a cheap check, no import.
+            self.numpy_available = await self.hass.async_add_executor_job(_numpy_installed)
         self.challenger_enabled = enabled
         for runtime in self.persons.values():
             await self._async_model_job(runtime, runtime.model.enable_challenger, enabled)
         if enabled:
-            _LOGGER.debug("scikit-learn challenger enabled")
+            _LOGGER.debug("gradient-boosting challenger enabled")
             await self.async_request_refresh()
 
     @callback

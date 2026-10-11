@@ -33,7 +33,7 @@
           "half_life_days": "History half-life",
           "update_interval_minutes": "Update interval",
           "holiday_calendar": "Holiday calendar",
-          "enable_sklearn_challenger": "Enable scikit-learn challenger model"
+          "enable_sklearn_challenger": "Challenger model (gradient boosting, numpy)"
         },
         "data_description": {
           "persons": "Person entities whose return home will be predicted.",
@@ -43,7 +43,7 @@
           "half_life_days": "Older habits weigh half after this many days.",
           "update_interval_minutes": "How often predictions are recomputed, in minutes.",
           "holiday_calendar": "Optional calendar whose events mark holidays.",
-          "enable_sklearn_challenger": "Experimental. Installs scikit-learn (about 100 MB) at runtime and trains a gradient boosting challenger in the background (single thread, every few hours). It is used only while it beats the built-in model on recent, unseen predictions; otherwise the built-in model keeps working. Leave off on very small systems."
+          "enable_sklearn_challenger": "Experimental. Trains a gradient boosting challenger in the background with numpy (already part of Home Assistant on most installs; installed at runtime otherwise). Single thread, every few hours, under a second on an Intel N100. It is used only while it beats the built-in model on recent, unseen predictions; otherwise the built-in model keeps working."
         }
       }
     },
