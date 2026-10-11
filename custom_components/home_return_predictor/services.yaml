@@ -1,0 +1,17 @@
+retrain:
+  fields:
+    person:
+      required: false
+      selector:
+        entity:
+          domain: person
+          multiple: true
+reset:
+  fields:
+    person:
+      required: true
+      selector:
+        entity:
+          domain: person
+          multiple: true
+export_diagnostics:
