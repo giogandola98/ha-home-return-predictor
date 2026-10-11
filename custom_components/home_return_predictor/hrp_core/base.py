@@ -112,8 +112,10 @@ class ReturnModel(ABC):
     """Abstract per-person return predictor.
 
     Lifecycle used by the integration:
-      1. ``load_history`` on bootstrap / retrain (replaces episodes).
-      2. ``observe_transition`` on every person home/away change.
+      1. ``load_history`` on bootstrap / retrain (merges recorder episodes into the
+         stored ones; ``replace=True`` rebuilds from the history alone).
+      2. ``observe_transition`` on every person home/away change (cheap: heavier
+         refits are deferred to ``resolve``).
       3. ``predict`` every update interval (pure).
       4. ``log_prediction`` after predict (the model rate-limits and later
          resolves the entry against the real outcome; it also feeds the GPS
@@ -129,8 +131,17 @@ class ReturnModel(ABC):
         transitions: Iterable[PresenceTransition],
         fixes: Iterable[PositionFix] = (),
         holidays: Iterable[datetime] = (),
+        replace: bool = False,
     ) -> None:
-        """Rebuild episodes (and optionally warm the GPS calibration) from history."""
+        """Merge episodes rebuilt from history into the stored ones.
+
+        Default: union of stored and rebuilt episodes/trips (a stored episode whose
+        departure is within 10 minutes of a rebuilt one is replaced by the rebuilt
+        one); calibration counts and the prediction log are kept, and the GPS
+        calibration is warmed from ``fixes`` only if it has no observations yet.
+        ``replace=True``: forget stored episodes and rebuild everything (incl. the
+        GPS calibration) from the given history.
+        """
 
     @abstractmethod
     def observe_transition(

@@ -5,11 +5,12 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from .base import AbsenceEpisode, MaturityReport
 from .episodes import minutes_between, to_utc
+from .fusion import P_MAX, P_MIN, clamp, logit, sigmoid
 from .prior import DAY_MINUTES, recency_weight
 
 MAX_RESOLVED = 3000
@@ -91,6 +92,141 @@ def resolve_entries(
     return resolved, keep
 
 
+# ------------------------------------------------------------------ compact storage
+LOG_DECIMALS = 4
+# Challenger feature positions duplicated from the stacker features (x index -> f index);
+# x[11] (z_bayes) is derived from f[0] + f[1], and x[2] (away horizons, capped at 16)
+# equals f[2] (capped at 8) below the stacker cap. Only the other x columns are stored:
+# 4 values (x[2] = f[2]) or 5 values (x[2] stored first); 0 / 12 values = verbatim.
+_X_FROM_F: dict[int, int] = {0: 0, 1: 1, 5: 5, 6: 6, 8: 3, 10: 4}
+_X_DERIVED = 11
+_X_AWAY = 2
+_F_AWAY_CAP = 8.0
+_X_OWN: tuple[int, ...] = (3, 4, 7, 9)
+_N_F = 7
+_N_X = 12
+
+
+def round_value(value: float | None) -> float | int | None:
+    """Rounded to LOG_DECIMALS; integral values become ints (shorter JSON)."""
+    if value is None:
+        return None
+    v = round(float(value), LOG_DECIMALS)
+    return int(v) if v.is_integer() else v
+
+
+def round_float(value: float | None) -> float | None:
+    """In-memory counterpart of ``round_value`` (what a JSON round trip yields)."""
+    return None if value is None else float(round(float(value), LOG_DECIMALS))
+
+
+def _z_bayes(f: Sequence[float]) -> float:
+    return round(logit(clamp(sigmoid(f[0] + f[1]), P_MIN, P_MAX)), LOG_DECIMALS)
+
+
+def _pack_x(f: Sequence[float], x: Sequence[float]) -> list[float | int | None]:
+    """Store only the challenger columns not recoverable from ``f`` (if possible)."""
+    rx = [float(round_value(v) or 0) for v in x]
+    rf = [float(round_value(v) or 0) for v in f]
+    if (
+        len(rf) == _N_F
+        and len(rx) == _N_X
+        and all(rx[i] == rf[j] for i, j in _X_FROM_F.items())
+        and rx[_X_DERIVED] == _z_bayes(rf)
+    ):
+        own = [round_value(rx[i]) for i in _X_OWN]
+        if rx[_X_AWAY] == rf[_X_AWAY] and rf[_X_AWAY] < _F_AWAY_CAP:
+            return own
+        return [round_value(rx[_X_AWAY]), *own]
+    return [round_value(v) for v in rx]
+
+
+def _unpack_x(f: Sequence[float], packed: Sequence[float]) -> list[float]:
+    n_own = len(_X_OWN)
+    if len(packed) not in (n_own, n_own + 1) or len(f) != _N_F:
+        return [float(v) for v in packed]
+    x = [0.0] * _N_X
+    for i, j in _X_FROM_F.items():
+        x[i] = float(f[j])
+    x[_X_AWAY] = float(packed[0]) if len(packed) > n_own else float(f[_X_AWAY])
+    for i, v in zip(_X_OWN, packed[-n_own:], strict=True):
+        x[i] = float(v)
+    x[_X_DERIVED] = _z_bayes(f)
+    return x
+
+
+def _epoch(dt: datetime) -> int:
+    return int(to_utc(dt).timestamp())
+
+
+def _from_epoch(value: float) -> datetime:
+    return datetime.fromtimestamp(int(value), UTC)
+
+
+def encode_entries(entries: Sequence[LogEntry]) -> dict[str, list[Any]]:
+    """Column arrays: int epoch seconds, floats rounded to 4 decimals."""
+    classes: list[str | None] = []
+    codes: list[int] = []
+    for e in entries:
+        if e.approach_class not in classes:
+            classes.append(e.approach_class)
+        codes.append(classes.index(e.approach_class))
+    horizons = [round((e.horizon_end - e.ts).total_seconds()) for e in entries]
+    return {
+        "ts": [_epoch(e.ts) for e in entries],
+        # one int when every entry has the same horizon (the usual case)
+        "h": horizons[0] if len(set(horizons)) == 1 else horizons,
+        "p": [round_value(e.p) for e in entries],
+        "prior": [round_value(e.prior) for e in entries],
+        "classes": classes,
+        "cls": codes,
+        "o": [e.outcome for e in entries],
+        "b": [round_value(e.base) for e in entries],
+        "f": [[round_value(v) for v in e.features] for e in entries],
+        "x": [_pack_x(e.features, e.x) for e in entries],
+    }
+
+
+def decode_entries(data: Any) -> list[LogEntry]:
+    """Inverse of ``encode_entries``; also reads the legacy list-of-dicts format."""
+    if isinstance(data, list):
+        return [LogEntry.from_dict(e) for e in data]
+    if not isinstance(data, dict) or not data.get("ts"):
+        return []
+    classes = data.get("classes") or []
+    h = data["h"]
+    horizons = h if isinstance(h, list) else [h] * len(data["ts"])
+    out: list[LogEntry] = []
+    for i, ts_raw in enumerate(data["ts"]):
+        ts = _from_epoch(ts_raw)
+        prior = data["prior"][i]
+        base = data["b"][i]
+        features = [float(v) for v in data["f"][i]]
+        outcome = data["o"][i]
+        out.append(
+            LogEntry(
+                ts=ts,
+                p=float(data["p"][i]),
+                prior=None if prior is None else float(prior),
+                approach_class=classes[data["cls"][i]],
+                horizon_end=ts + timedelta(seconds=int(horizons[i])),
+                outcome=None if outcome is None else int(outcome),
+                features=features,
+                base=None if base is None else float(base),
+                x=_unpack_x(features, data["x"][i]),
+            )
+        )
+    return out
+
+
+def compact_entry(entry: LogEntry) -> LogEntry:
+    """The entry exactly as it reads back from storage (rounded, whole seconds).
+
+    Applied when an entry is logged, so a persistence round trip changes nothing.
+    """
+    return decode_entries(encode_entries([entry]))[0]
+
+
 class PredictionLog:
     """Rate-limited prediction log with resolved history."""
 
@@ -116,16 +252,16 @@ class PredictionLog:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "pending": [e.to_dict() for e in self.pending],
-            "resolved": [e.to_dict() for e in self.resolved],
+            "pending": encode_entries(self.pending),
+            "resolved": encode_entries(self.resolved),
             "last_logged": self.last_logged.isoformat() if self.last_logged else None,
         }
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> PredictionLog:
         log = cls()
-        log.pending = [LogEntry.from_dict(e) for e in data.get("pending", [])]
-        log.resolved = [LogEntry.from_dict(e) for e in data.get("resolved", [])]
+        log.pending = decode_entries(data.get("pending"))
+        log.resolved = decode_entries(data.get("resolved"))
         last = data.get("last_logged")
         log.last_logged = datetime.fromisoformat(last) if last else None
         return log

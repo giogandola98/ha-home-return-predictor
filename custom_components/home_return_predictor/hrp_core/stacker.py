@@ -161,7 +161,11 @@ class Stacker:
         return apply_weights(self.weights, features)
 
     def fit(self, entries: Sequence[LogEntry], now: datetime, half_life_days: float) -> None:
-        """Refit on the last resolved entries and decide whether to activate."""
+        """Refit on the last resolved entries and decide whether to activate.
+
+        With enough entries the weights are fit on the oldest 80 % and scored on
+        the newest 20 %; those evaluated weights are the ones kept and served.
+        """
         usable = [e for e in entries if e.outcome is not None and len(e.features) == N_FEATURES][
             -MAX_TRAIN_ENTRIES:
         ]
@@ -185,16 +189,20 @@ class Stacker:
 
         self.active = False
         self.holdout_brier_learned = self.holdout_brier_bayes = None
-        if len(usable) >= MIN_ENTRIES_TO_ACTIVATE:
-            split = int(len(usable) * (1 - HOLDOUT_FRACTION))
-            train, hold = usable[:split], usable[split:]
-            w_train = weights_for(train)
-            hl = half_life_days
-            learned = _brier(hold, [apply_weights(w_train, e.features) for e in hold], now, hl)
-            bayes = _brier(hold, [bayes_from_features(e.features) for e in hold], now, hl)
-            self.holdout_brier_learned, self.holdout_brier_bayes = learned, bayes
-            self.active = learned < bayes * (1.0 - ACTIVATION_MARGIN)
-        self.weights = weights_for(usable)
+        if len(usable) < MIN_ENTRIES_TO_ACTIVATE:
+            # Not evaluated, so never selected: keep the weights near the centre.
+            self.weights = weights_for(usable)
+            return
+        split = int(len(usable) * (1 - HOLDOUT_FRACTION))
+        train, hold = usable[:split], usable[split:]
+        w_train = weights_for(train)
+        hl = half_life_days
+        learned = _brier(hold, [apply_weights(w_train, e.features) for e in hold], now, hl)
+        bayes = _brier(hold, [bayes_from_features(e.features) for e in hold], now, hl)
+        self.holdout_brier_learned, self.holdout_brier_bayes = learned, bayes
+        self.active = learned < bayes * (1.0 - ACTIVATION_MARGIN)
+        # Serve exactly the weights whose holdout Brier drives the selection.
+        self.weights = w_train
 
     def to_dict(self) -> dict[str, Any]:
         return {

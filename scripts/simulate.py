@@ -10,6 +10,7 @@ Standalone: needs no Home Assistant. Usage::
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from collections import defaultdict
@@ -79,6 +80,7 @@ def simulate(
             (rec.prediction.probability, rec.truth)
         )
 
+    stats["state_bytes"] = len(json.dumps(model.to_dict()))
     rows: list[dict[str, object]] = []
     history: list[list[tuple[float, bool]]] = []
     last = (0.0, 0, "kernel_bayes")
@@ -160,6 +162,8 @@ def main() -> None:
                 f"{name}: {n} challenger trainings, mean {mean:.2f} s, "
                 f"max {st.get('max_train_seconds', 0.0):.2f} s"
             )
+    for name, st in stats.items():
+        print(f"{name}: persisted state {st['state_bytes'] / 1000:.0f} KB (to_dict JSON)")
     print(
         f"\nsimulated {args.days} days x {len(people)} people in "
         f"{time.perf_counter() - started:.1f} s"

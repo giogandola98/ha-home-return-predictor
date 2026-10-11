@@ -150,6 +150,15 @@ class LRCalibrator:
         target = self.returned if returned else self.not_returned
         target[approach_class] += 1.0
 
+    def has_observations(self) -> bool:
+        """True once any count differs from the default pseudo-counts."""
+        fresh = LRCalibrator()
+        return any(
+            abs(self.returned[c] - fresh.returned[c]) > 1e-9
+            or abs(self.not_returned[c] - fresh.not_returned[c]) > 1e-9
+            for c in fresh.returned
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {"returned": dict(self.returned), "not_returned": dict(self.not_returned)}
 

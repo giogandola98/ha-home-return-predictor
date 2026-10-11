@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import bisect
 import time
 from collections.abc import Iterable
 from datetime import date, datetime, timedelta
@@ -36,7 +37,15 @@ from .episodes import (
 )
 from .evidence import CalibrationSegments, LRCalibrator, compute_evidence
 from .fusion import combine_eta, fuse_probability, position_eta_minutes
-from .maturity import LogEntry, PredictionLog, maturity_report, resolve_entries
+from .maturity import (
+    LogEntry,
+    PredictionLog,
+    compact_entry,
+    decode_entries,
+    encode_entries,
+    maturity_report,
+    resolve_entries,
+)
 from .prior import EpisodeKey, duration_baseline, episode_keys, estimate_prior, is_rest_day
 from .selection import (
     FUSION_ALIAS,
@@ -49,13 +58,21 @@ from .selection import (
     recency_weights,
     weighted_brier,
 )
-from .stacker import N_FEATURES, Stacker, apply_weights, build_features, fit_weights
+from .stacker import (
+    ACTIVATION_MARGIN,
+    N_FEATURES,
+    Stacker,
+    apply_weights,
+    build_features,
+    fit_weights,
+)
 
 STATE_VERSION = 1
 EPISODE_RETENTION_HALF_LIVES = 10.0
 STACKER_REFIT_EVERY = 150  # newly resolved entries between stacker refits
 CHALLENGER_RETRAIN_HOURS = 6.0
 CHALLENGER_RETRAIN_ENTRIES = 150
+MERGE_TOLERANCE = timedelta(minutes=10)  # same departure in stored and recorder data
 
 
 def shift_label(local_hour: int) -> str:
@@ -132,16 +149,40 @@ class KernelBayesReturnModel(ReturnModel):
         transitions: Iterable[PresenceTransition],
         fixes: Iterable[PositionFix] = (),
         holidays: Iterable[datetime | date] = (),
+        replace: bool = False,
     ) -> None:
         built = build_episodes(transitions, self.config, holidays)
-        self._episodes, self._trips = built.episodes, built.trips
+        if replace:
+            self._episodes, self._trips = built.episodes, built.trips
+            self._is_home, self._away_since = built.is_home, built.away_since
+            self._away_is_holiday = False
+            self._segments = CalibrationSegments()
+        else:
+            self._episodes, self._trips = self._merge(built.episodes, built.trips)
+            if built.is_home is not None:
+                if built.away_since != self._away_since:
+                    self._away_is_holiday = False
+                self._is_home, self._away_since = built.is_home, built.away_since
         self._key_cache = None
-        self._is_home, self._away_since = built.is_home, built.away_since
-        self._away_is_holiday = False
-        self._segments = CalibrationSegments()
         fix_list = sorted(fixes, key=lambda f: to_utc(f.ts))
-        if fix_list:
+        if fix_list and (replace or not self.calibrator.has_observations()):
             self._warm_calibration(fix_list)
+
+    def _merge(
+        self, episodes: list[AbsenceEpisode], trips: list[AbsenceEpisode]
+    ) -> tuple[list[AbsenceEpisode], list[AbsenceEpisode]]:
+        """Union of stored and rebuilt episodes/trips; the rebuilt version wins."""
+        rebuilt = sorted(e.left_at for e in (*episodes, *trips))
+
+        def duplicated(ep: AbsenceEpisode) -> bool:
+            i = bisect.bisect_left(rebuilt, ep.left_at - MERGE_TOLERANCE)
+            return i < len(rebuilt) and rebuilt[i] <= ep.left_at + MERGE_TOLERANCE
+
+        def union(stored: list[AbsenceEpisode], new: list[AbsenceEpisode]) -> list[AbsenceEpisode]:
+            kept = [e for e in stored if not duplicated(e)]
+            return sorted((*kept, *new), key=lambda e: e.left_at)
+
+        return union(self._episodes, episodes), union(self._trips, trips)
 
     def _warm_calibration(self, fixes: list[PositionFix]) -> None:
         """Replay historical fixes per absence to calibrate the GPS LR from scratch."""
@@ -419,8 +460,10 @@ class KernelBayesReturnModel(ReturnModel):
             # Calibration observation: first time this class is seen in this
             # absence (still/away) or approach segment (approach classes).
             self._calib_pending.append(
-                LogEntry(
-                    now, prediction.probability, prediction.prior_probability, cls, horizon_end
+                compact_entry(
+                    LogEntry(
+                        now, prediction.probability, prediction.prior_probability, cls, horizon_end
+                    )
                 )
             )
         entry = LogEntry(
@@ -446,7 +489,7 @@ class KernelBayesReturnModel(ReturnModel):
             horizon_minutes=self.config.horizon_minutes,
             half_life_days=self.config.half_life_days,
         )
-        return self._log.add(entry, self.config.prediction_log_interval_minutes)
+        return self._log.add(compact_entry(entry), self.config.prediction_log_interval_minutes)
 
     def _settle(self, *, arrival: datetime | None = None, now: datetime | None = None) -> int:
         resolved, self._log.pending = resolve_entries(self._log.pending, arrival=arrival, now=now)
@@ -462,19 +505,28 @@ class KernelBayesReturnModel(ReturnModel):
         self._log.settle(resolved, ref)
         self._since_refit += len(resolved)
         self._resolved_total += len(resolved)
-        if self._since_refit >= STACKER_REFIT_EVERY:
-            self._since_refit = 0
-            self.stacker.fit(self._log.resolved, ref, self.config.half_life_days)
-            if not self._challenger_mode():
-                # Without the challenger, the stacker's own holdout drives selection.
-                self.selector.update(
-                    {
-                        KERNEL_BAYES: self.stacker.holdout_brier_bayes,
-                        LEARNED_FUSION: self.stacker.holdout_brier_learned,
-                    },
-                    self.stacker.trained_on,
-                )
         return len(resolved)
+
+    def _maybe_refit(self, now: datetime) -> None:
+        """Refit the stacker after enough new resolved entries (called by resolve only).
+
+        In challenger mode ``train_challenger`` evaluates and installs the learned
+        fusion weights, so the stacker is not refit here: the weights served are
+        always the ones the selector evaluated.
+        """
+        if self._since_refit < STACKER_REFIT_EVERY:
+            return
+        self._since_refit = 0
+        if self._challenger_mode():
+            return
+        self.stacker.fit(self._log.resolved, now, self.config.half_life_days)
+        self.selector.update(
+            {
+                KERNEL_BAYES: self.stacker.holdout_brier_bayes,
+                LEARNED_FUSION: self.stacker.holdout_brier_learned,
+            },
+            self.stacker.trained_on,
+        )
 
     # ----------------------------------------------------------------- challenger
     def _challenger_rows(self) -> list[LogEntry]:
@@ -511,67 +563,126 @@ class KernelBayesReturnModel(ReturnModel):
         new = self._resolved_total - self._resolved_at_training
         return elapsed_h >= CHALLENGER_RETRAIN_HOURS or new >= CHALLENGER_RETRAIN_ENTRIES
 
-    def train_challenger(self, now: datetime) -> dict[str, Any]:
-        """Train + evaluate the challenger and update the selection (blocking).
+    def challenger_snapshot(self) -> Any:
+        """Cheap copy of what ``fit_challenger`` needs (call under the person lock).
 
-        Run in an executor. Holdout = last 20 % of resolved entries (chronological);
-        the stacker and the GBM are fit on the first 80 % for the evaluation, then
-        the GBM is refit on everything for serving.
+        Only list copies: the logged feature rows are never mutated after logging,
+        so the snapshot can be fit in another thread while the model keeps running.
+        """
+        rows = self._challenger_rows()
+        return {
+            "enabled": self._challenger_enabled,
+            "half_life_days": self.config.half_life_days,
+            "resolved_total": self._resolved_total,
+            "ts": [e.ts for e in rows],
+            "x": [e.x for e in rows],
+            "f": [e.features for e in rows],
+            "y": [int(e.outcome or 0) for e in rows],
+        }
+
+    @staticmethod
+    def fit_challenger(snapshot: Any, now: datetime) -> Any:
+        """Heavy part of the training: fit and evaluate all candidates (no model state).
+
+        Holdout = last 20 % of the resolved entries (chronological); the stacker and
+        the GBM are fit on the first 80 % for the evaluation, then the GBM is refit
+        on everything for serving. The learned-fusion weights evaluated here are
+        the ones installed (and served) by ``apply_challenger``.
         """
         started = time.perf_counter()
         now = to_utc(now)
-        rows = self._challenger_rows()
+        n = len(snapshot["y"])
+        result: dict[str, Any] = {
+            "status": "ok",
+            "rows": n,
+            "resolved_total": snapshot["resolved_total"],
+            "brier": {},
+        }
 
-        def summary(trained: bool, reason: str, brier: dict[str, Any]) -> dict[str, Any]:
+        def done(status: str) -> dict[str, Any]:
+            result["status"] = status
+            result["seconds"] = round(time.perf_counter() - started, 3)
+            return result
+
+        if not snapshot["enabled"]:
+            return done("disabled")
+        if not sklearn_available():
+            return done("sklearn_unavailable")
+        if n < RULES[SKLEARN_GBM].min_entries:
+            return done("insufficient_data")
+
+        hl = snapshot["half_life_days"]
+        ts, xs, fs, ys = snapshot["ts"], snapshot["x"], snapshot["f"], snapshot["y"]
+        idx_train, idx_hold = chronological_split(range(n))
+        w_all = recency_weights(ts, now, hl)
+        w_train = [w_all[i] for i in idx_train]
+        w_hold = [w_all[i] for i in idx_hold]
+        y_train = [ys[i] for i in idx_train]
+        y_hold = [ys[i] for i in idx_hold]
+
+        weights = fit_weights([fs[i] for i in idx_train], y_train, w_train)
+        candidate = SklearnChallenger()
+        candidate.fit([xs[i] for i in idx_train], y_train, w_train)
+        result["brier"] = {
+            KERNEL_BAYES: weighted_brier(
+                [bayes_from_challenger_features(xs[i]) for i in idx_hold], y_hold, w_hold
+            ),
+            LEARNED_FUSION: weighted_brier(
+                [apply_weights(weights, fs[i]) for i in idx_hold], y_hold, w_hold
+            ),
+            SKLEARN_GBM: weighted_brier(
+                candidate.predict_many([xs[i] for i in idx_hold]), y_hold, w_hold
+            ),
+        }
+        result["weights"] = weights
+        serving = SklearnChallenger()
+        serving.fit(xs, ys, w_all)
+        result["challenger"] = serving
+        return done("ok")
+
+    def apply_challenger(self, result: Any, now: datetime) -> dict[str, Any]:
+        """Cheap: install the fitted challenger / fusion weights and update selection."""
+        status = result["status"]
+        brier = dict(result.get("brier") or {})
+
+        def summary(trained: bool, reason: str) -> dict[str, Any]:
             return {
                 "trained": trained,
                 "reason": reason,
-                "rows": len(rows),
-                "seconds": round(time.perf_counter() - started, 3),
-                "brier": brier,
+                "rows": result["rows"],
+                "seconds": result.get("seconds", 0.0),
+                "brier": brier if trained else {},
                 "active_model": self._serving_model(),
             }
 
-        if not self._challenger_enabled:
-            return summary(False, "disabled", {})
-        if not sklearn_available():
-            return summary(False, "sklearn_unavailable", {})
-        self._last_training = now
-        self._resolved_at_training = self._resolved_total
-        if len(rows) < RULES[SKLEARN_GBM].min_entries:
-            return summary(False, "insufficient_data", {})
+        if status == "ok" and not self._challenger_enabled:
+            status = "disabled"  # switched off while training ran
+        if status in ("disabled", "sklearn_unavailable"):
+            return summary(False, status)
+        self._last_training = to_utc(now)
+        self._resolved_at_training = int(result["resolved_total"])
+        if status != "ok":
+            return summary(False, status)
 
-        hl = self.config.half_life_days
-        train, hold = chronological_split(rows)
-        w_train = recency_weights([e.ts for e in train], now, hl)
-        w_hold = recency_weights([e.ts for e in hold], now, hl)
-        y_train = [int(e.outcome or 0) for e in train]
-        y_hold = [int(e.outcome or 0) for e in hold]
-
-        weights = fit_weights([e.features for e in train], y_train, w_train)
-        candidate = SklearnChallenger()
-        candidate.fit([e.x for e in train], y_train, w_train)
-        brier = {
-            KERNEL_BAYES: weighted_brier(
-                [bayes_from_challenger_features(e.x) for e in hold], y_hold, w_hold
-            ),
-            LEARNED_FUSION: weighted_brier(
-                [apply_weights(weights, e.features) for e in hold], y_hold, w_hold
-            ),
-            SKLEARN_GBM: weighted_brier(
-                candidate.predict_many([e.x for e in hold]), y_hold, w_hold
-            ),
-        }
-        self.selector.update(brier, len(rows))
-
-        serving = SklearnChallenger()
-        serving.fit(
-            [e.x for e in rows],
-            [int(e.outcome or 0) for e in rows],
-            recency_weights([e.ts for e in rows], now, hl),
+        self.selector.update(brier, result["rows"])
+        st = self.stacker
+        st.weights = list(result["weights"])
+        st.trained_on = int(result["rows"])
+        st.holdout_brier_learned = brier.get(LEARNED_FUSION)
+        st.holdout_brier_bayes = brier.get(KERNEL_BAYES)
+        learned, bayes = st.holdout_brier_learned, st.holdout_brier_bayes
+        st.active = (
+            learned is not None and bayes is not None and learned < bayes * (1 - ACTIVATION_MARGIN)
         )
-        self._challenger = serving
-        return summary(True, "ok", brier)
+        self._challenger = result["challenger"]
+        return summary(True, "ok")
+
+    def train_challenger(self, now: datetime) -> dict[str, Any]:
+        """Train + evaluate the challenger and update the selection (blocking).
+
+        Equivalent to ``apply_challenger(fit_challenger(challenger_snapshot(), now))``.
+        """
+        return self.apply_challenger(self.fit_challenger(self.challenger_snapshot(), now), now)
 
     def resolve(self, now: datetime, is_home: bool) -> int:
         now = to_utc(now)
@@ -579,8 +690,11 @@ class KernelBayesReturnModel(ReturnModel):
             # Arrival is resolved by observe_transition; drop orphans of unknown outcome.
             self._log.pending = [e for e in self._log.pending if e.horizon_end >= now]
             self._calib_pending = [e for e in self._calib_pending if e.horizon_end >= now]
+            self._maybe_refit(now)
             return 0
-        return self._settle(now=now)
+        count = self._settle(now=now)
+        self._maybe_refit(now)
+        return count
 
     def maturity(self, now: datetime) -> MaturityReport:
         return maturity_report(
@@ -612,7 +726,7 @@ class KernelBayesReturnModel(ReturnModel):
             "calibrator": self.calibrator.to_dict(),
             "stacker": self.stacker.to_dict(),
             "log": self._log.to_dict(),
-            "calib_pending": [e.to_dict() for e in self._calib_pending],
+            "calib_pending": encode_entries(self._calib_pending),
             "segments": self._segments.to_dict(),
             "since_refit": self._since_refit,
             "selection": self.selector.to_dict(),
@@ -632,7 +746,7 @@ class KernelBayesReturnModel(ReturnModel):
         model.calibrator = LRCalibrator.from_dict(data.get("calibrator", {}))
         model.stacker = Stacker.from_dict(data.get("stacker", {}))
         model._log = PredictionLog.from_dict(data.get("log", {}))
-        model._calib_pending = [LogEntry.from_dict(e) for e in data.get("calib_pending", [])]
+        model._calib_pending = decode_entries(data.get("calib_pending"))
         model._segments = CalibrationSegments.from_dict(data.get("segments") or {})
         model._since_refit = int(data.get("since_refit", 0))
         if "selection" in data:
