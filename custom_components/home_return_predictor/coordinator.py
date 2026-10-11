@@ -92,6 +92,7 @@ _LOGGER = logging.getLogger(__name__)
 type HRPConfigEntry = ConfigEntry[HRPCoordinator]
 
 REASON_STATE_UNKNOWN = "state unknown"
+OBSERVE_FLUSH_TIMEOUT = 10.0  # seconds to wait for pending observations on unload
 
 
 @dataclass
@@ -184,6 +185,9 @@ class HouseResult:
     away_probability: float = 0.0  # combined return probability of persons away
     eta_person: str | None = None  # person whose ETA is ``next_eta``
     persons_unknown: list[str] = field(default_factory=list)
+    # (person, probability 0..1, ETA) of away persons with p >= HOUSE_ETA_MIN_PROBABILITY,
+    # sorted by ETA (None last): each return judged on its own (blueprint).
+    candidates: list[tuple[str, float, datetime | None]] = field(default_factory=list)
 
     @property
     def advisory(self) -> bool:
@@ -299,6 +303,9 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         self._unsub_tracking: CALLBACK_TYPE | None = None
         self._unsub_stop: CALLBACK_TYPE | None = None
         self._tracked: set[str] = set()
+        # Pending ``_async_observe`` tasks; awaited before the final save.
+        self._observe_tasks: set[asyncio.Task[None]] = set()
+        self._unloading = False
         # Change counter of the persisted document; a save is scheduled only when
         # it moved since the last scheduled save.
         self._data_version = 0
@@ -465,12 +472,26 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
     async def _async_handle_stop(self, _event: Event) -> None:
         """Home Assistant stops: refresh changed snapshots; Store writes on final write."""
         self._unsub_stop = None  # listen_once already removed itself
+        await self._async_wait_observers()
         await self._async_snapshot_dirty()
         self._schedule_save(force=True)
 
+    async def _async_wait_observers(self) -> None:
+        """Let pending observations reach the models before a final save."""
+        if not (pending := set(self._observe_tasks)):
+            return
+        _done, not_done = await asyncio.wait(pending, timeout=OBSERVE_FLUSH_TIMEOUT)
+        if not_done:
+            _LOGGER.warning(
+                "%d presence observations still pending at shutdown; not persisted",
+                len(not_done),
+            )
+
     async def async_unload(self) -> None:
         """Stop listening and persist everything."""
+        self._unloading = True
         self._async_unsubscribe()
+        await self._async_wait_observers()
         async with self._lock:
             await self._async_snapshot_dirty()
         await self.storage.async_save(self._store_data())
@@ -493,9 +514,11 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                 self._async_subscribe()
             transition = self._handle_presence(runtime, new_state)
             if transition is not None:
-                self.config_entry.async_create_task(
+                task = self.config_entry.async_create_task(
                     self.hass, self._async_observe(runtime, transition, self._is_holiday())
                 )
+                self._observe_tasks.add(task)
+                task.add_done_callback(self._observe_tasks.discard)
         fix = state_to_fix(new_state, zone)
         if fix is not None:
             for runtime in self.persons.values():
@@ -538,7 +561,8 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
             runtime.dirty = True
             if transition.is_home:
                 runtime.fixes.clear()
-        await self.async_request_refresh()
+        if not self._unloading:
+            await self.async_request_refresh()
 
     # ------------------------------------------------------------------ update
 
@@ -744,11 +768,15 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
             probability = away_probability
         else:
             probability = None
-        eta_candidates = [
-            (p.eta, pid)
-            for pid, p in away.items()
-            if p.eta is not None and p.probability >= HOUSE_ETA_MIN_PROBABILITY
-        ]
+        candidates = sorted(
+            (
+                (pid, p.probability, p.eta)
+                for pid, p in away.items()
+                if p.probability >= HOUSE_ETA_MIN_PROBABILITY
+            ),
+            key=lambda c: (c[2] is None, c[2] or datetime.min, c[0]),
+        )
+        eta_candidates = [(eta, pid) for pid, _p, eta in candidates if eta is not None]
         next_eta, eta_person = min(eta_candidates) if eta_candidates else (None, None)
         known = [pid for pid in results if pid not in unknown]
         mode_source = returning or known or list(results)
@@ -767,6 +795,7 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
             away_probability=away_probability,
             eta_person=eta_person,
             persons_unknown=unknown,
+            candidates=candidates,
         )
 
     # ------------------------------------------------------------------ storage

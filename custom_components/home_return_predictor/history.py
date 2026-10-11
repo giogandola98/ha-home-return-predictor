@@ -142,7 +142,15 @@ class _HistoryReducer:
         self._last_state: str | None = None
         self._last_fix_ts: datetime | None = None
 
-    def feed(self, states: Iterable[State]) -> None:
+    def feed(self, states: Iterable[State], window_start: datetime | None = None) -> None:
+        """Reduce one chronological batch of states.
+
+        ``window_start``: start of the recorder query window. With
+        ``include_start_time_state`` the recorder prepends a synthetic row (the
+        state at the window start) whose ``last_updated``/``last_changed`` are
+        rewritten to ``window_start``; its coordinates are older than that, so it
+        never yields a fix (real rows are strictly newer than the window start).
+        """
         min_gap = timedelta(seconds=HISTORY_FIX_MIN_INTERVAL_S)
         for state in states:
             is_home = state_is_home(state, self.zone_id, self.zone)
@@ -156,6 +164,8 @@ class _HistoryReducer:
                 self.transitions.append(PresenceTransition(ts=ts, is_home=is_home))
                 self._last = is_home
             self._last_state = state.state
+            if window_start is not None and state.last_updated <= window_start:
+                continue  # synthetic start-time state: no position information
             fix = state_to_fix(state, self.zone)
             if fix is not None and (
                 self._last_fix_ts is None or fix.ts >= self._last_fix_ts + min_gap
@@ -206,7 +216,7 @@ def _load_history_chunked(
     chunk_start = start
     while chunk_start < end:
         chunk_end = min(chunk_start + window, end)
-        reducer.feed(_fetch_states(hass, entity_id, chunk_start, chunk_end))
+        reducer.feed(_fetch_states(hass, entity_id, chunk_start, chunk_end), chunk_start)
         chunk_start = chunk_end
     return reducer.transitions, reducer.fixes
 

@@ -373,3 +373,67 @@ def test_all_presets_configurable():
     assert decide_preset(bed, None).preset == "frost"
     # hysteresis by role: current "comfort" here is the medium preset
     assert decide_preset(replace(_nobody(0.37), presets=presets), "comfort").preset == "comfort"
+
+
+# --------------------------------------------------------------------------- per-person candidates
+
+
+def test_candidates_never_mix_probability_and_eta():
+    """Alice p=0.30 ETA 17:00, Bob p=0.80 ETA 21:00: the house sensors say 86 % at 17:00.
+
+    The combined probability must not be paired with Alice's (earliest) ETA:
+    pre-heat follows Bob (comfort from 20:30), not 86 % at 17:00.
+    """
+    alice, bob = (0.30, at(17)), (0.80, at(21))
+    house_p = 1 - (1 - alice[0]) * (1 - bob[0])  # 0.86
+    for now, expected in [(at(16, 40), "frost"), (at(20, 0), "frost"), (at(20, 35), "comfort")]:
+        legacy = inp(now=now, house_probability=house_p, house_eta=at(17))
+        with_candidates = replace(legacy, return_candidates=[alice, bob])
+        assert decide_preset(with_candidates, "frost").preset == expected, now
+    # Without the attribute (old integration): the single pair is still used.
+    assert (
+        decide_preset(
+            inp(now=at(16, 40), house_probability=house_p, house_eta=at(17)), "frost"
+        ).preset
+        == "comfort"
+    )
+
+
+def test_two_low_candidates_do_not_sum():
+    """Two persons at 35 % each: combined 58 % (eco), but neither return is likely."""
+    a, b = (0.35, at(12, 10)), (0.35, at(12, 15))
+    house_p = 1 - 0.65 * 0.65
+    legacy = inp(house_probability=house_p, house_eta=at(12, 10))
+    assert decide_preset(legacy, "frost").preset == "eco"
+    d = decide_preset(replace(legacy, return_candidates=[a, b]), "frost")
+    assert d.preset == "frost", d.reason
+
+
+def test_candidates_highest_rank_wins_with_own_schedule_and_hysteresis():
+    now = at(19, 50)
+    schedule = sched(now, bedroom_blocks())  # off now, on from 20:00
+    cands = [
+        (0.95, at(19, 55)),  # in window but bedroom not scheduled at 19:55
+        (0.50, at(20, 10)),  # medium, scheduled at ETA -> eco
+        (0.99, at(23, 0)),  # outside the pre-heat window
+    ]
+    base = inp(now=now, zone_type="night", schedule=schedule, return_candidates=cands)
+    assert decide_preset(base, "frost").preset == "eco"
+    # Hysteresis per candidate against the current preset.
+    cands2 = [(0.67, at(20, 10)), (0.2, at(20, 5))]
+    assert decide_preset(replace(base, return_candidates=cands2), "comfort").preset == "comfort"
+    assert decide_preset(replace(base, return_candidates=cands2), "frost").preset == "eco"
+    # Candidate without ETA is ignored; empty list falls back to the house pair.
+    assert decide_preset(replace(base, return_candidates=[(0.9, None)]), None).preset == "frost"
+    fallback = replace(base, return_candidates=[], house_probability=0.9, house_eta=at(20, 10))
+    assert decide_preset(fallback, None).preset == "comfort"
+
+
+def test_candidates_upgrade_only_when_someone_home():
+    # Zone outside its schedule now (unused), scheduled from 12:05 (at the ETAs).
+    home = inp(
+        someone_home=True, schedule=(False, at(12, 5)), return_candidates=[(0.9, at(12, 10))]
+    )
+    assert decide_preset(home, "eco").preset == "comfort"
+    low = replace(home, return_candidates=[(0.3, at(12, 10)), (0.3, at(12, 6))])
+    assert decide_preset(low, "eco").preset == "eco"  # unused preset kept, never frost

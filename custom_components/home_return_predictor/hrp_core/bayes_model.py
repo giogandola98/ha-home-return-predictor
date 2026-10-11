@@ -135,14 +135,24 @@ class KernelBayesReturnModel(ReturnModel):
         self._last_training: datetime | None = None
         self._resolved_total = 0  # resolved entries seen in this process
         self._resolved_at_training = 0
+        # Bumped whenever the learnt state is discarded (reset / replacing history);
+        # a challenger fit started on an older generation is stale and discarded.
+        self._generation = 0
         # Prior keys cache; set to None whenever episodes/trips change.
         self._key_cache: tuple[list[EpisodeKey], list[EpisodeKey]] | None = None
 
     # ------------------------------------------------------------------ lifecycle
     def reset(self) -> None:
         enabled = self._challenger_enabled
+        generation = self._generation
         self.__init__(self.config)  # type: ignore[misc]
         self._challenger_enabled = enabled
+        self._generation = generation + 1
+
+    @property
+    def generation(self) -> int:
+        """Counter of discarded learnt states (reset / ``load_history(replace=True)``)."""
+        return self._generation
 
     def load_history(
         self,
@@ -153,6 +163,7 @@ class KernelBayesReturnModel(ReturnModel):
     ) -> None:
         built = build_episodes(transitions, self.config, holidays)
         if replace:
+            self._generation += 1
             self._episodes, self._trips = built.episodes, built.trips
             self._is_home, self._away_since = built.is_home, built.away_since
             self._away_is_holiday = False
@@ -572,6 +583,7 @@ class KernelBayesReturnModel(ReturnModel):
         rows = self._challenger_rows()
         return {
             "enabled": self._challenger_enabled,
+            "generation": self._generation,
             "half_life_days": self.config.half_life_days,
             "resolved_total": self._resolved_total,
             "ts": [e.ts for e in rows],
@@ -596,6 +608,7 @@ class KernelBayesReturnModel(ReturnModel):
             "status": "ok",
             "rows": n,
             "resolved_total": snapshot["resolved_total"],
+            "generation": snapshot.get("generation", 0),
             "brier": {},
         }
 
@@ -655,6 +668,10 @@ class KernelBayesReturnModel(ReturnModel):
                 "active_model": self._serving_model(),
             }
 
+        if int(result.get("generation", 0)) != self._generation:
+            # Reset / history replaced while the fit ran: the result describes a
+            # model that no longer exists; leave selection and counters untouched.
+            return summary(False, "stale")
         if status == "ok" and not self._challenger_enabled:
             status = "disabled"  # switched off while training ran
         if status in ("disabled", "sklearn_unavailable"):
@@ -731,6 +748,7 @@ class KernelBayesReturnModel(ReturnModel):
             "since_refit": self._since_refit,
             "selection": self.selector.to_dict(),
             "challenger_enabled": self._challenger_enabled,
+            "generation": self._generation,
         }
 
     @classmethod
@@ -754,4 +772,5 @@ class KernelBayesReturnModel(ReturnModel):
         elif model.stacker.active:  # state written before the generic selection existed
             model.selector.champion = LEARNED_FUSION
         model._challenger_enabled = bool(data.get("challenger_enabled", False))
+        model._generation = int(data.get("generation", 0))
         return model

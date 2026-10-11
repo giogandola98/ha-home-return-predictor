@@ -134,4 +134,6 @@ def test_reset_and_reload() -> None:
     model.load_history(tl.transitions, tl.fixes)
     assert len(model.episodes()) > 15
     model.reset()
-    assert model.episodes() == [] and model.to_dict() == KernelBayesReturnModel(CONFIG).to_dict()
+    fresh = KernelBayesReturnModel(CONFIG).to_dict()
+    # Only the generation counter (stale challenger fits) survives a reset.
+    assert model.episodes() == [] and model.to_dict() == {**fresh, "generation": 1}

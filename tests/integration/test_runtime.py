@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import threading
 from collections.abc import Generator
@@ -15,7 +16,11 @@ from homeassistant.config_entries import ConfigEntryState
 from homeassistant.core import HomeAssistant, State
 from homeassistant.helpers.update_coordinator import UpdateFailed
 from homeassistant.util import dt as dt_util
-from pytest_homeassistant_custom_component.common import MockConfigEntry, async_capture_events
+from pytest_homeassistant_custom_component.common import (
+    MockConfigEntry,
+    async_capture_events,
+    async_fire_time_changed,
+)
 
 from custom_components.home_return_predictor.const import (
     DOMAIN,
@@ -260,6 +265,47 @@ async def test_final_write_on_stop(
     assert hass_storage[key]["data"]["persons"][ALICE]["mode"] == "live"
 
 
+async def test_unload_awaits_pending_observation(
+    hass: HomeAssistant, loaded_entry: MockConfigEntry, hass_storage: dict[str, Any]
+) -> None:
+    """Observations in flight at unload finish before the final save; nothing runs after."""
+    coordinator = loaded_entry.runtime_data
+    key = f"{DOMAIN}.{loaded_entry.entry_id}"
+    started = threading.Event()
+    release = threading.Event()
+    original = KernelBayesReturnModel.observe_transition
+
+    def _observe(self: KernelBayesReturnModel, *args: Any, **kwargs: Any) -> Any:
+        started.set()
+        release.wait(5)
+        return original(self, *args, **kwargs)
+
+    with patch.object(KernelBayesReturnModel, "observe_transition", _observe):
+        # No coordinates: no fix-triggered refresh, only the observation.
+        hass.states.async_set(ALICE, "not_home", {"friendly_name": "Alice"})
+        for _ in range(200):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert coordinator._observe_tasks
+        unload = hass.async_create_task(hass.config_entries.async_unload(loaded_entry.entry_id))
+        await asyncio.sleep(0.05)
+        assert not unload.done()
+        with (
+            patch.object(coordinator, "_async_update_data") as update,
+            patch.object(coordinator.storage, "async_schedule_save") as schedule_save,
+        ):
+            release.set()
+            assert await asyncio.wait_for(unload, 5)
+            assert not coordinator._observe_tasks
+            async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=30))
+            await hass.async_block_till_done()
+        update.assert_not_called()  # no refresh (and no later save) after the final save
+        schedule_save.assert_not_called()
+    model = hass_storage[key]["data"]["persons"][ALICE]["model"]
+    assert model["is_home"] is False and model["away_since"] is not None
+
+
 # --------------------------------------------------------------------------- H5 / H6
 
 
@@ -284,6 +330,20 @@ async def test_house_eta_from_medium_probability(
     assert coordinator.data.house.next_eta == expected
     assert dt_util.parse_datetime(eta_state.state) == expected.replace(microsecond=0)
     assert eta_state.attributes["eta_person"] == ALICE
+    # Per-person candidates (probability in %), Bob excluded (< 25 %).
+    candidates = [{"person": ALICE, "probability": 45.0, "eta": expected.isoformat()}]
+    assert eta_state.attributes["candidates"] == candidates
+    prob_attrs = hass.states.get("sensor.house_return_probability").attributes
+    assert prob_attrs["candidates"] == candidates
+    forced[BOB] = (0.8, timedelta(hours=3))
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    persons = [
+        c["person"]
+        for c in hass.states.get("sensor.house_next_return_eta").attributes["candidates"]
+    ]
+    assert persons == [ALICE, BOB]  # sorted by ETA
+    assert coordinator.data.house.eta_person == ALICE
     # Person ETA is published whenever away, even at low probability.
     assert hass.states.get("sensor.bob_return_eta").state not in ("unknown", "unavailable")
     assert hass.states.get("binary_sensor.alice_returning").state == "off"
@@ -382,6 +442,34 @@ def test_history_chunked_queries(hass: HomeAssistant) -> None:
     assert all(e - s <= timedelta(days=7) for s, e in windows)
     assert windows[0][0] == start and windows[-1][1] == end
     assert [t.is_home for t in transitions] == [False, True, False]
+
+
+def test_history_chunk_start_state_gives_no_fix(hass: HomeAssistant) -> None:
+    """The synthetic start-time state of each chunk (timestamps = chunk start) is no fix.
+
+    Mirrors the recorder: with include_start_time_state the first row of a window
+    carries last_updated_ts = last_changed_ts = 0, which LazyState replaces with the
+    window start, while the attributes are those of the last real (older) state.
+    """
+    end = dt_util.utcnow()
+    start = end - timedelta(days=10)  # two chunks
+    away = _offset(5_000)
+    windows: list[datetime] = []
+
+    def _fetch(_hass: Any, _entity: str, s: datetime, e: datetime) -> list[State]:
+        windows.append(s)
+        if len(windows) == 1:
+            return [
+                _st("home", s, HOME_LAT),  # synthetic
+                _st("not_home", s + timedelta(days=1), away),  # real departure
+            ]
+        return [_st("not_home", s, away)]  # synthetic only: no row in this window
+
+    with patch("custom_components.home_return_predictor.history._fetch_states", _fetch):
+        transitions, fixes = _load_history_chunked(hass, ALICE, "zone.home", WORK, start, end)
+    assert len(windows) == 2
+    assert [t.is_home for t in transitions] == [True, False]
+    assert [f.ts for f in fixes] == [start + timedelta(days=1)]  # no fix at chunk starts
 
 
 def test_holiday_multi_day_expansion() -> None:

@@ -239,3 +239,70 @@ async def test_training_scheduled_once_at_a_time(
     assert sorted(applied) == sorted(models)
     assert max_running == 1
     assert coordinator.training_persons == set()
+
+
+async def test_reset_during_fit_discards_stale_result(
+    hass: HomeAssistant, setup_home: None
+) -> None:
+    """A fit in flight while the person is reset must not touch the fresh model."""
+    entry = _enabled_entry(hass)
+    release = threading.Event()
+    started = threading.Event()
+    summaries: list[dict[str, Any]] = []
+    scheduled: set[int] = set()
+    real_apply = KernelBayesReturnModel.apply_challenger
+
+    def _due(self: KernelBayesReturnModel, now: datetime) -> bool:
+        if not scheduled:  # one training only (the first person checked)
+            scheduled.add(id(self))
+            return True
+        return False
+
+    def _fit(snapshot: dict[str, Any], now: datetime) -> dict[str, Any]:
+        started.set()
+        release.wait(5)
+        # A result that would promote sklearn_gbm if it were applied.
+        return {
+            "status": "ok",
+            "rows": 5000,
+            "resolved_total": 1234,
+            "generation": snapshot["generation"],
+            "seconds": 0.0,
+            "brier": {"kernel_bayes": 0.2, "learned_fusion": 0.2, "sklearn_gbm": 0.01},
+            "weights": [0.0] * 8,
+            "challenger": object(),
+        }
+
+    def _apply(self: KernelBayesReturnModel, result: Any, now: datetime) -> dict[str, Any]:
+        summary = real_apply(self, result, now)
+        summaries.append(summary)
+        return summary
+
+    with (
+        patch(f"{COORD}.async_process_requirements", AsyncMock(return_value=None)),
+        patch(f"{COORD}.sklearn_available", return_value=True),
+        patch.object(KernelBayesReturnModel, "challenger_due", _due),
+        patch.object(KernelBayesReturnModel, "fit_challenger", staticmethod(_fit)),
+        patch.object(KernelBayesReturnModel, "apply_challenger", _apply),
+    ):
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done()
+        coordinator = entry.runtime_data
+        for _ in range(200):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert started.is_set()
+        await asyncio.wait_for(coordinator.async_reset(ALICE), 5)
+        await asyncio.wait_for(coordinator.async_reset(BOB), 5)
+        release.set()
+        await hass.async_block_till_done(wait_background_tasks=True)
+    assert len(summaries) == 1 and summaries[0]["reason"] == "stale"
+    assert summaries[0]["trained"] is False
+    for runtime in coordinator.persons.values():
+        model = runtime.model
+        assert model.generation == 1
+        assert model.selector.champion == "kernel_bayes"
+        assert model.selector.brier == {}
+        assert model._resolved_at_training == 0
+        assert model._last_training is None

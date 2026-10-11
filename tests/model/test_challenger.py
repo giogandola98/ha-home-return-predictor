@@ -168,6 +168,40 @@ def test_model_train_challenger(shift_model) -> None:  # type: ignore[no-untyped
     assert model._log.resolved[-1].base is not None
 
 
+def test_stale_challenger_result_is_discarded(shift_model) -> None:  # type: ignore[no-untyped-def]
+    """A fit started before reset()/load_history(replace=True) must not be applied."""
+    model, tl = shift_model
+    now = tl.absences[-1].returned_at
+    model = KernelBayesReturnModel.from_dict(json.loads(json.dumps(model.to_dict())), CONFIG)
+    model.enable_challenger(True)
+    fitted = model.fit_challenger(model.challenger_snapshot(), now)
+    assert fitted["status"] == "ok"
+
+    model.reset()  # e.g. the reset service ran while the fit was in flight
+    assert model.generation == 1
+    before = json.dumps(model.to_dict())
+    summary = model.apply_challenger(fitted, now)
+    assert summary["trained"] is False and summary["reason"] == "stale"
+    assert json.dumps(model.to_dict()) == before  # selection/stacker untouched
+    assert model._resolved_at_training == 0 and model._last_training is None
+    assert model._challenger is not fitted["challenger"]
+
+    # load_history(replace=True) also invalidates in-flight fits.
+    snap = model.challenger_snapshot()
+    model.load_history([], replace=True)
+    assert model.generation == 2
+    assert model.apply_challenger(model.fit_challenger(snap, now), now)["reason"] == "stale"
+    # A merge (replace=False) keeps the generation.
+    model.load_history([])
+    assert model.generation == 2
+
+    # Persisted, backwards compatible (missing key -> 0).
+    data = json.loads(json.dumps(model.to_dict()))
+    assert KernelBayesReturnModel.from_dict(data, CONFIG).generation == 2
+    data.pop("generation")
+    assert KernelBayesReturnModel.from_dict(data, CONFIG).generation == 0
+
+
 def test_promoted_sklearn_serves_and_falls_back_after_restart(shift_model) -> None:  # type: ignore[no-untyped-def]
     model, tl = shift_model
     now = tl.absences[-1].returned_at
