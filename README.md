@@ -163,12 +163,16 @@ scaricarlo solo se il token GitHub configurato in HACS ha accesso al repository:
    **Integrazione** → Aggiungi.
 4. Cerca "Home Return Predictor" → Scarica → **riavvia Home Assistant**.
 
+Se HACS risponde "repository non trovato" o non mostra versioni, il suo token non
+vede i repo privati: usa l'installazione manuale qui sotto (gli aggiornamenti
+andranno ripetuti a mano) oppure rendi pubblico il repo.
+
 ### Manuale
 
 Copia `custom_components/home_return_predictor/` in
 `<config>/custom_components/home_return_predictor/` e riavvia.
 
-Requisiti: Home Assistant 2025.1 o successivo, `recorder` attivo, persone (`person`)
+Requisiti: Home Assistant 2026.1 o successivo, `recorder` attivo, persone (`person`)
 con tracker (meglio se l'app Companion con GPS).
 
 ---
