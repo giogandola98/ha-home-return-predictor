@@ -67,6 +67,7 @@ class ReturningBinarySensor(HRPPersonEntity, BinarySensorEntity):
             "mode": result.effective_mode,
             "advisory": result.advisory,
             "reason": result.reason,
+            "active_model": result.active_model,
         }
 
 

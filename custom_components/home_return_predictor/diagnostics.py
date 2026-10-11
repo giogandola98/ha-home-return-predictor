@@ -36,6 +36,7 @@ async def async_get_config_entry_diagnostics(
             "maturity": asdict(result.maturity) if result else None,
             "returning": result.returning if result else None,
             "reason": result.reason if result else None,
+            "active_model": result.active_model if result else None,
             "last_prediction": asdict(prediction) if prediction else None,
             "prediction_log": coordinator.prediction_log(person_id, DIAGNOSTICS_LOG_ENTRIES),
         }
@@ -43,6 +44,12 @@ async def async_get_config_entry_diagnostics(
         {
             "entry": {"data": dict(entry.data), "options": dict(entry.options)},
             "home_zone": coordinator.home_zone_id,
+            "challenger": {
+                "requested": coordinator.challenger_requested,
+                "enabled": coordinator.challenger_enabled,
+                "sklearn_available": coordinator.sklearn_available,
+                "training": sorted(coordinator.training_persons),
+            },
             "persons": persons,
             "house": asdict(data.house) if data else None,
         },

@@ -138,6 +138,10 @@ class ModelMaturitySensor(HRPPersonSensor):
                 baseline_brier_score=report.baseline_brier_score,
                 brier_skill_score=report.brier_skill_score,
                 fusion=getattr(report, "fusion", None),
+                active_model=result.active_model,
+                candidate_brier=dict(getattr(report, "candidate_brier", None) or {}),
+                challenger_enabled=self.coordinator.challenger_enabled,
+                sklearn_available=self.coordinator.sklearn_available,
                 selected_mode=result.mode,
                 effective_mode=result.effective_mode,
             )
@@ -161,6 +165,7 @@ class ReturnReasonSensor(HRPPersonSensor):
         attrs = super().extra_state_attributes
         if (result := self.result) is not None:
             attrs["parts"] = result.prediction.reason
+            attrs["active_model"] = result.active_model
         return attrs
 
 

@@ -19,13 +19,19 @@ CONF_HORIZON_MINUTES: Final = "horizon_minutes"
 CONF_HALF_LIFE_DAYS: Final = "half_life_days"
 CONF_UPDATE_INTERVAL_MINUTES: Final = "update_interval_minutes"
 CONF_HOLIDAY_CALENDAR: Final = "holiday_calendar"  # optional calendar.* entity
+CONF_ENABLE_SKLEARN: Final = "enable_sklearn_challenger"
 
 DEFAULT_RETURN_THRESHOLD: Final = 0.6
 DEFAULT_MATURITY_THRESHOLD: Final = 0.7
 DEFAULT_HORIZON_MINUTES: Final = 90
 DEFAULT_HALF_LIFE_DAYS: Final = 28
 DEFAULT_UPDATE_INTERVAL_MINUTES: Final = 2
+DEFAULT_ENABLE_SKLEARN: Final = False
 MATURITY_HYSTERESIS: Final = 0.1
+
+# Optional scikit-learn challenger (installed at runtime only when enabled)
+SKLEARN_REQUIREMENT: Final = "scikit-learn>=1.5"
+DEFAULT_ACTIVE_MODEL: Final = "kernel_bayes"
 
 # Modes
 MODE_AUTO: Final = "auto"

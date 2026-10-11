@@ -26,3 +26,12 @@ async def test_diagnostics(hass: HomeAssistant, loaded_entry: MockConfigEntry) -
     assert isinstance(alice["prediction_log"], list)
     assert data["house"]["occupied"] is True
     assert alice["last_prediction"]["reason"]["latitude"] == "**REDACTED**"
+    assert alice["active_model"] == "kernel_bayes"
+    assert alice["maturity"]["active_model"] == "kernel_bayes"
+    assert "candidate_brier" in alice["maturity"]
+    assert data["challenger"] == {
+        "requested": False,
+        "enabled": False,
+        "sklearn_available": data["challenger"]["sklearn_available"],
+        "training": [],
+    }

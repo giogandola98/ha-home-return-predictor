@@ -32,7 +32,8 @@
           "horizon_minutes": "Prediction horizon",
           "half_life_days": "History half-life",
           "update_interval_minutes": "Update interval",
-          "holiday_calendar": "Holiday calendar"
+          "holiday_calendar": "Holiday calendar",
+          "enable_sklearn_challenger": "Enable scikit-learn challenger model"
         },
         "data_description": {
           "persons": "Person entities whose return home will be predicted.",
@@ -41,7 +42,8 @@
           "horizon_minutes": "Window, in minutes, within which a return is predicted.",
           "half_life_days": "Older habits weigh half after this many days.",
           "update_interval_minutes": "How often predictions are recomputed, in minutes.",
-          "holiday_calendar": "Optional calendar whose events mark holidays."
+          "holiday_calendar": "Optional calendar whose events mark holidays.",
+          "enable_sklearn_challenger": "Experimental. Installs scikit-learn (about 100 MB) at runtime and trains a gradient boosting challenger in the background (single thread, every few hours). It is used only while it beats the built-in model on recent, unseen predictions; otherwise the built-in model keeps working. Leave off on very small systems."
         }
       }
     },

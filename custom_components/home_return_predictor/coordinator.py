@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
 import math
 from collections import deque
@@ -22,9 +23,11 @@ from homeassistant.core import (
 )
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+from homeassistant.requirements import RequirementsNotFound, async_process_requirements
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_ENABLE_SKLEARN,
     CONF_HALF_LIFE_DAYS,
     CONF_HOLIDAY_CALENDAR,
     CONF_HOME_ZONE,
@@ -33,6 +36,8 @@ from .const import (
     CONF_PERSONS,
     CONF_RETURN_THRESHOLD,
     CONF_UPDATE_INTERVAL_MINUTES,
+    DEFAULT_ACTIVE_MODEL,
+    DEFAULT_ENABLE_SKLEARN,
     DEFAULT_HALF_LIFE_DAYS,
     DEFAULT_HOME_ZONE,
     DEFAULT_HORIZON_MINUTES,
@@ -48,6 +53,7 @@ from .const import (
     MODE_LEARNING,
     MODE_LIVE,
     MODES,
+    SKLEARN_REQUIREMENT,
 )
 from .history import (
     HomeZone,
@@ -56,7 +62,7 @@ from .history import (
     state_is_home,
     state_to_fix,
 )
-from .hrp_core import KernelBayesReturnModel, create_model
+from .hrp_core import KernelBayesReturnModel, create_model, sklearn_available
 from .hrp_core.base import (
     MaturityReport,
     ModelConfig,
@@ -79,7 +85,7 @@ class PersonRuntime:
 
     entity_id: str
     slug: str
-    model: ReturnModel
+    model: ReturnModel  # KernelBayesReturnModel (also provides the challenger hooks)
     mode: str = MODE_AUTO
     effective_mode: str | None = None
     is_home: bool | None = None
@@ -89,6 +95,9 @@ class PersonRuntime:
     returning: bool = False
     snapshot: dict[str, Any] | None = None  # last JSON-safe model state
     dirty: bool = True  # model changed since the last snapshot
+    # Serialises every access to ``model`` (executor jobs, including challenger
+    # training, and in-loop mutations) so the model is never used concurrently.
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def add_fix(self, fix: PositionFix) -> bool:
         """Append a fix, skipping duplicates (person mirrors its source tracker)."""
@@ -130,6 +139,15 @@ class PersonResult:
         """True when the prediction should only be informative."""
         return self.effective_mode == MODE_LEARNING
 
+    @property
+    def active_model(self) -> str:
+        """Model whose probability is currently served (champion or promoted challenger)."""
+        return str(
+            self.prediction.reason.get("active_model")
+            or getattr(self.maturity, "active_model", None)
+            or DEFAULT_ACTIVE_MODEL
+        )
+
 
 @dataclass
 class HouseResult:
@@ -162,6 +180,11 @@ class HRPData:
     house: HouseResult
 
 
+def _sklearn_installed() -> bool:
+    """Cheap check (no import) whether scikit-learn is installed."""
+    return importlib.util.find_spec("sklearn") is not None
+
+
 def _fmt_dt(value: datetime | None) -> str | None:
     return dt_util.as_local(value).strftime("%H:%M") if value else None
 
@@ -192,6 +215,8 @@ def build_reason(prediction: Prediction, left_at: datetime | None) -> str:
     parts.append(", ".join(evidence))
     if prediction.eta is not None:
         parts.append(f"ETA {_fmt_dt(prediction.eta)}")
+    if active := prediction.reason.get("active_model"):
+        parts.append(f"model {active}")
     return "; ".join(parts)[:255]
 
 
@@ -230,10 +255,22 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         self.persons: dict[str, PersonRuntime] = {}
         self.last_predictions: dict[str, Prediction] = {}
         self._lock = asyncio.Lock()
+        self.challenger_requested: bool = bool(
+            options.get(CONF_ENABLE_SKLEARN, DEFAULT_ENABLE_SKLEARN)
+        )
+        self.challenger_enabled: bool = False  # requested and scikit-learn installed
+        self.sklearn_available: bool = False
+        self._train_lock = asyncio.Lock()  # one challenger training at a time
+        self._training: set[str] = set()  # persons with a scheduled/running training
         self._unsub_tracking: CALLBACK_TYPE | None = None
         self._tracked: set[str] = set()
 
     # ------------------------------------------------------------------ helpers
+
+    @property
+    def training_persons(self) -> set[str]:
+        """Persons whose challenger training is scheduled or running."""
+        return set(self._training)
 
     @property
     def home_zone(self) -> HomeZone | None:
@@ -298,10 +335,47 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                 if fix is not None and runtime.is_home is not True:
                     runtime.add_fix(fix)
         self._async_subscribe()
+        self.config_entry.async_create_background_task(
+            self.hass, self._async_setup_challenger(), f"{DOMAIN}_challenger_setup"
+        )
         if to_bootstrap:
             self.config_entry.async_create_background_task(
                 self.hass, self.async_retrain(to_bootstrap), f"{DOMAIN}_bootstrap"
             )
+
+    async def _async_setup_challenger(self) -> None:
+        """Install scikit-learn on demand and switch the challenger on/off."""
+        enabled = False
+        if self.challenger_requested:
+            try:
+                await async_process_requirements(self.hass, DOMAIN, [SKLEARN_REQUIREMENT])
+            except (RequirementsNotFound, OSError) as err:
+                _LOGGER.warning(
+                    "Could not install %s (%s); the scikit-learn challenger stays disabled "
+                    "and the built-in model keeps working",
+                    SKLEARN_REQUIREMENT,
+                    err,
+                )
+            else:
+                enabled = True
+        if self.challenger_requested:
+            self.sklearn_available = await self.hass.async_add_executor_job(sklearn_available)
+        else:
+            # Do not import scikit-learn (memory) when the challenger is off.
+            self.sklearn_available = await self.hass.async_add_executor_job(_sklearn_installed)
+        if enabled and not self.sklearn_available:
+            _LOGGER.warning(
+                "%s reported installed but cannot be imported; challenger disabled",
+                SKLEARN_REQUIREMENT,
+            )
+            enabled = False
+        self.challenger_enabled = enabled
+        for runtime in self.persons.values():
+            async with runtime.lock:
+                await self.hass.async_add_executor_job(runtime.model.enable_challenger, enabled)
+        if enabled:
+            _LOGGER.debug("scikit-learn challenger enabled")
+            await self.async_request_refresh()
 
     @callback
     def _async_subscribe(self) -> None:
@@ -324,7 +398,7 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
             self._unsub_tracking()
             self._unsub_tracking = None
         async with self._lock:
-            await self.hass.async_add_executor_job(self._snapshot_dirty)
+            await self._async_snapshot_dirty()
         await self.storage.async_save(self._store_data())
 
     # ------------------------------------------------------------------ events
@@ -386,7 +460,7 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
     async def _async_observe(
         self, runtime: PersonRuntime, transition: PresenceTransition, holiday: bool
     ) -> None:
-        async with self._lock:
+        async with self._lock, runtime.lock:
             runtime.model.observe_transition(transition, holiday)
             runtime.dirty = True
             if transition.is_home:
@@ -411,12 +485,24 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
             runtime.dirty = False
         return prediction, maturity
 
-    def _snapshot_dirty(self) -> None:
-        """Refresh snapshots of changed models (executor)."""
-        for runtime in self.persons.values():
-            if runtime.dirty or runtime.snapshot is None:
-                runtime.snapshot = runtime.model.to_dict()
-                runtime.dirty = False
+    @staticmethod
+    def _snapshot(runtime: PersonRuntime) -> None:
+        """Refresh the snapshot of a changed model (executor, under runtime.lock)."""
+        if runtime.dirty or runtime.snapshot is None:
+            runtime.snapshot = runtime.model.to_dict()
+            runtime.dirty = False
+
+    async def _async_snapshot_dirty(self, person_ids: list[str] | None = None) -> None:
+        """Refresh snapshots of changed models, one person (lock) at a time."""
+        for person_id in person_ids or list(self.persons):
+            runtime = self.persons[person_id]
+            async with runtime.lock:
+                await self.hass.async_add_executor_job(self._snapshot, runtime)
+
+    def _reset_model(self, runtime: PersonRuntime) -> None:
+        """Reset a model, keeping the challenger switch (executor, under runtime.lock)."""
+        runtime.model.reset()
+        runtime.model.enable_challenger(self.challenger_enabled)
 
     def _effective_mode(self, runtime: PersonRuntime, maturity: float) -> str:
         if runtime.mode != MODE_AUTO:
@@ -443,9 +529,12 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                     fixes=tuple(runtime.fixes),
                 )
                 try:
-                    prediction, maturity = await self.hass.async_add_executor_job(
-                        self._compute, runtime, model_input
-                    )
+                    async with runtime.lock:
+                        prediction, maturity = await self.hass.async_add_executor_job(
+                            self._compute, runtime, model_input
+                        )
+                        model = runtime.model
+                        training_due = self.challenger_enabled and model.challenger_due(now)
                 except (ArithmeticError, KeyError, TypeError, ValueError) as err:
                     raise UpdateFailed(
                         translation_domain=DOMAIN,
@@ -471,8 +560,45 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                     self._fire_return_event(result)
                 runtime.returning = returning
                 results[person_id] = result
+                if training_due:
+                    self._schedule_training(runtime, now)
         self._schedule_save()
         return HRPData(persons=results, house=self._aggregate(results))
+
+    # ------------------------------------------------------------------ challenger
+
+    @callback
+    def _schedule_training(self, runtime: PersonRuntime, now: datetime) -> None:
+        """Train the challenger of a person in the background (once at a time)."""
+        if runtime.entity_id in self._training:
+            return
+        self._training.add(runtime.entity_id)
+        self.config_entry.async_create_background_task(
+            self.hass,
+            self._async_train(runtime, now),
+            f"{DOMAIN}_train_challenger_{runtime.slug}",
+        )
+
+    async def _async_train(self, runtime: PersonRuntime, now: datetime) -> None:
+        try:
+            async with self._train_lock, runtime.lock:
+                future = self.hass.async_add_executor_job(runtime.model.train_challenger, now)
+                try:
+                    summary = await asyncio.shield(future)
+                except asyncio.CancelledError:
+                    # Keep the model locked until the worker thread really finishes.
+                    await future
+                    raise
+                runtime.dirty = True
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # a failed challenger must never stop the champion
+            _LOGGER.warning("Challenger training failed for %s", runtime.entity_id, exc_info=True)
+            return
+        finally:
+            self._training.discard(runtime.entity_id)
+        _LOGGER.debug("Challenger training for %s: %s", runtime.entity_id, summary)
+        self._schedule_save()
 
     def _fire_return_event(self, result: PersonResult) -> None:
         eta = result.prediction.eta
@@ -545,7 +671,8 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         """Forget everything learnt for a person."""
         async with self._lock:
             runtime = self.persons[person_id]
-            await self.hass.async_add_executor_job(runtime.model.reset)
+            async with runtime.lock:
+                await self.hass.async_add_executor_job(self._reset_model, runtime)
             runtime.fixes.clear()
             runtime.returning = False
             runtime.effective_mode = None
@@ -564,15 +691,16 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                 "History for %s: %d transitions, %d fixes", person_id, len(transitions), len(fixes)
             )
             async with self._lock:
-                if transitions or fixes:
-                    await self.hass.async_add_executor_job(
-                        runtime.model.load_history, transitions, fixes, holidays
-                    )
-                    runtime.dirty = True
-                last = transitions[-1] if transitions else None
-                if last is not None and not last.is_home and runtime.left_at is None:
-                    runtime.left_at = last.ts
-                await self.hass.async_add_executor_job(self._snapshot_dirty)
+                async with runtime.lock:
+                    if transitions or fixes:
+                        await self.hass.async_add_executor_job(
+                            runtime.model.load_history, transitions, fixes, holidays
+                        )
+                        runtime.dirty = True
+                    last = transitions[-1] if transitions else None
+                    if last is not None and not last.is_home and runtime.left_at is None:
+                        runtime.left_at = last.ts
+                await self._async_snapshot_dirty()
         self._schedule_save()
         await self.async_request_refresh()
 
