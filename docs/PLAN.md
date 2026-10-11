@@ -37,7 +37,7 @@ ha-home-return-predictor/
 │   ├── model/                 # pure tests (import hrp_core via sys.path, no HA)
 │   └── integration/           # pytest-homeassistant-custom-component: config flow, setup, entities
 ├── .github/workflows/{ci.yml,validate.yml}   # ruff + pytest ; hassfest + HACS action
-├── hacs.json, pyproject.toml (ruff + pytest config), README.md (Italian), LICENSE
+├── hacs.json, pyproject.toml (ruff + pytest config), README.md (English), LICENSE
 ```
 
 `hrp_core` sits inside the integration (so HACS ships it) but never imports
