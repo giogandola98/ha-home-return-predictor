@@ -170,3 +170,15 @@ HA side:
 - H8 bootstrap fixes left_at from history when no stored data.
 - H9 reason text reads `shift_label`; hacs.json minimum HA raised to the tested range.
 - Docs/CI: README baseline description, CI runs the whole test suite (incl. blueprint tests).
+
+## 7. Fix plan after re-verification
+
+- R1 model generation counter: `reset()` / `load_history(replace=True)` bump it; the challenger
+  snapshot carries it and `apply_challenger` discards stale results.
+- R2 per-person return candidates: house ETA sensor gets attribute `candidates`
+  (`[{person, probability, eta}]`, away persons with p >= 0.25). `decide_preset` accepts a list
+  of candidates and takes the highest-ranked preset (each candidate judged on its own
+  probability, ETA and schedule-at-ETA); the blueprint mirrors it with a Jinja loop and falls
+  back to the single house ETA/probability when the attribute is missing.
+- R3 pending observe tasks are awaited before the final save on unload.
+- R4 chunked recorder bootstrap ignores the synthetic first state of each chunk for fixes.
