@@ -101,9 +101,11 @@ class MaturityReport:
     episodes: int
     resolved_predictions: int
     brier_score: float | None
-    baseline_brier_score: float | None
+    baseline_brier_score: float | None  # duration-only survival baseline
     brier_skill_score: float | None
-    fusion: str = "bayes"  # "bayes" or "learned" (active probability fusion)
+    fusion: str = "bayes"  # "bayes" / "learned" / "sklearn" (compat alias of active_model)
+    active_model: str = "kernel_bayes"  # kernel_bayes / learned_fusion / sklearn_gbm
+    candidate_brier: dict[str, float | None] = field(default_factory=dict)  # last holdout
 
 
 class ReturnModel(ABC):

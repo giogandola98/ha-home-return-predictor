@@ -1,4 +1,4 @@
-"""Prediction log, Brier skill vs climatology and the maturity score."""
+"""Prediction log, Brier skill vs a duration-only baseline and the maturity score."""
 
 from __future__ import annotations
 
@@ -15,8 +15,10 @@ from .prior import DAY_MINUTES, recency_weight
 MAX_RESOLVED = 3000
 MAX_RESOLVED_AGE_DAYS = 90.0
 MIN_RESOLVED_FOR_SKILL = 30
-EPISODE_SCALE = 12.0
-BSS_FULL = 0.25
+EPISODE_SCALE = 15.0  # data factor: 1 - e^(-n_eff / 15)
+# Full skill at BSS 0.5 vs the duration-only baseline (habits + GPS halve the Brier
+# of "how long has the person been away"); vs climatology it used to be 0.25.
+BSS_FULL = 0.5
 
 
 @dataclass
@@ -29,7 +31,9 @@ class LogEntry:
     approach_class: str | None
     horizon_end: datetime
     outcome: int | None = None
-    features: list[float] = field(default_factory=list)
+    features: list[float] = field(default_factory=list)  # stacker features
+    base: float | None = None  # duration-only baseline P, computed at log time
+    x: list[float] = field(default_factory=list)  # challenger features
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -40,6 +44,8 @@ class LogEntry:
             "hend": self.horizon_end.isoformat(),
             "outcome": self.outcome,
             "f": list(self.features),
+            "b": self.base,
+            "x": list(self.x),
         }
 
     @classmethod
@@ -52,6 +58,8 @@ class LogEntry:
             horizon_end=datetime.fromisoformat(data["hend"]),
             outcome=data.get("outcome"),
             features=[float(x) for x in data.get("f", [])],
+            base=None if data.get("b") is None else float(data["b"]),
+            x=[float(v) for v in data.get("x", [])],
         )
 
 
@@ -126,7 +134,12 @@ class PredictionLog:
 def weighted_brier(
     entries: Sequence[LogEntry], probs: Sequence[float], now: datetime, half_life_days: float
 ) -> tuple[float, float] | None:
-    """Recency-weighted (Brier, climatology Brier) of ``probs`` vs entry outcomes."""
+    """Recency-weighted (Brier of ``probs``, Brier of the baseline) vs entry outcomes.
+
+    The baseline is each entry's duration-only survival probability stored at log
+    time (an honest out-of-sample forecast); entries logged before the baseline
+    existed fall back to the weighted climatology rate.
+    """
     num = den = pos = 0.0
     weights: list[float] = []
     for entry, p in zip(entries, probs, strict=True):
@@ -138,8 +151,12 @@ def weighted_brier(
         pos += w * o
     if den <= 0:
         return None
-    base = pos / den
-    return num / den, base * (1.0 - base)
+    clim = pos / den
+    ref = 0.0
+    for entry, w in zip(entries, weights, strict=True):
+        b = clim if entry.base is None else entry.base
+        ref += w * (b - float(entry.outcome or 0)) ** 2
+    return num / den, ref / den
 
 
 def effective_episodes(
@@ -157,8 +174,14 @@ def maturity_report(
     now: datetime,
     half_life_days: float,
     fusion: str = "bayes",
+    active_model: str = "kernel_bayes",
+    candidate_brier: dict[str, float | None] | None = None,
 ) -> MaturityReport:
-    """maturity = (1 - e^(-n_eff/12)) x clamp(BSS / 0.25, 0, 1)."""
+    """maturity = (1 - e^(-n_eff/15)) x clamp(BSS / 0.5, 0, 1).
+
+    BSS is measured against the duration-only baseline, so maturity reflects the
+    value of learnt habits (and GPS) rather than plain base-rate knowledge.
+    """
     n_eff = effective_episodes(episodes, now, half_life_days)
     data_factor = 1.0 - math.exp(-n_eff / EPISODE_SCALE)
     bs = ref = bss = None
@@ -179,4 +202,6 @@ def maturity_report(
         baseline_brier_score=ref,
         brier_skill_score=bss,
         fusion=fusion,
+        active_model=active_model,
+        candidate_brier=dict(candidate_brier or {}),
     )

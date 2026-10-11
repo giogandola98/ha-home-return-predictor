@@ -66,7 +66,7 @@ def bayes_from_features(features: Sequence[float]) -> float:
     return clamp(sigmoid(features[0] + features[1]), P_MIN, P_MAX)
 
 
-def _apply(weights: Sequence[float], features: Sequence[float]) -> float:
+def apply_weights(weights: Sequence[float], features: Sequence[float]) -> float:
     z = weights[0] + sum(w * x for w, x in zip(weights[1:], features, strict=True))
     return clamp(sigmoid(z), P_MIN, P_MAX)
 
@@ -158,7 +158,7 @@ class Stacker:
         self.holdout_brier_bayes: float | None = None
 
     def predict(self, features: Sequence[float]) -> float:
-        return _apply(self.weights, features)
+        return apply_weights(self.weights, features)
 
     def fit(self, entries: Sequence[LogEntry], now: datetime, half_life_days: float) -> None:
         """Refit on the last resolved entries and decide whether to activate."""
@@ -190,7 +190,7 @@ class Stacker:
             train, hold = usable[:split], usable[split:]
             w_train = weights_for(train)
             hl = half_life_days
-            learned = _brier(hold, [_apply(w_train, e.features) for e in hold], now, hl)
+            learned = _brier(hold, [apply_weights(w_train, e.features) for e in hold], now, hl)
             bayes = _brier(hold, [bayes_from_features(e.features) for e in hold], now, hl)
             self.holdout_brier_learned, self.holdout_brier_bayes = learned, bayes
             self.active = learned < bayes * (1.0 - ACTIVATION_MARGIN)

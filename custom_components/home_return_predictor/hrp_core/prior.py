@@ -185,3 +185,38 @@ def estimate_prior(
         if q1 is not None and q3 is not None:
             iqr = q3 - q1
     return PriorResult(min(max(p, 0.0), 1.0), n_eff, k_total, median, iqr)
+
+
+def duration_baseline(
+    episodes: Sequence[EpisodeKey],
+    trips: Sequence[EpisodeKey],
+    *,
+    now: datetime,
+    minutes_away: float,
+    horizon_minutes: float,
+    half_life_days: float,
+) -> float:
+    """Duration-only survival baseline P(return in (d, d+H] | away d).
+
+    Recency-weighted Kaplan-Meier style conditional hazard over all known absences,
+    ignoring time of day, weekday and GPS. Trips only count once the current absence
+    is longer than ``LONG_ABSENCE_MINUTES`` (as in the prior). Used as the reference
+    forecast of the maturity Brier skill score: it measures what learnt *habits*
+    add over "how long has the person been away".
+    """
+    d = max(minutes_away, 0.0)
+    end = d + horizon_minutes
+    now_ts = now.timestamp()
+    decay = math.log(2.0) / (max(half_life_days, 1e-6) * 86400.0)
+    long_absence = d > LONG_ABSENCE_MINUTES
+    pool = (*episodes, *trips) if long_absence else episodes
+    hits = total = 0.0
+    for ep in pool:
+        if ep.duration <= d:
+            continue
+        r = math.exp(-decay * max(now_ts - ep.left_ts, 0.0))
+        total += r
+        if ep.duration <= end:
+            hits += r
+    target = LONG_FALLBACK_HAZARD if long_absence else FALLBACK_HAZARD
+    return min(max(_shrunk(hits, total, target, GLOBAL_PSEUDO_WEIGHT), 0.0), 1.0)

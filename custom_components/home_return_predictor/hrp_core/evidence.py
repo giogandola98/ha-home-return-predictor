@@ -31,7 +31,7 @@ DEFAULT_LR: dict[str, float] = {
     "approach_fast": 7.0,
 }
 LR_MIN = 0.05
-LR_MAX = 20.0
+LR_MAX = 50.0
 CALIBRATION_PRIOR_STRENGTH = 8.0
 MIN_FIXES = 3
 MIN_SPAN_MINUTES = 2.0
@@ -162,3 +162,67 @@ class LRCalibrator:
                 data.get("not_returned", {}).get(name, cal.not_returned[name])
             )
         return cal
+
+
+APPROACH_CLASSES: frozenset[str] = frozenset({"approach_slow", "approach", "approach_fast"})
+SEGMENT_RESET_MINUTES = 10.0
+
+
+class CalibrationSegments:
+    """Decides when an approach class yields a GPS calibration observation.
+
+    Approach classes count once per *approach segment*: a segment ends when the
+    person has been in a non-approach class (still / away) for >= 10 minutes, or a
+    full horizon after the class was counted. A drive-by followed by the real
+    return in the same absence therefore yields one negative and one positive
+    observation. Non-approach classes (still / away / away_fast) keep counting
+    once per absence, so long stays do not flood the counts with negatives.
+    """
+
+    def __init__(self) -> None:
+        self.absence_key: str | None = None
+        self.seen: dict[str, datetime] = {}
+        self.calm_since: datetime | None = None
+
+    def observe(
+        self, ts: datetime, approach_class: str | None, absence_key: str | None, horizon: float
+    ) -> bool:
+        """Register one observation; True if it should feed the calibrator."""
+        if absence_key != self.absence_key:
+            self.absence_key, self.seen, self.calm_since = absence_key, {}, None
+        if approach_class is None:
+            return False
+        if (
+            self.calm_since is not None
+            and minutes_between(self.calm_since, ts) >= SEGMENT_RESET_MINUTES
+        ):
+            self.seen = {c: t for c, t in self.seen.items() if c not in APPROACH_CLASSES}
+        if approach_class in APPROACH_CLASSES:
+            self.calm_since = None
+        elif self.calm_since is None:
+            self.calm_since = ts
+        self.seen = {
+            c: t
+            for c, t in self.seen.items()
+            if c not in APPROACH_CLASSES or minutes_between(t, ts) < horizon
+        }
+        if approach_class in self.seen:
+            return False
+        self.seen[approach_class] = ts
+        return True
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "key": self.absence_key,
+            "seen": {c: t.isoformat() for c, t in self.seen.items()},
+            "calm": self.calm_since.isoformat() if self.calm_since else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> CalibrationSegments:
+        seg = cls()
+        seg.absence_key = data.get("key")
+        seg.seen = {c: datetime.fromisoformat(t) for c, t in (data.get("seen") or {}).items()}
+        calm = data.get("calm")
+        seg.calm_since = datetime.fromisoformat(calm) if calm else None
+        return seg

@@ -72,8 +72,8 @@ Per person, one `KernelBayesReturnModel` implementing `ReturnModel`:
 5. **ETA**: inverse-variance combination of habit ETA (spread from weighted IQR) and
    position ETA (distance/speed when speed > 5 km/h, variance ∝ ETA²).
 6. **Maturity**: prediction log (sampled every ≥ 10 min while away), each resolved
-   against the truth (returned within H?). Brier score vs climatology baseline
-   (base rate of the same log) -> Brier skill score. maturity = data factor
+   against the truth (returned within H?). Brier score vs a duration-only survival baseline (see §5)
+   -> Brier skill score. maturity = data factor
    (1 − e^(−n_eff/12), n_eff = recency-weighted episodes) × skill factor
    (clamp(BSS / 0.25, 0, 1), requires ≥ 30 resolved predictions).
 7. **Modes**: select auto/learning/live. auto -> live when maturity ≥ threshold

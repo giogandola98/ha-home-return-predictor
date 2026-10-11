@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 from model_helpers import CONFIG, approach_fixes, away_input, local, next_weekday
@@ -15,7 +15,13 @@ from hrp_core import (
     PresenceTransition,
     haversine_m,
 )
-from hrp_core.evidence import DEFAULT_LR, LRCalibrator, classify_speed, compute_evidence
+from hrp_core.evidence import (
+    DEFAULT_LR,
+    LR_MAX,
+    LRCalibrator,
+    classify_speed,
+    compute_evidence,
+)
 from hrp_core.fusion import combine_eta, fuse_probability, position_eta_minutes
 from hrp_core.synthetic import DEFAULT_START, fixed_schedule_person, replay_online
 
@@ -65,7 +71,7 @@ def test_calibrator_prior_encodes_default_lrs() -> None:
     for _ in range(500):
         cal.update("approach_fast", True)
         cal.update("away_fast", False)
-    assert cal.likelihood_ratio("approach_fast") == 20.0  # clamped
+    assert cal.likelihood_ratio("approach_fast") == LR_MAX == 50.0  # clamped
 
 
 def test_fusion_math() -> None:
@@ -164,3 +170,78 @@ def test_drive_by_in_simulation_stays_below_threshold() -> None:
 
 def test_logit_helpers() -> None:
     assert math.isclose(fuse_probability(0.2, math.e), 1 / (1 + 4 / math.e))
+
+
+def _feed(model: KernelBayesReturnModel, day: date, left: float, minute: float, fixes) -> None:  # type: ignore[no-untyped-def]
+    inp = away_input(day, left, minute, fixes)
+    model.log_prediction(inp, model.predict(inp))
+    model.resolve(local(day, minute), False)
+
+
+def test_drive_by_then_real_return_counts_positive() -> None:
+    """Calibration is per approach segment: the real return after a drive-by counts."""
+    model = KernelBayesReturnModel(CONFIG)
+    base_r = model.calibrator.returned["approach_fast"]
+    base_n = model.calibrator.not_returned["approach_fast"]
+    day = next_weekday(DEFAULT_START, 2)
+    model.observe_transition(PresenceTransition(local(day, 465), False))
+    for minute in range(10 * 60 + 50, 11 * 60 + 1, 2):  # drive-by: fast approach to 400 m
+        dist = 400 + (11 * 60 - minute) * 50_000 / 60
+        _feed(model, day, 465, minute, approach_fixes(local(day, minute), dist, 50))
+    for minute in range(11 * 60 + 5, 11 * 60 + 40, 5):  # parked again, 10 km away
+        _feed(model, day, 465, minute, approach_fixes(local(day, minute), 10_000, 0))
+    _feed(model, day, 465, 13 * 60, approach_fixes(local(day, 13 * 60), 10_000, 0))
+    assert model.calibrator.not_returned["approach_fast"] == base_n + 1  # drive-by: negative
+    for minute in range(17 * 60 + 30, 17 * 60 + 41, 2):  # real return
+        dist = 300 + (17 * 60 + 41 - minute) * 50_000 / 60
+        _feed(model, day, 465, minute, approach_fixes(local(day, minute), dist, 50))
+    model.observe_transition(PresenceTransition(local(day, 17 * 60 + 45), True))
+    assert model.calibrator.returned["approach_fast"] == base_r + 1  # real return: positive
+    assert model.calibrator.not_returned["approach_fast"] == base_n + 1
+
+
+def test_calibration_segments_rules() -> None:
+    from hrp_core.evidence import CalibrationSegments
+
+    seg = CalibrationSegments()
+    t0 = local(DAY, 600)
+
+    def at(minutes: float) -> datetime:
+        return t0 + timedelta(minutes=minutes)
+
+    assert seg.observe(at(0), "approach_fast", "a", 90)
+    assert not seg.observe(at(2), "approach_fast", "a", 90)
+    assert seg.observe(at(3), "still", "a", 90)
+    assert not seg.observe(at(8), "approach_fast", "a", 90)  # still < 10 min: same segment
+    assert not seg.observe(at(9), "still", "a", 90)  # non-approach: once per absence
+    assert not seg.observe(at(20), "still", "a", 90)
+    assert seg.observe(at(21), "approach_fast", "a", 90)  # still >= 10 min: new segment
+    assert not seg.observe(at(100), "approach_fast", "a", 90)
+    assert seg.observe(at(112), "approach_fast", "a", 90)  # a full horizon elapsed
+    assert seg.observe(at(113), "still", "b", 90)  # new absence resets everything
+    restored = CalibrationSegments.from_dict(seg.to_dict())
+    assert restored.to_dict() == seg.to_dict()
+
+
+def test_odd_time_return_with_strong_approach(trained: KernelBayesReturnModel) -> None:
+    """Sharp prior at an odd time + sustained fast approach: no longer stuck near 0.
+
+    Target P >= 0.2 (the pre-fix model gave ~0.06 with prior clamp 0.005 / LR cap 20).
+    On this data the calibrated LR(approach_fast) is ~13, because identical fast
+    approaches at that hour are often drive-bys; 0.3 would need LR >= 21, which the
+    calibration does not support, and the drive-by tests require staying < 0.6.
+    """
+    day = next_weekday(DEFAULT_START + timedelta(days=57), 1)
+    probs = []
+    for minute in range(10 * 60 + 50, 11 * 60 + 3, 3):  # 12+ min of fast approach
+        dist = 600 + (11 * 60 + 3 - minute) * 48_000 / 60
+        pred = trained.predict(
+            away_input(day, 465, minute, approach_fixes(local(day, minute), dist, 48))
+        )
+        probs.append(pred.probability)
+        assert pred.prior_probability is not None and pred.prior_probability < 0.02
+    lr = trained.calibrator.likelihood_ratio("approach_fast")
+    old = 1 / (1 + (1 - 0.005) / (0.005 * min(lr, 20.0)))
+    assert min(probs[1:]) >= 0.2
+    assert min(probs[1:]) > 3 * old
+    assert max(probs) < 0.6

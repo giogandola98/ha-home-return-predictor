@@ -6,7 +6,9 @@ import math
 
 P_MIN = 0.01
 P_MAX = 0.99
-PRIOR_CLAMP = 0.005
+# Prior floor/ceiling before fusion: a sharp habit prior (e.g. 0.005 at an odd time)
+# must still let strong, calibrated GPS evidence through (LR up to 50 -> P ~ 0.5).
+PRIOR_CLAMP = 0.02
 MIN_POSITION_SPEED_KMH = 5.0
 POSITION_ETA_MAX_HORIZONS = 3.0
 MIN_HABIT_SD_MINUTES = 10.0
@@ -29,7 +31,7 @@ def sigmoid(z: float) -> float:
 
 
 def fuse_probability(prior: float, likelihood_ratio: float) -> float:
-    """logit(P) = logit(prior) + ln(LR), final P clamped to [0.01, 0.99]."""
+    """logit(P) = logit(clamp(prior, 0.02, 0.98)) + ln(LR), final P clamped to [0.01, 0.99]."""
     z = logit(clamp(prior, PRIOR_CLAMP, 1 - PRIOR_CLAMP)) + math.log(max(likelihood_ratio, 1e-9))
     return clamp(sigmoid(z), P_MIN, P_MAX)
 
