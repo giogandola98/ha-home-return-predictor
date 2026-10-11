@@ -105,3 +105,40 @@ Per person, one `KernelBayesReturnModel` implementing `ReturnModel`:
 | integration | pytest-homeassistant-custom-component: config flow (user + options + duplicate abort), setup/unload, entities created with stable unique_ids, select changes mode, services registered, diagnostics |
 | packaging | ruff clean, hassfest + HACS action in CI, manifest keys checked |
 | final | separate subagent reviews everything against the brief; `/code-review` pass |
+
+## 5. Follow-up plan: champion/challenger + model fixes (added after first build)
+
+Requested by the user mid-build: optional scikit-learn model trained in the background,
+promoted automatically only when it beats the stdlib model.
+
+1. **Model fixes** (hrp_core, pure):
+   - Maturity baseline is too easy (climatology). Replace with a still-trivial but
+     informed baseline: duration-only survival P(return in (d, d+H] | away d) ignoring
+     time of day / weekday (recency-weighted Kaplan–Meier style). Maturity then measures
+     the value of learnt habits, so it no longer saturates in ~2 weeks.
+   - GPS calibration "once per class per absence" misses the real return on drive-by
+     days. Change to once per class per *approach segment* (a segment resets after the
+     class changes to still/away for ≥ 10 min or after a horizon has elapsed).
+   - Odd-time returns (sharp prior ≈ 0.005) stay low even with strong approach:
+     floor the prior at 0.02 before fusion, and let the calibrated LR cap rise to 50.
+2. **Challenger** `hrp_core/challenger.py`: `HistGradientBoostingClassifier`
+   (max_iter ≤ 100, max_leaf_nodes ≤ 15, early stopping off, single thread via
+   threadpoolctl) trained on the resolved prediction log features (logit prior, ln LR,
+   minutes away, departure-hour sin/cos, weekday class, log distance, speed, Bayes P).
+   sklearn imported lazily; module importable without it. Not pickled: retrained from
+   the persisted log at startup.
+3. **Selection** (pure, in `hrp_core`): rolling chronological holdout; candidates
+   bayes / learned fusion / sklearn; promote challenger only if it beats the current
+   champion's Brier by ≥ 3 % on ≥ 2 consecutive evaluations with ≥ 400 resolved
+   entries; demote immediately if it falls behind. Active model exposed in reason +
+   MaturityReport (`active_model`, per-candidate Brier).
+4. **HA wiring**: option `enable_sklearn_challenger` (default off). When enabled,
+   `homeassistant.requirements.async_process_requirements(hass, DOMAIN,
+   ["scikit-learn>=1.5"])` installs it at runtime (respects HA constraints); failure →
+   repair-free warning log, champion continues. Training every ≥ 6 h or after 150 new
+   resolved entries, in `hass.async_add_executor_job`, guarded by a lock so only one
+   training runs at a time. Attributes `active_model`, `candidate_brier` on maturity.
+5. **Verification**: unit tests (skip if sklearn missing) for training, selection
+   hysteresis, no-sklearn fallback; integration test for the option and failed install;
+   simulate.py `--sklearn` flag prints which model is active per day; timing check
+   that one training on 5000 rows takes < 2 s.
