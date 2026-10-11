@@ -1,4 +1,4 @@
-"""Optional scikit-learn challenger and champion/challenger selection."""
+"""Optional gradient-boosting challenger (numpy GBM) and champion/challenger selection."""
 
 from __future__ import annotations
 
@@ -11,18 +11,19 @@ from datetime import timedelta
 import pytest
 from model_helpers import CONFIG, away_input, local
 
-from hrp_core import KernelBayesReturnModel, sklearn_available
+from hrp_core import KernelBayesReturnModel, numpy_available, sklearn_available
 from hrp_core import bayes_model as bayes_module
 from hrp_core.challenger import (
+    MAX_PERSISTED_BYTES,
     N_CHALLENGER_FEATURES,
-    SklearnChallenger,
+    GBMChallenger,
     build_challenger_features,
 )
 from hrp_core.maturity import LogEntry
 from hrp_core.selection import (
+    GBM,
     KERNEL_BAYES,
     LEARNED_FUSION,
-    SKLEARN_GBM,
     Selector,
     chronological_split,
 )
@@ -65,14 +66,14 @@ def test_chronological_split() -> None:
 
 def test_selection_needs_two_consecutive_wins_and_demotes_on_loss() -> None:
     sel = Selector()
-    win = {KERNEL_BAYES: 0.10, LEARNED_FUSION: 0.10, SKLEARN_GBM: 0.09}  # 10 % better
-    small = {KERNEL_BAYES: 0.10, LEARNED_FUSION: 0.10, SKLEARN_GBM: 0.098}  # only 2 %
+    win = {KERNEL_BAYES: 0.10, LEARNED_FUSION: 0.10, GBM: 0.09}  # 10 % better
+    small = {KERNEL_BAYES: 0.10, LEARNED_FUSION: 0.10, GBM: 0.098}  # only 2 %
     assert sel.update(win, 500) == KERNEL_BAYES  # one win is not enough
     assert sel.update(small, 500) == KERNEL_BAYES  # streak broken (< 3 %)
     assert sel.update(win, 500) == KERNEL_BAYES
-    assert sel.update(win, 500) == SKLEARN_GBM  # two consecutive wins
-    assert sel.update(small, 500) == SKLEARN_GBM  # still ahead of kernel_bayes: kept
-    lose = {KERNEL_BAYES: 0.10, LEARNED_FUSION: 0.10, SKLEARN_GBM: 0.11}
+    assert sel.update(win, 500) == GBM  # two consecutive wins
+    assert sel.update(small, 500) == GBM  # still ahead of kernel_bayes: kept
+    lose = {KERNEL_BAYES: 0.10, LEARNED_FUSION: 0.10, GBM: 0.11}
     assert sel.update(lose, 500) == KERNEL_BAYES  # demoted immediately
     assert sel.update(win, 500) == KERNEL_BAYES  # needs two fresh wins again
     restored = Selector.from_dict(json.loads(json.dumps(sel.to_dict())))
@@ -81,58 +82,74 @@ def test_selection_needs_two_consecutive_wins_and_demotes_on_loss() -> None:
 
 def test_selection_min_entries_and_unscored_champion() -> None:
     sel = Selector()
-    win = {KERNEL_BAYES: 0.10, LEARNED_FUSION: 0.10, SKLEARN_GBM: 0.05}
+    win = {KERNEL_BAYES: 0.10, LEARNED_FUSION: 0.10, GBM: 0.05}
     for _ in range(3):
         assert sel.update(win, 399) == KERNEL_BAYES  # < 400 resolved entries
     sel.update(win, 400)
-    assert sel.update(win, 400) == SKLEARN_GBM
-    # sklearn not scored (e.g. uninstalled): back to the reference model.
+    assert sel.update(win, 400) == GBM
+    # gbm not scored (e.g. numpy missing): back to the reference model.
     assert sel.update({KERNEL_BAYES: 0.1, LEARNED_FUSION: 0.1}, 400) == KERNEL_BAYES
     # Learned fusion keeps its historical rule: 1 % on a single evaluation.
     assert sel.update({KERNEL_BAYES: 0.1, LEARNED_FUSION: 0.098}, 300) == LEARNED_FUSION
 
 
 # ------------------------------------------------------------------ fallback
-def test_no_sklearn_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_no_numpy_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
     tl = rotating_shift_person(days=21, seed=3)
     model = KernelBayesReturnModel(CONFIG)
     for _ in replay_online(model, tl):
         pass
-    monkeypatch.setattr(bayes_module, "sklearn_available", lambda: False)
+    monkeypatch.setattr(bayes_module, "numpy_available", lambda: False)
     now = tl.absences[-1].returned_at
     inp = away_input(DEFAULT_START + timedelta(days=22), 400, 600)
     before = model.predict(inp)
     model.enable_challenger(True)
     assert model.challenger_due(now) is False
     summary = model.train_challenger(now)
-    assert summary["trained"] is False and summary["reason"] == "sklearn_unavailable"
+    assert summary["trained"] is False and summary["reason"] == "numpy_unavailable"
     assert model.predict(inp) == before
     assert before.reason["active_model"] in (KERNEL_BAYES, LEARNED_FUSION)
 
 
-# ------------------------------------------------------------- sklearn required
-def test_challenger_fit_predict_and_compiled_trees() -> None:
-    pytest.importorskip("sklearn")
-    assert sklearn_available()
+# --------------------------------------------------------------- numpy required
+def test_challenger_fit_predict_and_persist() -> None:
+    pytest.importorskip("numpy")
+    assert numpy_available() and sklearn_available()  # deprecated alias
     rows, labels = _synthetic_rows(2000)
-    ch = SklearnChallenger()
+    ch = GBMChallenger()
     ch.fit(rows, labels, [1.0] * len(rows))
-    assert ch.trained and ch._trees is not None
-    import numpy as np
-
-    sk = ch._estimator.predict_proba(np.asarray([ch._snap(r) for r in rows[:200]]))[:, 1]
-    for row, p in zip(rows[:200], sk, strict=True):
-        assert ch.predict_proba(row) == pytest.approx(min(max(p, 0.01), 0.99), abs=1e-9)
+    assert ch.trained and ch.trained_on == 2000
     test_rows, test_labels = _synthetic_rows(1000, seed=1)
     probs = ch.predict_many(test_rows)
+    assert all(0.01 <= p <= 0.99 for p in probs)
     brier = sum((p - o) ** 2 for p, o in zip(probs, test_labels, strict=True)) / len(probs)
     assert brier < 0.15  # learns the hour x LR interaction (0.09 is the noise floor)
 
+    data = ch.to_dict()
+    assert data is not None and len(json.dumps(data)) <= MAX_PERSISTED_BYTES
+    restored = GBMChallenger.from_dict(json.loads(json.dumps(data)))
+    assert restored.trained and restored.trained_on == 2000
+    assert restored.predict_many(test_rows[:200]) == probs[:200]
+    # Unusable payloads give an untrained challenger (retrained later), never an error.
+    for bad in (None, {}, {"model": {"garbage": 1}}, {"constant": "x"}, [1, 2]):
+        assert not GBMChallenger.from_dict(bad).trained
+    assert GBMChallenger().to_dict() is None
+
+
+def test_challenger_single_class_is_constant() -> None:
+    pytest.importorskip("numpy")
+    rows, _ = _synthetic_rows(50)
+    ch = GBMChallenger()
+    ch.fit(rows, [1] * 50)
+    assert ch.predict_proba(rows[0]) == 0.99
+    restored = GBMChallenger.from_dict(json.loads(json.dumps(ch.to_dict())))
+    assert restored.predict_proba(rows[3]) == 0.99
+
 
 def test_training_5000_rows_under_two_seconds() -> None:
-    pytest.importorskip("sklearn")
+    pytest.importorskip("numpy")
     rows, labels = _synthetic_rows(5000)
-    ch = SklearnChallenger()
+    ch = GBMChallenger()
     started = time.perf_counter()
     ch.fit(rows, labels, [0.5 ** (i / 1000) for i in range(len(rows))])  # recency-like
     assert time.perf_counter() - started < 2.0
@@ -140,7 +157,7 @@ def test_training_5000_rows_under_two_seconds() -> None:
 
 @pytest.fixture(scope="module")
 def shift_model() -> tuple[KernelBayesReturnModel, object]:
-    pytest.importorskip("sklearn")
+    pytest.importorskip("numpy")
     tl = rotating_shift_person(days=35, seed=5)
     model = KernelBayesReturnModel(CONFIG)
     model.enable_challenger(True)
@@ -157,7 +174,7 @@ def test_model_train_challenger(shift_model) -> None:  # type: ignore[no-untyped
     summary = model.train_challenger(now)
     assert summary["trained"] and summary["reason"] == "ok"
     assert summary["rows"] >= 400 and summary["seconds"] < 5
-    assert set(summary["brier"]) == {KERNEL_BAYES, LEARNED_FUSION, SKLEARN_GBM}
+    assert set(summary["brier"]) == {KERNEL_BAYES, LEARNED_FUSION, GBM}
     assert all(0 <= v < 0.25 for v in summary["brier"].values())
     assert summary["active_model"] in (KERNEL_BAYES, LEARNED_FUSION)  # 1 evaluation only
     assert not model.challenger_due(now + timedelta(hours=1))
@@ -202,41 +219,55 @@ def test_stale_challenger_result_is_discarded(shift_model) -> None:  # type: ign
     assert KernelBayesReturnModel.from_dict(data, CONFIG).generation == 0
 
 
-def test_promoted_sklearn_serves_and_falls_back_after_restart(shift_model) -> None:  # type: ignore[no-untyped-def]
+def test_promoted_gbm_serves_and_survives_restart(shift_model) -> None:  # type: ignore[no-untyped-def]
     model, tl = shift_model
     now = tl.absences[-1].returned_at
     model = KernelBayesReturnModel.from_dict(json.loads(json.dumps(model.to_dict())), CONFIG)
     model.enable_challenger(True)
     model.train_challenger(now)
     # Force the promotion (synthetic data rarely lets the GBM win by 3 % twice).
-    model.selector.champion = SKLEARN_GBM
-    model.selector.brier = {KERNEL_BAYES: 0.05, LEARNED_FUSION: 0.04, SKLEARN_GBM: 0.03}
+    model.selector.champion = GBM
+    model.selector.brier = {KERNEL_BAYES: 0.05, LEARNED_FUSION: 0.04, GBM: 0.03}
     day = DEFAULT_START + timedelta(days=36)
     inp = away_input(day, 400, 600)
     pred = model.predict(inp)
-    assert pred.reason["active_model"] == SKLEARN_GBM and pred.reason["fusion"] == "sklearn"
+    assert pred.reason["active_model"] == GBM and pred.reason["fusion"] == "gbm"
     assert 0.01 <= pred.probability <= 0.99
     report = model.maturity(local(day, 600))
-    assert report.active_model == SKLEARN_GBM and report.fusion == "sklearn"
+    assert report.active_model == GBM and report.fusion == "gbm"
 
     payload = json.dumps(model.to_dict())
-    assert "sklearn_gbm" in payload and "estimator" not in payload
+    assert '"gbm"' in payload and "sklearn" not in payload
     restored = KernelBayesReturnModel.from_dict(json.loads(payload), CONFIG)
     assert json.dumps(restored.to_dict()) == payload
-    assert restored.selector.champion == SKLEARN_GBM
-    # Not retrained yet: next-best candidate (lower last Brier) serves meanwhile.
+    assert restored.selector.champion == GBM
+    # The exported trees are persisted: the champion serves at once after a restart
+    # (and is still retrained on the next due check).
+    again = restored.predict(inp)
+    assert again.reason["active_model"] == GBM and again.probability == pred.probability
+    assert restored.maturity(local(day, 600)).active_model == GBM
+    assert restored.challenger_due(local(day, 600))
+
+    # State without the persisted trees (written by the scikit-learn release, which
+    # also named the candidate "sklearn_gbm"): the next-best candidate serves until
+    # the challenger is retrained.
+    legacy = json.loads(payload.replace('"gbm"', '"sklearn_gbm"'))
+    legacy.pop("challenger")
+    restored = KernelBayesReturnModel.from_dict(legacy, CONFIG)
+    assert restored.selector.champion == GBM
+    assert set(restored.selector.brier) == {KERNEL_BAYES, LEARNED_FUSION, GBM}
     fallback = restored.predict(inp)
     assert fallback.reason["active_model"] == LEARNED_FUSION
     assert restored.maturity(local(day, 600)).active_model == LEARNED_FUSION
     assert restored.challenger_due(local(day, 600))
     restored.train_challenger(local(day, 600))
     assert restored.predict(inp).reason["active_model"] in (
-        SKLEARN_GBM,
+        GBM,
         KERNEL_BAYES,
         LEARNED_FUSION,
     )
     restored.enable_challenger(False)
-    assert restored.predict(inp).reason["active_model"] != SKLEARN_GBM
+    assert restored.predict(inp).reason["active_model"] != GBM
     assert not math.isnan(restored.predict(inp).probability)
 
 

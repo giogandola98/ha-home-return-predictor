@@ -3,7 +3,7 @@
 Candidates:
   * ``kernel_bayes``   - kernel survival prior x calibrated GPS LR (reference model)
   * ``learned_fusion`` - the prior-centred logistic stacker
-  * ``sklearn_gbm``    - optional HistGradientBoosting challenger
+  * ``gbm``            - optional gradient-boosting challenger (numpy, ``gbm.py``)
 
 Each evaluation scores every available candidate on the same holdout (the last
 20 % of resolved entries, recency-weighted Brier; the trainable candidates are fit
@@ -11,7 +11,7 @@ on the first 80 %). Rules:
 
   * a candidate replaces the current champion only after beating the champion's
     Brier by its margin on ``wins`` consecutive evaluations, with at least
-    ``min_entries`` resolved entries (sklearn: 3 %, 2 evaluations, 400 entries;
+    ``min_entries`` resolved entries (gbm: 3 %, 2 evaluations, 400 entries;
     learned fusion keeps its historical rule: 1 %, 1 evaluation, 300 entries);
   * a non-reference champion is demoted to ``kernel_bayes`` immediately when it
     falls behind ``kernel_bayes`` on an evaluation (or is not scored at all).
@@ -29,12 +29,14 @@ from .prior import DAY_MINUTES, recency_weight
 
 KERNEL_BAYES = "kernel_bayes"
 LEARNED_FUSION = "learned_fusion"
-SKLEARN_GBM = "sklearn_gbm"
-CANDIDATES: tuple[str, ...] = (KERNEL_BAYES, LEARNED_FUSION, SKLEARN_GBM)
+GBM = "gbm"
+CANDIDATES: tuple[str, ...] = (KERNEL_BAYES, LEARNED_FUSION, GBM)
+# Names written by earlier releases (the challenger used scikit-learn).
+LEGACY_CANDIDATES: dict[str, str] = {"sklearn_gbm": GBM}
 FUSION_ALIAS: dict[str, str] = {
     KERNEL_BAYES: "bayes",
     LEARNED_FUSION: "learned",
-    SKLEARN_GBM: "sklearn",
+    GBM: "gbm",
 }
 HOLDOUT_FRACTION = 0.2
 
@@ -50,7 +52,7 @@ class PromotionRule:
 
 RULES: dict[str, PromotionRule] = {
     LEARNED_FUSION: PromotionRule(min_entries=300, margin=0.01, wins=1),
-    SKLEARN_GBM: PromotionRule(min_entries=400, margin=0.03, wins=2),
+    GBM: PromotionRule(min_entries=400, margin=0.03, wins=2),
 }
 
 
@@ -74,6 +76,11 @@ def weighted_brier(
         num += w * (p - float(o)) ** 2
         den += w
     return num / den if den > 0 else None
+
+
+def canonical_candidate(name: Any) -> Any:
+    """Map a stored candidate name to the current one (``sklearn_gbm`` -> ``gbm``)."""
+    return LEGACY_CANDIDATES.get(name, name) if isinstance(name, str) else name
 
 
 class Selector:
@@ -132,13 +139,17 @@ class Selector:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Selector:
         sel = cls()
-        champ = data.get("champion")
+        champ = canonical_candidate(data.get("champion"))
         sel.champion = champ if champ in CANDIDATES else KERNEL_BAYES
-        sel.streak = {c: int(v) for c, v in (data.get("streak") or {}).items() if c in CANDIDATES}
+        sel.streak = {
+            canonical_candidate(c): int(v)
+            for c, v in (data.get("streak") or {}).items()
+            if canonical_candidate(c) in CANDIDATES
+        }
         sel.brier = {
-            c: (None if v is None else float(v))
+            canonical_candidate(c): (None if v is None else float(v))
             for c, v in (data.get("brier") or {}).items()
-            if c in CANDIDATES
+            if canonical_candidate(c) in CANDIDATES
         }
         sel.evaluations = int(data.get("evaluations", 0))
         return sel

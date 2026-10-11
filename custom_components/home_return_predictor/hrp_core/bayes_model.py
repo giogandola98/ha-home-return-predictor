@@ -20,10 +20,10 @@ from .base import (
 )
 from .challenger import (
     N_CHALLENGER_FEATURES,
-    SklearnChallenger,
+    GBMChallenger,
     bayes_from_challenger_features,
     build_challenger_features,
-    sklearn_available,
+    numpy_available,
 )
 from .episodes import (
     KIND_EPISODE,
@@ -49,10 +49,10 @@ from .maturity import (
 from .prior import EpisodeKey, duration_baseline, episode_keys, estimate_prior, is_rest_day
 from .selection import (
     FUSION_ALIAS,
+    GBM,
     KERNEL_BAYES,
     LEARNED_FUSION,
     RULES,
-    SKLEARN_GBM,
     Selector,
     chronological_split,
     recency_weights,
@@ -129,9 +129,10 @@ class KernelBayesReturnModel(ReturnModel):
         self._segments = CalibrationSegments()
         self._since_refit = 0
         self.selector = Selector()
-        # Challenger: only the enable flag and the selection state are persisted.
+        # Challenger: the enable flag, the selection state and the exported trees
+        # (when small enough) are persisted.
         self._challenger_enabled = False
-        self._challenger = SklearnChallenger()
+        self._challenger = GBMChallenger()
         self._last_training: datetime | None = None
         self._resolved_total = 0  # resolved entries seen in this process
         self._resolved_at_training = 0
@@ -320,7 +321,7 @@ class KernelBayesReturnModel(ReturnModel):
         if active == LEARNED_FUSION:
             features = self._features(now, prior.probability, lr, minutes_away, ev.distance_m)
             probability = self.stacker.predict(features)
-        elif active == SKLEARN_GBM:
+        elif active == GBM:
             row = self._challenger_row(
                 now,
                 left_at,
@@ -428,10 +429,10 @@ class KernelBayesReturnModel(ReturnModel):
     def _serving_model(self) -> str:
         """Champion, or the next-best candidate while the champion cannot serve."""
         champ = self.selector.champion
-        if champ != SKLEARN_GBM:
+        if champ != GBM:
             return champ
         if self._challenger_enabled and self._challenger.trained:
-            return SKLEARN_GBM
+            return GBM
         brier = self.selector.brier
         learned, bayes = brier.get(LEARNED_FUSION), brier.get(KERNEL_BAYES)
         if learned is not None and bayes is not None and learned < bayes:
@@ -553,23 +554,23 @@ class KernelBayesReturnModel(ReturnModel):
         """True when train_challenger (not the stacker refit) drives selection."""
         return (
             self._challenger_enabled
-            and sklearn_available()
-            and len(self._challenger_rows()) >= RULES[SKLEARN_GBM].min_entries
+            and numpy_available()
+            and len(self._challenger_rows()) >= RULES[GBM].min_entries
         )
 
     def enable_challenger(self, enabled: bool) -> None:
-        """Switch the optional scikit-learn challenger on or off."""
+        """Switch the optional gradient-boosting challenger on or off."""
         self._challenger_enabled = bool(enabled)
         if not enabled:
-            self._challenger = SklearnChallenger()
+            self._challenger = GBMChallenger()
             self._last_training = None
 
     def challenger_due(self, now: datetime) -> bool:
         """True when ``train_challenger`` should run (cheap; call from the event loop)."""
-        if not self._challenger_enabled or not sklearn_available():
+        if not self._challenger_enabled or not numpy_available():
             return False
         if self._last_training is None:
-            return len(self._challenger_rows()) >= RULES[SKLEARN_GBM].min_entries
+            return len(self._challenger_rows()) >= RULES[GBM].min_entries
         elapsed_h = minutes_between(self._last_training, to_utc(now)) / 60.0
         new = self._resolved_total - self._resolved_at_training
         return elapsed_h >= CHALLENGER_RETRAIN_HOURS or new >= CHALLENGER_RETRAIN_ENTRIES
@@ -619,9 +620,9 @@ class KernelBayesReturnModel(ReturnModel):
 
         if not snapshot["enabled"]:
             return done("disabled")
-        if not sklearn_available():
-            return done("sklearn_unavailable")
-        if n < RULES[SKLEARN_GBM].min_entries:
+        if not numpy_available():
+            return done("numpy_unavailable")
+        if n < RULES[GBM].min_entries:
             return done("insufficient_data")
 
         hl = snapshot["half_life_days"]
@@ -634,7 +635,7 @@ class KernelBayesReturnModel(ReturnModel):
         y_hold = [ys[i] for i in idx_hold]
 
         weights = fit_weights([fs[i] for i in idx_train], y_train, w_train)
-        candidate = SklearnChallenger()
+        candidate = GBMChallenger()
         candidate.fit([xs[i] for i in idx_train], y_train, w_train)
         result["brier"] = {
             KERNEL_BAYES: weighted_brier(
@@ -643,12 +644,10 @@ class KernelBayesReturnModel(ReturnModel):
             LEARNED_FUSION: weighted_brier(
                 [apply_weights(weights, fs[i]) for i in idx_hold], y_hold, w_hold
             ),
-            SKLEARN_GBM: weighted_brier(
-                candidate.predict_many([xs[i] for i in idx_hold]), y_hold, w_hold
-            ),
+            GBM: weighted_brier(candidate.predict_many([xs[i] for i in idx_hold]), y_hold, w_hold),
         }
         result["weights"] = weights
-        serving = SklearnChallenger()
+        serving = GBMChallenger()
         serving.fit(xs, ys, w_all)
         result["challenger"] = serving
         return done("ok")
@@ -674,7 +673,7 @@ class KernelBayesReturnModel(ReturnModel):
             return summary(False, "stale")
         if status == "ok" and not self._challenger_enabled:
             status = "disabled"  # switched off while training ran
-        if status in ("disabled", "sklearn_unavailable"):
+        if status in ("disabled", "numpy_unavailable"):
             return summary(False, status)
         self._last_training = to_utc(now)
         self._resolved_at_training = int(result["resolved_total"])
@@ -748,6 +747,7 @@ class KernelBayesReturnModel(ReturnModel):
             "since_refit": self._since_refit,
             "selection": self.selector.to_dict(),
             "challenger_enabled": self._challenger_enabled,
+            "challenger": self._challenger.to_dict(),
             "generation": self._generation,
         }
 
@@ -772,5 +772,7 @@ class KernelBayesReturnModel(ReturnModel):
         elif model.stacker.active:  # state written before the generic selection existed
             model.selector.champion = LEARNED_FUSION
         model._challenger_enabled = bool(data.get("challenger_enabled", False))
+        if model._challenger_enabled:
+            model._challenger = GBMChallenger.from_dict(data.get("challenger"))
         model._generation = int(data.get("generation", 0))
         return model

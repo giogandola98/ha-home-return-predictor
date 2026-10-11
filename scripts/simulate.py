@@ -4,7 +4,7 @@
 Standalone: needs no Home Assistant. Usage::
 
     python scripts/simulate.py --days 120 --seed 1
-    python scripts/simulate.py --sklearn   # also train the scikit-learn challenger
+    python scripts/simulate.py --gbm   # also train the gradient-boosting challenger
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ sys.path.insert(
     0, str(Path(__file__).resolve().parents[1] / "custom_components" / "home_return_predictor")
 )
 
-from hrp_core import KernelBayesReturnModel, ModelConfig, sklearn_available  # noqa: E402
+from hrp_core import KernelBayesReturnModel, ModelConfig, numpy_available  # noqa: E402
 from hrp_core.synthetic import (  # noqa: E402
     DEFAULT_TZ,
     Timeline,
@@ -38,18 +38,18 @@ def simulate(
     timeline: Timeline,
     config: ModelConfig,
     step: float,
-    use_sklearn: bool = False,
+    use_gbm: bool = False,
     stats: dict[str, float] | None = None,
 ) -> list[dict[str, object]]:
     """Replay one person online; return one summary row per local day."""
     model = KernelBayesReturnModel(config)
-    model.enable_challenger(use_sklearn)
+    model.enable_challenger(use_gbm)
     per_day: dict[date, list[tuple[float, bool]]] = defaultdict(list)
     reports: dict[date, tuple[float, int, str]] = {}
     stats = stats if stats is not None else {}
 
     def maybe_train(ts: datetime) -> None:
-        if use_sklearn and model.challenger_due(ts):
+        if use_gbm and model.challenger_due(ts):
             summary = model.train_challenger(ts)
             if summary["trained"]:
                 stats["trainings"] = stats.get("trainings", 0) + 1
@@ -80,7 +80,9 @@ def simulate(
             (rec.prediction.probability, rec.truth)
         )
 
-    stats["state_bytes"] = len(json.dumps(model.to_dict()))
+    state = model.to_dict()
+    stats["state_bytes"] = len(json.dumps(state))
+    stats["challenger_bytes"] = len(json.dumps(state.get("challenger"))) if use_gbm else 0
     rows: list[dict[str, object]] = []
     history: list[list[tuple[float, bool]]] = []
     last = (0.0, 0, "kernel_bayes")
@@ -111,11 +113,15 @@ def main() -> None:
     parser.add_argument("--step", type=float, default=5.0, help="minutes between predictions")
     parser.add_argument("--quiet", action="store_true", help="only print the summary")
     parser.add_argument(
-        "--sklearn", action="store_true", help="train the scikit-learn challenger when due"
+        "--gbm",
+        "--sklearn",  # deprecated alias (the challenger used scikit-learn)
+        dest="gbm",
+        action="store_true",
+        help="train the gradient-boosting challenger (numpy) when due",
     )
     args = parser.parse_args()
-    if args.sklearn and not sklearn_available():
-        parser.error("--sklearn needs scikit-learn installed")
+    if args.gbm and not numpy_available():
+        parser.error("--gbm needs numpy installed")
 
     config = ModelConfig(timezone=DEFAULT_TZ)
     people = [
@@ -124,9 +130,7 @@ def main() -> None:
     ]
     started = time.perf_counter()
     stats: dict[str, dict[str, float]] = {tl.name: {} for tl in people}
-    results = {
-        tl.name: simulate(tl, config, args.step, args.sklearn, stats[tl.name]) for tl in people
-    }
+    results = {tl.name: simulate(tl, config, args.step, args.gbm, stats[tl.name]) for tl in people}
 
     if not args.quiet:
         print(
@@ -154,13 +158,15 @@ def main() -> None:
                 f"{name:<6} {day:>4} {acc:>7.3f} {r['brier']:>7.3f} {r['maturity']:>8.3f} "
                 f"{r['active']}"
             )
-    if args.sklearn:
+    if args.gbm:
         for name, st in stats.items():
             n = int(st.get("trainings", 0))
             mean = st.get("train_seconds", 0.0) / n if n else 0.0
             print(
-                f"{name}: {n} challenger trainings, mean {mean:.2f} s, "
-                f"max {st.get('max_train_seconds', 0.0):.2f} s"
+                f"{name}: {n} challenger trainings, mean {mean:.3f} s, "
+                f"max {st.get('max_train_seconds', 0.0):.3f} s, "
+                f"total {st.get('train_seconds', 0.0):.1f} s; "
+                f"persisted challenger {st.get('challenger_bytes', 0) / 1000:.0f} KB"
             )
     for name, st in stats.items():
         print(f"{name}: persisted state {st['state_bytes'] / 1000:.0f} KB (to_dict JSON)")

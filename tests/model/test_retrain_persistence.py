@@ -134,7 +134,7 @@ def test_stacker_serves_the_evaluated_weights() -> None:
 
 
 def test_challenger_installs_the_evaluated_fusion_weights() -> None:
-    pytest.importorskip("sklearn")
+    pytest.importorskip("numpy")
     tl = rotating_shift_person(days=35, seed=5)
     model = KernelBayesReturnModel(CONFIG)
     model.enable_challenger(True)
@@ -186,13 +186,13 @@ def test_observe_transition_defers_refit_to_resolve(monkeypatch: pytest.MonkeyPa
         raise AssertionError("heavy work inside observe_transition")
 
     monkeypatch.setattr(Stacker, "fit", boom)
-    monkeypatch.setattr(bayes_module, "sklearn_available", boom)
+    monkeypatch.setattr(bayes_module, "numpy_available", boom)
     ep = model.observe_transition(PresenceTransition(local(day, 705), True))
     assert ep is not None and model._since_refit > STACKER_REFIT_EVERY
 
     calls: list[int] = []
     monkeypatch.setattr(Stacker, "fit", lambda self, *a, **k: calls.append(1))
-    monkeypatch.setattr(bayes_module, "sklearn_available", lambda: False)
+    monkeypatch.setattr(bayes_module, "numpy_available", lambda: False)
     model.resolve(local(day, 706), True)
     assert calls == [1] and model._since_refit == 0
     assert model.selector.champion == KERNEL_BAYES
@@ -239,7 +239,7 @@ def test_encode_keeps_unusual_rows_verbatim() -> None:
 
 # --------------------------------------------------------------------------- M5
 def test_split_training_matches_wrapper_and_fit_touches_no_model() -> None:
-    pytest.importorskip("sklearn")
+    pytest.importorskip("numpy")
     tl = rotating_shift_person(days=35, seed=5)
     model = KernelBayesReturnModel(CONFIG)
     model.enable_challenger(True)

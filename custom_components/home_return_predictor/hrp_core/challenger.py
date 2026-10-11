@@ -1,23 +1,24 @@
-"""Optional scikit-learn challenger (HistGradientBoostingClassifier).
+"""Optional gradient-boosting challenger (in-house numpy GBM, see ``gbm.py``).
 
-The module is importable without scikit-learn: sklearn / numpy / threadpoolctl are
-imported lazily inside the functions that need them. The fitted estimator is never
-pickled or persisted; it is retrained from the persisted prediction log on demand.
+Training needs numpy (``HistGBM.fit``); serving does not: the fitted trees are
+exported to a plain-Python dict and evaluated with ``HistGBM.predict_proba_exported``
+(~0.1 ms per row, thread-free). The exported model is JSON-safe and small, so it is
+persisted with the person's state (``to_dict``) and a promoted challenger keeps
+serving after a restart without waiting for a retraining.
 
-After fitting, the trees are compiled into plain Python tuples so that
-``predict_proba`` of a single row is fast (~0.1 ms), thread-free and does not
-touch numpy; if the private tree layout of the installed sklearn is not
-recognised, prediction falls back to the estimator's own ``predict_proba``.
+scikit-learn is no longer used: it publishes no musllinux wheels, so it cannot be
+installed on Home Assistant OS (Alpine).
 """
 
 from __future__ import annotations
 
-import bisect
+import json
 import math
 from collections.abc import Sequence
 from typing import Any
 
 from .fusion import P_MAX, P_MIN, PRIOR_CLAMP, clamp, logit, sigmoid
+from .gbm import HistGBM, numpy_available
 
 CHALLENGER_FEATURES: tuple[str, ...] = (
     "z_prior",
@@ -35,36 +36,20 @@ CHALLENGER_FEATURES: tuple[str, ...] = (
 )
 N_CHALLENGER_FEATURES = len(CHALLENGER_FEATURES)
 MAX_AWAY_HORIZONS = 16.0
-MAX_ITER = 100
-MAX_LEAF_NODES = 15
+MAX_ITER = 80
+MAX_DEPTH = 3
+MIN_SAMPLES_LEAF = 20
 LEARNING_RATE = 0.1
 L2_REGULARIZATION = 1.0
-# Features are snapped to <= MAX_DISTINCT unweighted-quantile edges before fitting:
-# HistGradientBoosting then needs no weighted percentiles to bin them (with sample
-# weights those cost ~0.3 ms per call and made a 3000-row fit take ~1 s instead of
-# ~0.15 s). The same snapping is applied at prediction time.
-MAX_DISTINCT = 255
-
-# Compiled tree node: (feature, threshold, left, right, is_leaf, value)
-_Node = tuple[int, float, int, int, bool, float]
-
-
-_AVAILABLE = False  # only a positive result is cached (sklearn may be installed later)
+MAX_BINS = 64
+# The exported model is persisted only below this JSON size (80 depth-3 trees are
+# far smaller); a larger one is kept in memory and retrained after a restart.
+MAX_PERSISTED_BYTES = 150_000
 
 
 def sklearn_available() -> bool:
-    """True if scikit-learn (with numpy and threadpoolctl) can be imported."""
-    global _AVAILABLE
-    if _AVAILABLE:
-        return True
-    try:
-        import numpy  # noqa: F401
-        import sklearn.ensemble  # noqa: F401
-        import threadpoolctl  # noqa: F401
-    except Exception:  # ImportError, or a broken binary install
-        return False
-    _AVAILABLE = True
-    return True
+    """Deprecated alias of ``numpy_available`` (kept for one release)."""
+    return numpy_available()
 
 
 def _hour_angle(hour: float) -> float:
@@ -109,19 +94,21 @@ def bayes_from_challenger_features(row: Sequence[float]) -> float:
     return clamp(sigmoid(row[-1]), P_MIN, P_MAX)
 
 
-class SklearnChallenger:
-    """Gradient-boosted trees on the prediction-log features (not persisted)."""
+class GBMChallenger:
+    """Gradient-boosted trees on the prediction-log features.
+
+    The fitted model is held as the plain-Python export of ``HistGBM`` (or as a
+    constant log-odds when the training log has a single class).
+    """
 
     def __init__(self) -> None:
-        self._estimator: Any = None
-        self._trees: list[list[_Node]] | None = None
-        self._baseline = 0.0
-        self._grids: list[list[float] | None] = []
+        self._model: dict[str, Any] | None = None
+        self._constant: float | None = None
         self.trained_on = 0
 
     @property
     def trained(self) -> bool:
-        return self._estimator is not None or self._trees is not None
+        return self._model is not None or self._constant is not None
 
     def fit(
         self,
@@ -129,106 +116,69 @@ class SklearnChallenger:
         labels: Sequence[int],
         weights: Sequence[float] | None = None,
     ) -> None:
-        """Fit single-threaded. Raises RuntimeError if sklearn is missing."""
-        if not sklearn_available():
-            raise RuntimeError("scikit-learn is not available")
-        import numpy as np
-        from sklearn.ensemble import HistGradientBoostingClassifier
-        from threadpoolctl import threadpool_limits
-
-        x = np.asarray(rows, dtype=float)
-        y = np.asarray(labels, dtype=int)
-        self._grids = []
-        for j in range(x.shape[1] if x.ndim == 2 else 0):
-            col = x[:, j]
-            if len(np.unique(col)) <= MAX_DISTINCT:
-                self._grids.append(None)
-                continue
-            edges = np.unique(np.quantile(col, np.linspace(0.0, 1.0, MAX_DISTINCT)))
-            self._grids.append([float(e) for e in edges])
-            idx = np.minimum(np.searchsorted(edges, col, side="left"), len(edges) - 1)
-            x[:, j] = edges[idx]
-        if len(set(y.tolist())) < 2:
-            # Degenerate log (all returns or none): a constant predictor.
-            rate = float(np.clip(y.mean() if len(y) else 0.5, P_MIN, P_MAX))
-            self._estimator, self._trees = None, []
-            self._baseline = logit(rate)
-            self.trained_on = len(y)
-            return
-        sw = None if weights is None else np.asarray(weights, dtype=float)
-        est = HistGradientBoostingClassifier(
-            max_iter=MAX_ITER,
-            max_leaf_nodes=MAX_LEAF_NODES,
-            learning_rate=LEARNING_RATE,
-            l2_regularization=L2_REGULARIZATION,
-            early_stopping=False,
-            random_state=0,
-        )
-        with threadpool_limits(limits=1):
-            est.fit(x, y, sample_weight=sw)
-        self._estimator = est
-        self._trees, self._baseline = self._compile(est)
+        """Fit (numpy, single thread). Raises RuntimeError if numpy is missing."""
+        if not numpy_available():
+            raise RuntimeError("numpy is not available")
+        y = [int(v) for v in labels]
         self.trained_on = len(y)
-
-    @staticmethod
-    def _compile(est: Any) -> tuple[list[list[_Node]] | None, float]:
-        """Extract the trees as plain tuples (None if the layout is unknown)."""
-        try:
-            baseline = float(est._baseline_prediction.ravel()[0])
-            trees: list[list[_Node]] = []
-            for (predictor,) in est._predictors:
-                nodes = predictor.nodes
-                if bool(nodes["is_categorical"].any()):
-                    return None, 0.0
-                trees.append(
-                    [
-                        (
-                            int(n["feature_idx"]),
-                            float(n["num_threshold"]),
-                            int(n["left"]),
-                            int(n["right"]),
-                            bool(n["is_leaf"]),
-                            float(n["value"]),
-                        )
-                        for n in nodes
-                    ]
-                )
-        except Exception:
-            return None, 0.0
-        return trees, baseline
-
-    def _snap(self, row: Sequence[float]) -> list[float]:
-        out = list(row)
-        for j, grid in enumerate(self._grids):
-            if grid is not None:
-                out[j] = grid[min(bisect.bisect_left(grid, out[j]), len(grid) - 1)]
-        return out
-
-    def predict_raw(self, row: Sequence[float]) -> float:
-        """Decision function (log-odds) of one row from the compiled trees."""
-        assert self._trees is not None
-        row = self._snap(row)
-        z = self._baseline
-        for tree in self._trees:
-            i = 0
-            node = tree[0]
-            while not node[4]:
-                i = node[2] if row[node[0]] <= node[1] else node[3]
-                node = tree[i]
-            z += node[5]
-        return z
+        if len(set(y)) < 2:
+            # Degenerate log (all returns or none): a constant predictor.
+            rate = sum(y) / len(y) if y else 0.5
+            self._model, self._constant = None, logit(clamp(rate, P_MIN, P_MAX))
+            return
+        gbm = HistGBM(
+            max_iter=MAX_ITER,
+            learning_rate=LEARNING_RATE,
+            max_depth=MAX_DEPTH,
+            min_samples_leaf=MIN_SAMPLES_LEAF,
+            l2_regularization=L2_REGULARIZATION,
+            max_bins=MAX_BINS,
+        )
+        gbm.fit(rows, y, sample_weight=None if weights is None else list(weights))
+        self._model, self._constant = gbm.export(), None
 
     def predict_proba(self, row: Sequence[float]) -> float:
         """P(return within horizon) for one feature row, clamped to [0.01, 0.99]."""
-        if self._trees is not None:
-            return clamp(sigmoid(self.predict_raw(row)), P_MIN, P_MAX)
-        if self._estimator is None:
-            raise RuntimeError("challenger not trained")
-        import numpy as np
-
-        snapped = np.asarray([self._snap(row)], dtype=float)
-        p = float(self._estimator.predict_proba(snapped)[0, 1])
-        return clamp(p, P_MIN, P_MAX)
+        if self._model is not None:
+            return clamp(HistGBM.predict_proba_exported(self._model, row), P_MIN, P_MAX)
+        if self._constant is not None:
+            return clamp(sigmoid(self._constant), P_MIN, P_MAX)
+        raise RuntimeError("challenger not trained")
 
     def predict_many(self, rows: Sequence[Sequence[float]]) -> list[float]:
         return [self.predict_proba(r) for r in rows]
+
+    # -------------------------------------------------------------- persistence
+    def to_dict(self) -> dict[str, Any] | None:
+        """JSON-safe state, or None when untrained or too large to persist."""
+        if not self.trained:
+            return None
+        data: dict[str, Any] = {"trained_on": self.trained_on}
+        if self._model is not None:
+            data["model"] = self._model
+        else:
+            data["constant"] = self._constant
+        if len(json.dumps(data)) > MAX_PERSISTED_BYTES:
+            return None
+        return data
+
+    @classmethod
+    def from_dict(cls, data: Any) -> GBMChallenger:
+        """Restore a persisted challenger; anything unusable yields an untrained one."""
+        ch = cls()
+        if not isinstance(data, dict):
+            return ch
+        try:
+            if isinstance(data.get("model"), dict):
+                ch._model = data["model"]
+            elif data.get("constant") is not None:
+                ch._constant = float(data["constant"])
+            else:
+                return cls()
+            ch.trained_on = int(data.get("trained_on", 0))
+            p = ch.predict_proba([0.0] * N_CHALLENGER_FEATURES)  # validate the layout
+            if not math.isfinite(p):
+                return cls()
+        except Exception:  # corrupted / incompatible export: retrain instead
+            return cls()
+        return ch
