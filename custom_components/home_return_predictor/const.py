@@ -28,6 +28,8 @@ DEFAULT_HALF_LIFE_DAYS: Final = 28
 DEFAULT_UPDATE_INTERVAL_MINUTES: Final = 2
 DEFAULT_ENABLE_SKLEARN: Final = False
 MATURITY_HYSTERESIS: Final = 0.1
+RETURNING_OFF_HYSTERESIS: Final = 0.05  # returning stays on until p < threshold - this
+HOUSE_ETA_MIN_PROBABILITY: Final = 0.25  # away persons considered for the house ETA
 
 # Optional scikit-learn challenger (installed at runtime only when enabled)
 SKLEARN_REQUIREMENT: Final = "scikit-learn>=1.5"
@@ -65,9 +67,11 @@ HOUSE_DEVICE_SLUG: Final = "house"
 
 # Recorder bootstrap
 HISTORY_DAYS: Final = 120
+HISTORY_CHUNK_DAYS: Final = 7  # recorder query window (bounds memory)
+HISTORY_FIX_MIN_INTERVAL_S: Final = 60  # history fixes downsampled to 1 per minute
 
 # Runtime tuning
-SAVE_DELAY_SECONDS: Final = 60
+SAVE_DELAY_SECONDS: Final = 600  # coalesce saves; final write on unload / HA stop
 FIX_WINDOW_MINUTES: Final = 30
 MAX_FIX_ACCURACY_M: Final = 250.0
 DIAGNOSTICS_LOG_ENTRIES: Final = 50

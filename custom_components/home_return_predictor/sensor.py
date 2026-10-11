@@ -67,7 +67,11 @@ class HRPPersonSensor(HRPPersonEntity, SensorEntity):
         result = self.result
         if result is None:
             return {}
-        return {"mode": result.effective_mode, "advisory": result.advisory}
+        return {
+            "mode": result.effective_mode,
+            "advisory": result.advisory,
+            "state_unknown": result.state_unknown,
+        }
 
 
 class ReturnProbabilitySensor(HRPPersonSensor):
@@ -82,7 +86,9 @@ class ReturnProbabilitySensor(HRPPersonSensor):
     def native_value(self) -> float | None:
         """Return the probability in percent."""
         result = self.result
-        return round(result.prediction.probability * 100, 1) if result else None
+        if result is None or result.prediction is None:
+            return None
+        return round(result.prediction.probability * 100, 1)
 
 
 class ReturnEtaSensor(HRPPersonSensor):
@@ -93,9 +99,9 @@ class ReturnEtaSensor(HRPPersonSensor):
 
     @property
     def native_value(self) -> datetime | None:
-        """Return the fused ETA."""
+        """Return the fused ETA whenever the person is away (unknown at home)."""
         result = self.result
-        if result is None or result.prediction.is_home:
+        if result is None or result.is_home is not False or result.prediction is None:
             return None
         return result.prediction.eta
 
@@ -103,9 +109,10 @@ class ReturnEtaSensor(HRPPersonSensor):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return the ETA components."""
         attrs = super().extra_state_attributes
-        if (result := self.result) is not None:
-            attrs["eta_habit"] = _iso(result.prediction.eta_habit)
-            attrs["eta_position"] = _iso(result.prediction.eta_position)
+        if (result := self.result) is not None and (pred := result.prediction) is not None:
+            attrs["eta_habit"] = _iso(pred.eta_habit)
+            attrs["eta_position"] = _iso(pred.eta_position)
+            attrs["probability"] = round(pred.probability, 3)
         return attrs
 
 
@@ -164,7 +171,7 @@ class ReturnReasonSensor(HRPPersonSensor):
         """Return the raw reason parts."""
         attrs = super().extra_state_attributes
         if (result := self.result) is not None:
-            attrs["parts"] = result.prediction.reason
+            attrs["parts"] = result.prediction.reason if result.prediction else {}
             attrs["active_model"] = result.active_model
         return attrs
 
@@ -184,7 +191,9 @@ class HouseReturnProbabilitySensor(HRPHouseEntity, SensorEntity):
     def native_value(self) -> float | None:
         """Return the house probability in percent (100 when occupied)."""
         house = self.house
-        return round(house.probability * 100, 1) if house else None
+        if house is None or house.probability is None:
+            return None
+        return round(house.probability * 100, 1)
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -193,7 +202,7 @@ class HouseReturnProbabilitySensor(HRPHouseEntity, SensorEntity):
 
 
 class HouseNextReturnEtaSensor(HRPHouseEntity, SensorEntity):
-    """Earliest ETA among returning persons."""
+    """Earliest ETA among away persons with p >= HOUSE_ETA_MIN_PROBABILITY."""
 
     _attr_device_class = SensorDeviceClass.TIMESTAMP
 
@@ -209,5 +218,8 @@ class HouseNextReturnEtaSensor(HRPHouseEntity, SensorEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return aggregate attributes."""
-        return self.house_attributes()
+        """Return aggregate attributes and whose ETA is shown."""
+        attrs = self.house_attributes()
+        if (house := self.house) is not None:
+            attrs["eta_person"] = house.eta_person
+        return attrs

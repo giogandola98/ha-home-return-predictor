@@ -103,4 +103,5 @@ class HRPHouseEntity(HRPEntity):
             "mode": house.mode,
             "advisory": house.advisory,
             "away_probability": round(house.away_probability * 100, 1),
+            "persons_unknown": house.persons_unknown,
         }

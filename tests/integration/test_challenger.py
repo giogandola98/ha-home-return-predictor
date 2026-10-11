@@ -173,11 +173,16 @@ async def test_enable_install_failure(
 async def test_training_scheduled_once_at_a_time(
     hass: HomeAssistant, setup_home: None, enable_calls: list[tuple[int, bool]]
 ) -> None:
-    """Due challengers train in the background, one at a time, never twice in parallel."""
+    """Due challengers train in the background, one fit at a time, without the person lock.
+
+    snapshot (locked) -> fit (unlocked, heavy) -> apply (locked); updates proceed
+    while a fit is in flight.
+    """
     entry = _enabled_entry(hass)
     release = threading.Event()
     guard = threading.Lock()
     trained: list[int] = []
+    applied: list[int] = []
     running = 0
     max_running = 0
 
@@ -185,7 +190,10 @@ async def test_training_scheduled_once_at_a_time(
         with guard:
             return id(self) not in trained
 
-    def _train(self: KernelBayesReturnModel, now: datetime) -> dict[str, Any]:
+    def _snapshot(self: KernelBayesReturnModel) -> dict[str, Any]:
+        return {"model": id(self)}
+
+    def _fit(snapshot: dict[str, Any], now: datetime) -> dict[str, Any]:
         nonlocal running, max_running
         with guard:
             running += 1
@@ -193,14 +201,21 @@ async def test_training_scheduled_once_at_a_time(
         release.wait(5)
         with guard:
             running -= 1
-            trained.append(id(self))
+            trained.append(snapshot["model"])
+        return {"model": snapshot["model"]}
+
+    def _apply(self: KernelBayesReturnModel, result: Any, now: datetime) -> dict[str, Any]:
+        assert result["model"] == id(self)
+        applied.append(id(self))
         return {"trained": True, "reason": "ok", "rows": 0, "seconds": 0.0, "brier": {}}
 
     with (
         patch(f"{COORD}.async_process_requirements", AsyncMock(return_value=None)),
         patch(f"{COORD}.sklearn_available", return_value=True),
         patch.object(KernelBayesReturnModel, "challenger_due", _due),
-        patch.object(KernelBayesReturnModel, "train_challenger", _train),
+        patch.object(KernelBayesReturnModel, "challenger_snapshot", _snapshot),
+        patch.object(KernelBayesReturnModel, "fit_challenger", staticmethod(_fit)),
+        patch.object(KernelBayesReturnModel, "apply_challenger", _apply),
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done()
@@ -211,14 +226,16 @@ async def test_training_scheduled_once_at_a_time(
             await asyncio.sleep(0.01)
         assert running == 1
         assert coordinator.training_persons == {ALICE, BOB}
-        # Another update while training: nothing new is scheduled.
-        refresh = hass.async_create_task(coordinator.async_refresh())
-        await asyncio.sleep(0.05)
+        # The fit runs without the person locks: an update completes meanwhile and
+        # schedules nothing new.
+        assert not any(rt.lock.locked() for rt in coordinator.persons.values())
+        await asyncio.wait_for(coordinator.async_refresh(), 5)
+        assert coordinator.last_update_success
         assert running == 1 and not trained
         release.set()
-        await refresh
         await hass.async_block_till_done(wait_background_tasks=True)
     models = {id(rt.model) for rt in coordinator.persons.values()}
     assert sorted(trained) == sorted(models)  # each person exactly once
+    assert sorted(applied) == sorted(models)
     assert max_running == 1
     assert coordinator.training_persons == set()

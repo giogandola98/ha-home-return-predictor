@@ -5,7 +5,8 @@ Home detection rule (shared by live tracking and history bootstrap):
 * home zone ``zone.home``: the person is home when its state is ``home``;
 * any other zone: the person is home when its state equals the zone friendly
   name (that is how ``person`` reports non-home zones) or when its own
-  coordinates are inside the zone radius.
+  coordinates are inside the zone radius; a fix less accurate than
+  ``MAX_FIX_ACCURACY_M`` gives no information.
 
 ``unknown`` / ``unavailable`` states give ``None`` (no information).
 """
@@ -13,6 +14,7 @@ Home detection rule (shared by live tracking and history bootstrap):
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 from typing import Any
@@ -30,7 +32,12 @@ from homeassistant.core import HomeAssistant, State
 from homeassistant.exceptions import HomeAssistantError
 from homeassistant.util import dt as dt_util
 
-from .const import DEFAULT_HOME_ZONE, MAX_FIX_ACCURACY_M
+from .const import (
+    DEFAULT_HOME_ZONE,
+    HISTORY_CHUNK_DAYS,
+    HISTORY_FIX_MIN_INTERVAL_S,
+    MAX_FIX_ACCURACY_M,
+)
 from .hrp_core import haversine_m
 from .hrp_core.base import PositionFix, PresenceTransition
 
@@ -101,7 +108,7 @@ def state_is_home(state: State, zone_id: str, zone: HomeZone | None) -> bool | N
         return False
     lat, lon, acc = coords
     if acc is not None and acc > MAX_FIX_ACCURACY_M:
-        return False
+        return None  # inaccurate fix: no information either way
     return zone.distance_m(lat, lon) <= 0.0
 
 
@@ -118,21 +125,52 @@ def state_to_fix(state: State, zone: HomeZone | None) -> PositionFix | None:
     return PositionFix(ts=state.last_updated, distance_m=zone.distance_m(lat, lon), accuracy_m=acc)
 
 
+class _HistoryReducer:
+    """Incrementally reduce chronological person states to model inputs.
+
+    Keeps only presence transitions and fixes downsampled to one every
+    ``HISTORY_FIX_MIN_INTERVAL_S`` seconds, so raw state rows can be dropped
+    chunk by chunk.
+    """
+
+    def __init__(self, zone_id: str, zone: HomeZone | None) -> None:
+        self.zone_id = zone_id
+        self.zone = zone
+        self.transitions: list[PresenceTransition] = []
+        self.fixes: list[PositionFix] = []
+        self._last: bool | None = None
+        self._last_state: str | None = None
+        self._last_fix_ts: datetime | None = None
+
+    def feed(self, states: Iterable[State]) -> None:
+        min_gap = timedelta(seconds=HISTORY_FIX_MIN_INTERVAL_S)
+        for state in states:
+            is_home = state_is_home(state, self.zone_id, self.zone)
+            if is_home is not None and is_home != self._last:
+                # last_changed is exact when the state string changed; coordinate
+                # based detection (non-default zones) only moves last_updated.
+                changed = self._last_state is None or state.state != self._last_state
+                ts = state.last_changed if changed else state.last_updated
+                if self.transitions and ts < self.transitions[-1].ts:
+                    ts = self.transitions[-1].ts
+                self.transitions.append(PresenceTransition(ts=ts, is_home=is_home))
+                self._last = is_home
+            self._last_state = state.state
+            fix = state_to_fix(state, self.zone)
+            if fix is not None and (
+                self._last_fix_ts is None or fix.ts >= self._last_fix_ts + min_gap
+            ):
+                self.fixes.append(fix)
+                self._last_fix_ts = fix.ts
+
+
 def states_to_history(
     states: list[State], zone_id: str, zone: HomeZone | None
 ) -> tuple[list[PresenceTransition], list[PositionFix]]:
     """Convert a chronological list of person states into model inputs."""
-    transitions: list[PresenceTransition] = []
-    fixes: list[PositionFix] = []
-    last: bool | None = None
-    for state in states:
-        is_home = state_is_home(state, zone_id, zone)
-        if is_home is not None and is_home != last:
-            transitions.append(PresenceTransition(ts=state.last_updated, is_home=is_home))
-            last = is_home
-        if (fix := state_to_fix(state, zone)) is not None:
-            fixes.append(fix)
-    return transitions, fixes
+    reducer = _HistoryReducer(zone_id, zone)
+    reducer.feed(states)
+    return reducer.transitions, reducer.fixes
 
 
 def _fetch_states(
@@ -154,6 +192,25 @@ def _fetch_states(
     return [s for s in result.get(entity_id, []) if isinstance(s, State)]
 
 
+def _load_history_chunked(
+    hass: HomeAssistant,
+    entity_id: str,
+    zone_id: str,
+    zone: HomeZone | None,
+    start: datetime,
+    end: datetime,
+) -> tuple[list[PresenceTransition], list[PositionFix]]:
+    """Query the recorder in windows and reduce each one (recorder executor)."""
+    reducer = _HistoryReducer(zone_id, zone)
+    window = timedelta(days=HISTORY_CHUNK_DAYS)
+    chunk_start = start
+    while chunk_start < end:
+        chunk_end = min(chunk_start + window, end)
+        reducer.feed(_fetch_states(hass, entity_id, chunk_start, chunk_end))
+        chunk_start = chunk_end
+    return reducer.transitions, reducer.fixes
+
+
 async def async_load_person_history(
     hass: HomeAssistant,
     person_id: str,
@@ -173,13 +230,36 @@ async def async_load_person_history(
     end = dt_util.utcnow()
     start = end - timedelta(days=days)
     try:
-        states = await get_instance(hass).async_add_executor_job(
-            _fetch_states, hass, person_id, start, end
+        return await get_instance(hass).async_add_executor_job(
+            _load_history_chunked, hass, person_id, zone_id, zone, start, end
         )
     except (HomeAssistantError, KeyError, ValueError) as err:
         _LOGGER.warning("Could not read history for %s: %s", person_id, err)
         return [], []
-    return await hass.async_add_executor_job(states_to_history, states, zone_id, zone)
+
+
+def _event_dates(event: dict[str, Any]) -> list[date]:
+    """Every local date covered by a calendar event (end exclusive)."""
+
+    def _parse(raw: Any) -> tuple[date, bool] | None:
+        text = str(raw or "")
+        if (parsed := dt_util.parse_datetime(text)) is not None:
+            local = dt_util.as_local(parsed)
+            return local.date(), local.timetz().replace(tzinfo=None) == time.min
+        if (parsed_date := dt_util.parse_date(text)) is not None:
+            return parsed_date, True
+        return None
+
+    start = _parse(event.get("start"))
+    if start is None:
+        return []
+    first = start[0]
+    end = _parse(event.get("end"))
+    if end is None:
+        return [first]
+    last = end[0] - timedelta(days=1) if end[1] else end[0]  # midnight end is exclusive
+    last = max(last, first)
+    return [first + timedelta(days=i) for i in range((last - first).days + 1)]
 
 
 async def async_load_holidays(
@@ -206,12 +286,6 @@ async def async_load_holidays(
     tz = dt_util.get_default_time_zone()
     holidays: set[datetime] = set()
     for event in events:
-        raw = str(event.get("start", ""))
-        if (parsed := dt_util.parse_datetime(raw)) is not None:
-            day: date = dt_util.as_local(parsed).date()
-        elif (parsed_date := dt_util.parse_date(raw)) is not None:
-            day = parsed_date
-        else:
-            continue
-        holidays.add(datetime.combine(day, time.min, tzinfo=tz))
+        for day in _event_dates(event):
+            holidays.add(datetime.combine(day, time.min, tzinfo=tz))
     return sorted(holidays)

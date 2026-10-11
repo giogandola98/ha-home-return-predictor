@@ -34,7 +34,7 @@ def test_state_is_home_custom_zone() -> None:
     assert state_is_home(_state("Work"), "zone.work", WORK) is True
     assert state_is_home(_state("not_home", 45.001), "zone.work", WORK) is True  # ~111 m
     assert state_is_home(_state("not_home", 45.01), "zone.work", WORK) is False
-    assert state_is_home(_state("not_home", 45.001, acc=500), "zone.work", WORK) is False
+    assert state_is_home(_state("not_home", 45.001, acc=500), "zone.work", WORK) is None
     assert state_is_home(_state("home"), "zone.work", WORK) is False
 
 

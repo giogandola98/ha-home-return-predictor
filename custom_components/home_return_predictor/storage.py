@@ -10,6 +10,7 @@ Stored document (``.storage/home_return_predictor.<entry_id>``)::
           "mode": "auto",          # select value
           "is_home": false,        # presence at last save (catch up on restart)
           "left_at": "2026-...",   # start of the current absence (ISO) or null
+          "event_left_at": "...",  # absence whose return event already fired
         }
       }
     }
@@ -62,7 +63,11 @@ class HRPStorage:
         return data
 
     def async_schedule_save(self, data_func: Callable[[], StoredData]) -> None:
-        """Schedule a delayed save (coalesces bursts of changes)."""
+        """Schedule a delayed save (coalesces bursts of changes).
+
+        ``Store`` also writes a pending delayed save on Home Assistant's final
+        write event, so nothing is lost on shutdown.
+        """
         self._store.async_delay_save(data_func, SAVE_DELAY_SECONDS)
 
     async def async_save(self, data: StoredData) -> None:

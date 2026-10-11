@@ -40,7 +40,9 @@ class ReturningBinarySensor(HRPPersonEntity, BinarySensorEntity):
     def is_on(self) -> bool | None:
         """Return True when returning."""
         result = self.result
-        return result.returning if result else None
+        if result is None or result.state_unknown:
+            return None
+        return result.returning
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
@@ -49,6 +51,14 @@ class ReturningBinarySensor(HRPPersonEntity, BinarySensorEntity):
         if result is None:
             return {}
         pred = result.prediction
+        if pred is None:
+            return {
+                "state_unknown": True,
+                "mode": result.effective_mode,
+                "advisory": result.advisory,
+                "reason": result.reason,
+                "active_model": result.active_model,
+            }
 
         def _round(value: float | None, digits: int) -> float | None:
             return round(value, digits) if value is not None else None
@@ -68,6 +78,7 @@ class ReturningBinarySensor(HRPPersonEntity, BinarySensorEntity):
             "advisory": result.advisory,
             "reason": result.reason,
             "active_model": result.active_model,
+            "state_unknown": False,
         }
 
 

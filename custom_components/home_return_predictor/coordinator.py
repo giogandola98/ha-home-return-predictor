@@ -1,4 +1,14 @@
-"""Data update coordinator: per-person models, listeners, mode logic, aggregation."""
+"""Data update coordinator: per-person models, listeners, mode logic, aggregation.
+
+Concurrency rules:
+
+* every model call runs in the executor while holding the person's
+  ``PersonRuntime.lock`` (the model is never used concurrently);
+* lock order is always ``HRPCoordinator._lock`` (updates/observations/retrain)
+  then ``PersonRuntime.lock``; nothing holds a person lock for long work:
+  challenger training snapshots under the lock, fits without it and applies
+  the result under the lock again.
+"""
 
 from __future__ import annotations
 
@@ -12,7 +22,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import STATE_ON
+from homeassistant.const import EVENT_HOMEASSISTANT_STOP, STATE_ON
 from homeassistant.core import (
     CALLBACK_TYPE,
     Event,
@@ -48,11 +58,13 @@ from .const import (
     EVENT_RETURN_DETECTED,
     FIX_WINDOW_MINUTES,
     HISTORY_DAYS,
+    HOUSE_ETA_MIN_PROBABILITY,
     MATURITY_HYSTERESIS,
     MODE_AUTO,
     MODE_LEARNING,
     MODE_LIVE,
     MODES,
+    RETURNING_OFF_HYSTERESIS,
     SKLEARN_REQUIREMENT,
 )
 from .history import (
@@ -72,11 +84,14 @@ from .hrp_core.base import (
     PresenceTransition,
     ReturnModel,
 )
+from .hrp_core.maturity import decode_entries
 from .storage import STORAGE_SCHEMA, HRPStorage, StoredData
 
 _LOGGER = logging.getLogger(__name__)
 
 type HRPConfigEntry = ConfigEntry[HRPCoordinator]
+
+REASON_STATE_UNKNOWN = "state unknown"
 
 
 @dataclass
@@ -90,13 +105,14 @@ class PersonRuntime:
     effective_mode: str | None = None
     is_home: bool | None = None
     left_at: datetime | None = None
+    event_left_at: datetime | None = None  # absence for which the return event fired
     fixes: deque[PositionFix] = field(default_factory=deque)
     trackers: tuple[str, ...] = ()
     returning: bool = False
     snapshot: dict[str, Any] | None = None  # last JSON-safe model state
     dirty: bool = True  # model changed since the last snapshot
-    # Serialises every access to ``model`` (executor jobs, including challenger
-    # training, and in-loop mutations) so the model is never used concurrently.
+    # Serialises every access to ``model`` (always in the executor) so the model
+    # is never used concurrently. Only held for short jobs.
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def add_fix(self, fix: PositionFix) -> bool:
@@ -127,12 +143,17 @@ class PersonResult:
     slug: str
     name: str
     is_home: bool | None
-    prediction: Prediction
+    prediction: Prediction | None  # None while the presence state is unknown
     maturity: MaturityReport
     mode: str  # selected mode (auto/learning/live)
     effective_mode: str  # learning/live
     returning: bool
     reason: str
+
+    @property
+    def state_unknown(self) -> bool:
+        """True when the person's presence is unknown (no prediction)."""
+        return self.is_home is None
 
     @property
     def advisory(self) -> bool:
@@ -142,8 +163,9 @@ class PersonResult:
     @property
     def active_model(self) -> str:
         """Model whose probability is currently served (champion or promoted challenger)."""
+        reason = self.prediction.reason if self.prediction is not None else {}
         return str(
-            self.prediction.reason.get("active_model")
+            reason.get("active_model")
             or getattr(self.maturity, "active_model", None)
             or DEFAULT_ACTIVE_MODEL
         )
@@ -151,15 +173,17 @@ class PersonResult:
 
 @dataclass
 class HouseResult:
-    """Aggregate over all persons."""
+    """Aggregate over all persons with a known presence."""
 
-    probability: float
+    probability: float | None  # None when no person has a known presence
     occupied: bool
     persons_home: list[str]
     returning_persons: list[str]
     next_eta: datetime | None
     mode: str
     away_probability: float = 0.0  # combined return probability of persons away
+    eta_person: str | None = None  # person whose ETA is ``next_eta``
+    persons_unknown: list[str] = field(default_factory=list)
 
     @property
     def advisory(self) -> bool:
@@ -180,6 +204,16 @@ class HRPData:
     house: HouseResult
 
 
+@dataclass
+class _Computed:
+    """Executor result of one person update."""
+
+    prediction: Prediction | None
+    maturity: MaturityReport
+    training_due: bool
+    snapshot_changed: bool
+
+
 def _sklearn_installed() -> bool:
     """Cheap check (no import) whether scikit-learn is installed."""
     return importlib.util.find_spec("sklearn") is not None
@@ -195,7 +229,7 @@ def build_reason(prediction: Prediction, left_at: datetime | None) -> str:
         return "at home"
     parts: list[str] = []
     if left_at is not None:
-        label = prediction.reason.get("label") or prediction.reason.get("schedule")
+        label = prediction.reason.get("shift_label")
         parts.append(f"left {_fmt_dt(left_at)}" + (f" ({label})" if label else ""))
     if prediction.distance_m is not None:
         motion = ""
@@ -260,10 +294,15 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         )
         self.challenger_enabled: bool = False  # requested and scikit-learn installed
         self.sklearn_available: bool = False
-        self._train_lock = asyncio.Lock()  # one challenger training at a time
+        self._train_lock = asyncio.Lock()  # one challenger fit at a time
         self._training: set[str] = set()  # persons with a scheduled/running training
         self._unsub_tracking: CALLBACK_TYPE | None = None
+        self._unsub_stop: CALLBACK_TYPE | None = None
         self._tracked: set[str] = set()
+        # Change counter of the persisted document; a save is scheduled only when
+        # it moved since the last scheduled save.
+        self._data_version = 0
+        self._saved_version = 0
 
     # ------------------------------------------------------------------ helpers
 
@@ -296,10 +335,22 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
             trackers.append(source)
         return tuple(str(t) for t in trackers)
 
+    @callback
+    def _mark_changed(self) -> None:
+        """Record that the persisted document changed."""
+        self._data_version += 1
+
+    async def _async_model_job(self, runtime: PersonRuntime, func: Any, *args: Any) -> Any:
+        """Run one model call in the executor under the person lock."""
+        async with runtime.lock:
+            return await self.hass.async_add_executor_job(func, *args)
+
     # ------------------------------------------------------------------ setup
 
     async def _async_setup(self) -> None:
         """Load stored models, catch up presence, subscribe, bootstrap history."""
+        # Registered first so a failed first refresh never leaks listeners.
+        self.config_entry.async_on_unload(self._async_unsubscribe)
         stored = await self.storage.async_load()
         stored_persons: dict[str, Any] = stored.get("persons", {})
         to_bootstrap: list[str] = []
@@ -319,7 +370,8 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                 model=model or create_model(self.model_config),
                 mode=pdata.get("mode") if pdata.get("mode") in MODES else MODE_AUTO,
                 is_home=pdata.get("is_home"),
-                left_at=dt_util.parse_datetime(pdata["left_at"]) if pdata.get("left_at") else None,
+                left_at=_parse_dt(pdata.get("left_at")),
+                event_left_at=_parse_dt(pdata.get("event_left_at")),
             )
             if model is None:
                 to_bootstrap.append(person_id)
@@ -330,17 +382,25 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
             state = self.hass.states.get(person_id)
             runtime.trackers = self._trackers_of(state)
             if state is not None:
-                self._handle_presence(runtime, state, observe_now=True)
+                transition = self._handle_presence(runtime, state, at_setup=True)
+                if transition is not None:
+                    await self._async_model_job(
+                        runtime, runtime.model.observe_transition, transition, self._is_holiday()
+                    )
+                    runtime.dirty = True
                 fix = state_to_fix(state, self.home_zone)
-                if fix is not None and runtime.is_home is not True:
+                if fix is not None and runtime.is_home is False:
                     runtime.add_fix(fix)
         self._async_subscribe()
+        self._unsub_stop = self.hass.bus.async_listen_once(
+            EVENT_HOMEASSISTANT_STOP, self._async_handle_stop
+        )
         self.config_entry.async_create_background_task(
             self.hass, self._async_setup_challenger(), f"{DOMAIN}_challenger_setup"
         )
         if to_bootstrap:
             self.config_entry.async_create_background_task(
-                self.hass, self.async_retrain(to_bootstrap), f"{DOMAIN}_bootstrap"
+                self.hass, self.async_retrain(to_bootstrap, bootstrap=True), f"{DOMAIN}_bootstrap"
             )
 
     async def _async_setup_challenger(self) -> None:
@@ -371,8 +431,7 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
             enabled = False
         self.challenger_enabled = enabled
         for runtime in self.persons.values():
-            async with runtime.lock:
-                await self.hass.async_add_executor_job(runtime.model.enable_challenger, enabled)
+            await self._async_model_job(runtime, runtime.model.enable_challenger, enabled)
         if enabled:
             _LOGGER.debug("scikit-learn challenger enabled")
             await self.async_request_refresh()
@@ -392,14 +451,30 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
             self.hass, sorted(entities), self._async_handle_state_event
         )
 
-    async def async_unload(self) -> None:
-        """Stop listening and persist everything."""
+    @callback
+    def _async_unsubscribe(self) -> None:
+        """Remove every listener (idempotent)."""
         if self._unsub_tracking:
             self._unsub_tracking()
             self._unsub_tracking = None
+        self._tracked = set()
+        if self._unsub_stop:
+            self._unsub_stop()
+            self._unsub_stop = None
+
+    async def _async_handle_stop(self, _event: Event) -> None:
+        """Home Assistant stops: refresh changed snapshots; Store writes on final write."""
+        self._unsub_stop = None  # listen_once already removed itself
+        await self._async_snapshot_dirty()
+        self._schedule_save(force=True)
+
+    async def async_unload(self) -> None:
+        """Stop listening and persist everything."""
+        self._async_unsubscribe()
         async with self._lock:
             await self._async_snapshot_dirty()
         await self.storage.async_save(self._store_data())
+        self._saved_version = self._data_version
 
     # ------------------------------------------------------------------ events
 
@@ -416,13 +491,17 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
             if trackers != runtime.trackers:
                 runtime.trackers = trackers
                 self._async_subscribe()
-            self._handle_presence(runtime, new_state)
+            transition = self._handle_presence(runtime, new_state)
+            if transition is not None:
+                self.config_entry.async_create_task(
+                    self.hass, self._async_observe(runtime, transition, self._is_holiday())
+                )
         fix = state_to_fix(new_state, zone)
         if fix is not None:
             for runtime in self.persons.values():
                 # Fixes only matter during an absence (cleared again on arrival).
                 if (
-                    runtime.is_home is not True
+                    runtime.is_home is False
                     and (entity_id == runtime.entity_id or entity_id in runtime.trackers)
                     and runtime.add_fix(fix)
                 ):
@@ -432,72 +511,70 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
 
     @callback
     def _handle_presence(
-        self, runtime: PersonRuntime, state: State, observe_now: bool = False
-    ) -> None:
-        """Detect home/away changes and feed them to the model."""
+        self, runtime: PersonRuntime, state: State, at_setup: bool = False
+    ) -> PresenceTransition | None:
+        """Track home/away changes; return the transition to feed to the model."""
         is_home = state_is_home(state, self.home_zone_id, self.home_zone)
         if is_home is None or is_home == runtime.is_home:
-            return
+            return None
         previous = runtime.is_home
         # last_changed is exact for state changes (and across restarts); coordinate
         # based detection (non-default zones) only moves last_updated.
-        ts = state.last_changed if previous is None or observe_now else state.last_updated
+        ts = state.last_changed if previous is None or at_setup else state.last_updated
         runtime.is_home = is_home
         runtime.left_at = None if is_home else ts
+        self._mark_changed()
         if previous is None:
-            return
-        transition = PresenceTransition(ts=ts, is_home=is_home)
-        holiday = self._is_holiday()
-        if observe_now:
-            # Setup: nothing else touches the model yet.
-            runtime.model.observe_transition(transition, holiday)
-            runtime.dirty = True
-            return
-        self.config_entry.async_create_task(
-            self.hass, self._async_observe(runtime, transition, holiday)
-        )
+            return None
+        return PresenceTransition(ts=ts, is_home=is_home)
 
     async def _async_observe(
         self, runtime: PersonRuntime, transition: PresenceTransition, holiday: bool
     ) -> None:
-        async with self._lock, runtime.lock:
-            runtime.model.observe_transition(transition, holiday)
+        async with self._lock:
+            await self._async_model_job(
+                runtime, runtime.model.observe_transition, transition, holiday
+            )
             runtime.dirty = True
             if transition.is_home:
                 runtime.fixes.clear()
-        self._schedule_save()
         await self.async_request_refresh()
 
     # ------------------------------------------------------------------ update
 
-    @staticmethod
-    def _compute(
-        runtime: PersonRuntime, model_input: ModelInput
-    ) -> tuple[Prediction, MaturityReport]:
-        """Run the model (executor)."""
+    def _compute(self, runtime: PersonRuntime, model_input: ModelInput | None) -> _Computed:
+        """Run the model (executor, under runtime.lock). ``None`` input = state unknown."""
         model = runtime.model
-        resolved = model.resolve(model_input.now, model_input.is_home)
-        prediction = model.predict(model_input)
-        logged = model.log_prediction(model_input, prediction)
-        maturity = model.maturity(model_input.now)
-        if resolved or logged or runtime.dirty:
+        now = model_input.now if model_input is not None else dt_util.utcnow()
+        prediction: Prediction | None = None
+        changed = runtime.dirty or runtime.snapshot is None
+        if model_input is not None:
+            resolved = model.resolve(model_input.now, model_input.is_home)
+            prediction = model.predict(model_input)
+            logged = model.log_prediction(model_input, prediction)
+            changed = changed or bool(resolved) or logged
+        maturity = model.maturity(now)
+        if changed:
             runtime.snapshot = model.to_dict()
             runtime.dirty = False
-        return prediction, maturity
+        training_due = self.challenger_enabled and model.challenger_due(now)
+        return _Computed(prediction, maturity, training_due, changed)
 
     @staticmethod
-    def _snapshot(runtime: PersonRuntime) -> None:
+    def _snapshot(runtime: PersonRuntime) -> bool:
         """Refresh the snapshot of a changed model (executor, under runtime.lock)."""
         if runtime.dirty or runtime.snapshot is None:
             runtime.snapshot = runtime.model.to_dict()
             runtime.dirty = False
+            return True
+        return False
 
     async def _async_snapshot_dirty(self, person_ids: list[str] | None = None) -> None:
         """Refresh snapshots of changed models, one person (lock) at a time."""
         for person_id in person_ids or list(self.persons):
             runtime = self.persons[person_id]
-            async with runtime.lock:
-                await self.hass.async_add_executor_job(self._snapshot, runtime)
+            if await self._async_model_job(runtime, self._snapshot, runtime):
+                self._mark_changed()
 
     def _reset_model(self, runtime: PersonRuntime) -> None:
         """Reset a model, keeping the challenger switch (executor, under runtime.lock)."""
@@ -513,6 +590,15 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
             threshold = self.maturity_threshold
         return MODE_LIVE if maturity >= threshold else MODE_LEARNING
 
+    def _is_returning(self, runtime: PersonRuntime, prediction: Prediction | None) -> bool:
+        """Returning with off-hysteresis (stays on until p < threshold - 0.05)."""
+        if prediction is None or runtime.is_home is not False:
+            return False
+        threshold = self.return_threshold
+        if runtime.returning:
+            threshold -= RETURNING_OFF_HYSTERESIS
+        return prediction.probability >= threshold
+
     async def _async_update_data(self) -> HRPData:
         now = dt_util.utcnow()
         holiday = self._is_holiday()
@@ -520,50 +606,72 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         async with self._lock:
             for person_id, runtime in self.persons.items():
                 runtime.prune_fixes(now)
-                is_home = bool(runtime.is_home)
-                model_input = ModelInput(
-                    now=now,
-                    is_home=is_home,
-                    left_at=None if is_home else runtime.left_at,
-                    is_holiday=holiday,
-                    fixes=tuple(runtime.fixes),
+                is_home = runtime.is_home
+                model_input = (
+                    None
+                    if is_home is None
+                    else ModelInput(
+                        now=now,
+                        is_home=is_home,
+                        left_at=None if is_home else runtime.left_at,
+                        is_holiday=holiday,
+                        fixes=tuple(runtime.fixes),
+                    )
                 )
                 try:
-                    async with runtime.lock:
-                        prediction, maturity = await self.hass.async_add_executor_job(
-                            self._compute, runtime, model_input
-                        )
-                        model = runtime.model
-                        training_due = self.challenger_enabled and model.challenger_due(now)
+                    computed: _Computed = await self._async_model_job(
+                        runtime, self._compute, runtime, model_input
+                    )
                 except (ArithmeticError, KeyError, TypeError, ValueError) as err:
                     raise UpdateFailed(
                         translation_domain=DOMAIN,
                         translation_key="update_failed",
                         translation_placeholders={"person": person_id, "error": str(err)},
                     ) from err
-                self.last_predictions[person_id] = prediction
-                runtime.effective_mode = self._effective_mode(runtime, maturity.maturity)
-                returning = (not is_home) and prediction.probability >= self.return_threshold
+                if computed.snapshot_changed:
+                    self._mark_changed()
+                prediction = computed.prediction
+                if prediction is not None:
+                    self.last_predictions[person_id] = prediction
+                else:
+                    self.last_predictions.pop(person_id, None)
+                runtime.effective_mode = self._effective_mode(runtime, computed.maturity.maturity)
+                returning = self._is_returning(runtime, prediction)
                 result = PersonResult(
                     entity_id=person_id,
                     slug=runtime.slug,
                     name=self.person_name(person_id),
-                    is_home=runtime.is_home,
+                    is_home=is_home,
                     prediction=prediction,
-                    maturity=maturity,
+                    maturity=computed.maturity,
                     mode=runtime.mode,
                     effective_mode=runtime.effective_mode,
                     returning=returning,
-                    reason=build_reason(prediction, model_input.left_at),
+                    reason=(
+                        build_reason(prediction, runtime.left_at if not is_home else None)
+                        if prediction is not None
+                        else REASON_STATE_UNKNOWN
+                    ),
                 )
-                if returning and not runtime.returning:
+                if returning and self._should_fire(runtime):
                     self._fire_return_event(result)
                 runtime.returning = returning
                 results[person_id] = result
-                if training_due:
+                if computed.training_due:
                     self._schedule_training(runtime, now)
         self._schedule_save()
         return HRPData(persons=results, house=self._aggregate(results))
+
+    @callback
+    def _should_fire(self, runtime: PersonRuntime) -> bool:
+        """One return event per absence (keyed on left_at, persisted across restarts)."""
+        if runtime.left_at is None:
+            return not runtime.returning  # unknown departure: rising edge only
+        if runtime.event_left_at == runtime.left_at:
+            return False
+        runtime.event_left_at = runtime.left_at
+        self._mark_changed()
+        return True
 
     # ------------------------------------------------------------------ challenger
 
@@ -580,15 +688,15 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         )
 
     async def _async_train(self, runtime: PersonRuntime, now: datetime) -> None:
+        """Snapshot (locked) -> fit (unlocked, heavy) -> apply (locked)."""
+        model = runtime.model
         try:
-            async with self._train_lock, runtime.lock:
-                future = self.hass.async_add_executor_job(runtime.model.train_challenger, now)
-                try:
-                    summary = await asyncio.shield(future)
-                except asyncio.CancelledError:
-                    # Keep the model locked until the worker thread really finishes.
-                    await future
-                    raise
+            async with self._train_lock:
+                snapshot = await self._async_model_job(runtime, model.challenger_snapshot)
+                fitted = await self.hass.async_add_executor_job(
+                    type(model).fit_challenger, snapshot, now
+                )
+                summary = await self._async_model_job(runtime, model.apply_challenger, fitted, now)
                 runtime.dirty = True
         except asyncio.CancelledError:
             raise
@@ -598,16 +706,20 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         finally:
             self._training.discard(runtime.entity_id)
         _LOGGER.debug("Challenger training for %s: %s", runtime.entity_id, summary)
+        await self._async_snapshot_dirty([runtime.entity_id])
         self._schedule_save()
 
     def _fire_return_event(self, result: PersonResult) -> None:
-        eta = result.prediction.eta
+        prediction = result.prediction
+        if prediction is None:
+            return
+        eta = prediction.eta
         self.hass.bus.async_fire(
             EVENT_RETURN_DETECTED,
             {
                 "person": result.entity_id,
                 "name": result.name,
-                "probability": round(result.prediction.probability, 3),
+                "probability": round(prediction.probability, 3),
                 "eta": eta.isoformat() if eta else None,
                 "mode": result.effective_mode,
                 "advisory": result.advisory,
@@ -616,14 +728,30 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
 
     @staticmethod
     def _aggregate(results: dict[str, PersonResult]) -> HouseResult:
-        persons_home = [pid for pid, r in results.items() if r.is_home]
+        persons_home = [pid for pid, r in results.items() if r.is_home is True]
+        away = {
+            pid: r.prediction
+            for pid, r in results.items()
+            if r.is_home is False and r.prediction is not None
+        }
+        unknown = [pid for pid, r in results.items() if r.state_unknown]
         returning = [pid for pid, r in results.items() if r.returning]
-        away_probability = 1.0 - math.prod(
-            1.0 - r.prediction.probability for r in results.values() if not r.is_home
-        )
-        probability = 1.0 if persons_home else away_probability
-        etas = [e for pid in returning if (e := results[pid].prediction.eta) is not None]
-        mode_source = returning or list(results)
+        away_probability = 1.0 - math.prod(1.0 - p.probability for p in away.values())
+        probability: float | None
+        if persons_home:
+            probability = 1.0
+        elif away:
+            probability = away_probability
+        else:
+            probability = None
+        eta_candidates = [
+            (p.eta, pid)
+            for pid, p in away.items()
+            if p.eta is not None and p.probability >= HOUSE_ETA_MIN_PROBABILITY
+        ]
+        next_eta, eta_person = min(eta_candidates) if eta_candidates else (None, None)
+        known = [pid for pid in results if pid not in unknown]
+        mode_source = returning or known or list(results)
         mode = (
             MODE_LIVE
             if any(results[pid].effective_mode == MODE_LIVE for pid in mode_source)
@@ -634,9 +762,11 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
             occupied=bool(persons_home),
             persons_home=persons_home,
             returning_persons=returning,
-            next_eta=min(etas) if etas else None,
+            next_eta=next_eta,
             mode=mode,
             away_probability=away_probability,
+            eta_person=eta_person,
+            persons_unknown=unknown,
         )
 
     # ------------------------------------------------------------------ storage
@@ -650,13 +780,19 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                     "mode": rt.mode,
                     "is_home": rt.is_home,
                     "left_at": rt.left_at.isoformat() if rt.left_at else None,
+                    "event_left_at": rt.event_left_at.isoformat() if rt.event_left_at else None,
                 }
                 for pid, rt in self.persons.items()
             },
         }
 
     @callback
-    def _schedule_save(self) -> None:
+    def _schedule_save(self, force: bool = False) -> None:
+        """Schedule a delayed save when the persisted document changed."""
+        if not force and self._data_version == self._saved_version:
+            return
+        self._saved_version = self._data_version
+        # data_func runs at write time, so later changes are included as well.
         self.storage.async_schedule_save(self._store_data)
 
     # ------------------------------------------------------------------ actions
@@ -664,6 +800,7 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
     async def async_set_mode(self, person_id: str, mode: str) -> None:
         """Change the selected mode of a person."""
         self.persons[person_id].mode = mode
+        self._mark_changed()
         self._schedule_save()
         await self.async_refresh()
 
@@ -671,16 +808,17 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         """Forget everything learnt for a person."""
         async with self._lock:
             runtime = self.persons[person_id]
-            async with runtime.lock:
-                await self.hass.async_add_executor_job(self._reset_model, runtime)
+            await self._async_model_job(runtime, self._reset_model, runtime)
             runtime.fixes.clear()
             runtime.returning = False
             runtime.effective_mode = None
             runtime.dirty = True
         await self.async_refresh()
 
-    async def async_retrain(self, person_ids: list[str] | None = None) -> None:
-        """Rebuild models from recorder history."""
+    async def async_retrain(
+        self, person_ids: list[str] | None = None, bootstrap: bool = False
+    ) -> None:
+        """Merge recorder history into the models (bootstrap or ``retrain`` service)."""
         holidays = await async_load_holidays(self.hass, self.holiday_calendar, HISTORY_DAYS)
         for person_id in person_ids or list(self.persons):
             runtime = self.persons[person_id]
@@ -691,16 +829,26 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                 "History for %s: %d transitions, %d fixes", person_id, len(transitions), len(fixes)
             )
             async with self._lock:
-                async with runtime.lock:
-                    if transitions or fixes:
-                        await self.hass.async_add_executor_job(
-                            runtime.model.load_history, transitions, fixes, holidays
-                        )
-                        runtime.dirty = True
-                    last = transitions[-1] if transitions else None
-                    if last is not None and not last.is_home and runtime.left_at is None:
-                        runtime.left_at = last.ts
-                await self._async_snapshot_dirty()
+                if transitions or fixes:
+                    await self._async_model_job(
+                        runtime, runtime.model.load_history, transitions, fixes, holidays
+                    )
+                    runtime.dirty = True
+                last = transitions[-1] if transitions else None
+                if (
+                    last is not None
+                    and not last.is_home
+                    and runtime.is_home is not True
+                    and (
+                        runtime.left_at is None
+                        # Bootstrap: left_at came from last_changed at boot, which is
+                        # the restart time when the absence started earlier.
+                        or (bootstrap and last.ts < runtime.left_at)
+                    )
+                ):
+                    runtime.left_at = last.ts
+                    self._mark_changed()
+                await self._async_snapshot_dirty([person_id])
         self._schedule_save()
         await self.async_request_refresh()
 
@@ -710,6 +858,15 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         log = snapshot.get("log")
         if not isinstance(log, dict):
             return []
-        entries = [*log.get("resolved", []), *log.get("pending", [])]
-        entries.sort(key=lambda e: str(e.get("ts", "")))
-        return entries[-limit:]
+        entries = [*decode_entries(log.get("resolved")), *decode_entries(log.get("pending"))]
+        entries.sort(key=lambda e: e.ts)
+        return [e.to_dict() for e in entries[-limit:]]
+
+    async def async_episode_count(self, person_id: str) -> int:
+        """Number of stored episodes (model call under the person lock)."""
+        runtime = self.persons[person_id]
+        return len(await self._async_model_job(runtime, runtime.model.episodes))
+
+
+def _parse_dt(value: Any) -> datetime | None:
+    return dt_util.parse_datetime(value) if isinstance(value, str) and value else None
