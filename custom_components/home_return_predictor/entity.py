@@ -104,4 +104,15 @@ class HRPHouseEntity(HRPEntity):
             "advisory": house.advisory,
             "away_probability": round(house.away_probability * 100, 1),
             "persons_unknown": house.persons_unknown,
+            # Per-person returns (probability in %, like the sensors): the blueprint
+            # judges each one on its own instead of pairing the combined house
+            # probability with the earliest ETA.
+            "candidates": [
+                {
+                    "person": pid,
+                    "probability": round(probability * 100, 1),
+                    "eta": eta.isoformat() if eta else None,
+                }
+                for pid, probability, eta in house.candidates
+            ],
         }

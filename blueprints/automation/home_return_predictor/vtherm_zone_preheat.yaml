@@ -7,8 +7,9 @@ blueprint:
 
     Priority (highest first): VTherm protections (window open, safety, power
     shedding, HVAC off, locked) -> bed switch -> zone schedule / occupancy while
-    someone is home -> predicted return (pre-heat N minutes before the house ETA,
-    only if the zone schedule is active at the expected arrival).
+    someone is home -> predicted return (pre-heat N minutes before each away
+    person's ETA, judged on that person's own probability, only if the zone
+    schedule is active at the expected arrival).
     With someone at home a predicted return can only *upgrade* a zone.
 
 
@@ -330,9 +331,9 @@ variables:
   # ZoneInputs.house_eta (0 = none)
   eta_ts: "{{ as_timestamp(states(eta_sensor), 0) | float(0) }}"
 
-  # ZoneInputs.house_probability, in % (0..100). The house sensor is 100 while
-  # someone is home: then use its `away_probability` attribute if present, else
-  # 100 when an ETA exists (the ETA is only published for returning persons).
+  # ZoneInputs.house_probability, in % (0..100); only used when the ETA sensor has
+  # no `candidates` attribute. The house sensor is 100 while someone is home: then
+  # use its `away_probability` attribute if present, else 100 when an ETA exists.
   probability: >-
     {% if state_attr(prob_sensor, 'occupied') == true %}
       {% set a = state_attr(prob_sensor, 'away_probability') %}
@@ -381,24 +382,48 @@ variables:
     {% elif not has_schedule %}someone home, zone has no schedule
     {% elif sched_active_now %}someone home, zone schedule active
     {% else %}someone home, zone outside schedule{% endif %}
-  # _return_candidate() part that does not depend on the current preset.
-  # window: now >= eta - preheat (also true when the ETA is already past);
-  # schedule evaluated at arrival = max(eta, now).
-  return_applicable: >-
-    {% if not prediction_enabled or eta_ts == 0 %}{{ false }}
-    {% elif now_ts < eta_ts - preheat_min * 60 %}{{ false }}
-    {% elif not has_schedule %}{{ true }}
-    {% else %}
-      {% set arrival = [eta_ts, now_ts] | max %}
-      {% if sched_on %}{{ sched_next_ts == 0 or arrival < sched_next_ts }}
-      {% else %}{{ sched_next_ts != 0 and arrival >= sched_next_ts }}{% endif %}
+  # ZoneInputs.return_candidates: one {p (%), eta (timestamp, 0 = none)} per away
+  # person from the `candidates` attribute of the house ETA sensor; each return is
+  # judged on its own probability and ETA. Missing/empty attribute (older
+  # integration, nobody likely to return) -> the single (probability, eta_ts) pair.
+  return_candidates: >-
+    {% set raw = state_attr(eta_sensor, 'candidates') %}
+    {% set ns = namespace(items=[]) %}
+    {% if raw is sequence and raw is not string %}
+      {% for c in raw if c is mapping %}
+        {% set e = as_timestamp(c.get('eta'), 0) | float(0) if c.get('eta') else 0 %}
+        {% set ns.items = ns.items + [{'p': c.get('probability') | float(0), 'eta': e}] %}
+      {% endfor %}
     {% endif %}
-  return_reason: >-
-    {% if not prediction_enabled %}prediction ignored (not live)
-    {% elif eta_ts == 0 %}no return predicted
-    {% elif now_ts < eta_ts - preheat_min * 60 %}return ETA {{ eta_ts | timestamp_custom('%H:%M') }} outside pre-heat window
-    {% elif not return_applicable %}zone not scheduled at ETA {{ eta_ts | timestamp_custom('%H:%M') }}
-    {% else %}return probability {{ probability | round(0) }}% ETA {{ eta_ts | timestamp_custom('%H:%M') }}{% endif %}
+    {% if ns.items | count == 0 %}
+      {% set ns.items = [{'p': probability | float(0), 'eta': eta_ts | float(0)}] %}
+    {% endif %}
+    {{ ns.items }}
+  # _single_return() part that does not depend on the current preset, per candidate:
+  # ok = window reached (now >= eta - preheat, also when the ETA is already past)
+  # and zone scheduled at arrival = max(eta, now).
+  return_options: >-
+    {% set ns = namespace(items=[]) %}
+    {% for c in return_candidates %}
+      {% set eta = c.eta | float(0) %}
+      {% set hhmm = eta | timestamp_custom('%H:%M') if eta > 0 else '' %}
+      {% if not prediction_enabled %}
+        {% set ok, why = false, 'prediction ignored (not live)' %}
+      {% elif eta == 0 %}
+        {% set ok, why = false, 'no return predicted' %}
+      {% elif now_ts < eta - preheat_min * 60 %}
+        {% set ok, why = false, 'return ETA ' ~ hhmm ~ ' outside pre-heat window' %}
+      {% else %}
+        {% set arrival = [eta, now_ts] | max %}
+        {% if not has_schedule %}{% set ok = true %}
+        {% elif sched_on %}{% set ok = sched_next_ts == 0 or arrival < sched_next_ts %}
+        {% else %}{% set ok = sched_next_ts != 0 and arrival >= sched_next_ts %}{% endif %}
+        {% set why = ('return probability ' ~ (c.p | round(0)) ~ '% ETA ' ~ hhmm) if ok
+                     else 'zone not scheduled at ETA ' ~ hhmm %}
+      {% endif %}
+      {% set ns.items = ns.items + [{'p': c.p | float(0), 'ok': ok, 'reason': why}] %}
+    {% endfor %}
+    {{ ns.items }}
 
 actions:
   - repeat:
@@ -441,14 +466,22 @@ actions:
                 {% set r = 'bed mode: day zone set to night preset' if zone_type == 'day'
                            else 'bed mode: night zone kept comfortable' %}
               {% else %}
-                {# _return_candidate() with hysteresis on the current preset #}
+                {# _return_candidate(): each candidate with hysteresis on the current
+                   preset; the highest-ranked preset wins (first one on ties) #}
                 {% set cur = rank(current) | int %}
                 {% set hi = high_th - hyst if cur >= 2 else high_th %}
                 {% set med = medium_th - hyst if cur >= 1 else medium_th %}
-                {% if not return_applicable %}{% set cand = '' %}
-                {% elif probability >= hi %}{% set cand = comfort_preset %}
-                {% elif probability >= med %}{% set cand = medium_preset %}
-                {% else %}{% set cand = absent_preset %}{% endif %}
+                {% set best = namespace(t='', r='') %}
+                {% for o in return_options %}
+                  {% if not o.ok %}{% set c = '' %}
+                  {% elif o.p >= hi %}{% set c = comfort_preset %}
+                  {% elif o.p >= med %}{% set c = medium_preset %}
+                  {% else %}{% set c = absent_preset %}{% endif %}
+                  {% if loop.first or (c != '' and rank(c) | int > rank(best.t) | int) %}
+                    {% set best.t, best.r = c, o.reason %}
+                  {% endif %}
+                {% endfor %}
+                {% set cand, return_reason = best.t, best.r %}
                 {% if someone_home %}
                   {# never downgrade because of another person's return #}
                   {% if cand != '' and rank(cand) | int > rank(base_preset | trim) | int %}

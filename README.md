@@ -215,7 +215,10 @@ Casa:
 | `binary_sensor.house_someone_returning` | On se almeno una persona sta tornando |
 
 Tutte le entità casa hanno gli attributi `occupied`, `persons_home`,
-`returning_persons`, `mode`, `advisory` (il binary sensor anche `returning_names`).
+`returning_persons`, `mode`, `advisory`, `away_probability` e `candidates` (il
+binary sensor anche `returning_names`). `candidates` è la lista delle persone fuori
+con probabilità ≥ 25%, ordinata per ETA: `[{person, probability, eta}]` con
+`probability` in **%** (come i sensori) ed `eta` in ISO 8601 (o `null`).
 
 ---
 
@@ -346,6 +349,14 @@ Regole aggiuntive:
 - Con nessuno in casa vale il punto 4, o il preset assenza.
 - **Isteresi**: se il preset attuale è comfort, resta comfort finché p ≥ alta − 5;
   se è eco (o superiore), resta almeno eco finché p ≥ media − 5.
+- **Ogni rientro è valutato da solo**: il blueprint legge l'attributo `candidates`
+  del sensore ETA casa e applica il punto 4 a ogni persona con la *sua*
+  probabilità, la *sua* ETA e il calendario alla *sua* ETA; vince il preset più
+  alto. La probabilità combinata della casa non viene mai abbinata all'ETA di
+  un'altra persona (es. Alice 30% alle 17:00 e Bob 80% alle 21:00: comfort dalle
+  20:30, non 86% alle 17:00) e due rientri poco probabili non si sommano.
+- Senza attributo `candidates` (integrazione più vecchia) o con lista vuota il
+  blueprint usa la coppia probabilità casa / ETA casa.
 - Con qualcuno in casa la probabilità casa vale 100%; il blueprint usa allora
   l'attributo `away_probability` se l'integrazione lo fornisce, altrimenti considera
   100% quando esiste un'ETA (cioè qualcuno sta già tornando).

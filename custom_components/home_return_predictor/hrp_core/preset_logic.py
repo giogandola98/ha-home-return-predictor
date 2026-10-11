@@ -17,6 +17,11 @@ Priority, highest first:
    schedule is active at the expected arrival: probability >= high -> ``comfort``,
    >= medium -> ``medium`` preset (default eco), else ``absent`` (with hysteresis on
    the current preset).
+   With per-person ``return_candidates`` (the ``candidates`` attribute of the house
+   ETA sensor) every candidate is judged on its *own* probability, ETA and
+   schedule-at-ETA and the highest-ranked preset wins; probabilities of different
+   persons are never combined with another person's ETA. Without candidates the
+   single (house probability, house ETA) pair is used.
    With someone home the result is the higher-ranked of (3) and (4): another
    person's return never downgrades a zone. With nobody home it is (4) or ``absent``.
 
@@ -25,6 +30,7 @@ The blueprint never sets temperatures; it only switches VTherm presets.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -77,6 +83,9 @@ class ZoneInputs:
     someone_home: bool = False
     house_probability: float = 0.0  # 0..1, best return probability of an away person
     house_eta: datetime | None = None
+    # Per-person (probability 0..1, ETA) of away persons; when non-empty it replaces
+    # the (house_probability, house_eta) pair for the predicted-return rule.
+    return_candidates: Sequence[tuple[float, datetime | None]] | None = None
     preheat_minutes: float = 30.0
     # None = no schedule entity; else (state_on, next_event) of an HA ``schedule``.
     schedule: tuple[bool, datetime | None] | None = None
@@ -129,10 +138,32 @@ def preset_rank(preset: str | None, presets: PresetConfig) -> int:
 
 
 def _return_candidate(inputs: ZoneInputs, current_preset: str | None) -> tuple[str | None, str]:
-    """Preset suggested by the predicted return, or ``None`` if it does not apply."""
+    """Preset suggested by the predicted return, or ``None`` if it does not apply.
+
+    Each (probability, ETA) candidate is evaluated on its own; the highest-ranked
+    preset wins (first one on ties). Without candidates: the house pair.
+    """
     if not inputs.prediction_enabled:
         return None, "prediction ignored (not live)"
-    eta = inputs.house_eta
+    candidates = list(inputs.return_candidates or ()) or [
+        (inputs.house_probability, inputs.house_eta)
+    ]
+    best: tuple[str | None, str] | None = None
+    for p, eta in candidates:
+        preset, reason = _single_return(inputs, p, eta, current_preset)
+        if best is None or (
+            preset is not None
+            and preset_rank(preset, inputs.presets) > preset_rank(best[0], inputs.presets)
+        ):
+            best = (preset, reason)
+    assert best is not None
+    return best
+
+
+def _single_return(
+    inputs: ZoneInputs, p: float, eta: datetime | None, current_preset: str | None
+) -> tuple[str | None, str]:
+    """Return rule for one (probability, ETA) pair."""
     if eta is None:
         return None, "no return predicted"
     start = eta - timedelta(minutes=max(inputs.preheat_minutes, 0.0))
@@ -149,7 +180,6 @@ def _return_candidate(inputs: ZoneInputs, current_preset: str | None) -> tuple[s
     rank = preset_rank(current_preset, presets)
     high = th.high - th.hysteresis if rank >= 2 else th.high
     medium = th.medium - th.hysteresis if rank >= 1 else th.medium
-    p = inputs.house_probability
     if p >= high:
         return presets.comfort, f"return likely ({p:.0%}) ETA {eta:%H:%M}"
     if p >= medium:

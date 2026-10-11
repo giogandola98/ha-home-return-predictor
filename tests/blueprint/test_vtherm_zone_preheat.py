@@ -290,3 +290,59 @@ async def test_custom_presets(hass: HomeAssistant) -> None:
     assert await _run(hass, calls) == "comfort"
     _house(hass, prob=10, eta_min=10)
     assert await _run(hass, calls) == "eco"
+
+
+def _candidates(hass: HomeAssistant, house_prob: float, cands: list[tuple[str, float, float]]):
+    """House sensors as published by the integration, with per-person candidates."""
+    now = dt_util.now()
+    attr = [
+        {"person": p, "probability": prob, "eta": (now + timedelta(minutes=m)).isoformat()}
+        for p, prob, m in cands
+    ]
+    first = min(cands, key=lambda c: c[2])
+    hass.states.async_set("zone.home", "0")
+    hass.states.async_set(
+        "sensor.house_return_probability", str(house_prob), {"occupied": False, "candidates": attr}
+    )
+    hass.states.async_set(
+        "sensor.house_next_return_eta",
+        (now + timedelta(minutes=first[2])).isoformat(),
+        {"eta_person": first[0], "candidates": attr},
+    )
+    hass.states.async_set(
+        "binary_sensor.house_someone_returning", "on", {"mode": "live", "advisory": False}
+    )
+
+
+async def test_candidates_never_mix_probability_and_eta(hass: HomeAssistant) -> None:
+    """Alice 30 % in 20 min, Bob 80 % in 4 h: house says 86 % with Alice's ETA."""
+    calls = await _setup(hass)
+    _climate(hass, "frost")
+    _candidates(hass, 86, [("person.alice", 30, 20), ("person.bob", 80, 240)])
+    assert await _run(hass, calls) is None  # stays frost: no comfort 4 h early
+    # Bob is now the one arriving within the pre-heat window.
+    _candidates(hass, 86, [("person.alice", 30, 240), ("person.bob", 80, 20)])
+    assert await _run(hass, calls) == "comfort"
+    # Without the attribute (older integration) the single house pair is used.
+    _climate(hass, "frost")
+    _house(hass, prob=86, eta_min=20)
+    assert await _run(hass, calls) == "comfort"
+
+
+async def test_two_low_candidates_do_not_sum(hass: HomeAssistant) -> None:
+    """Two persons at 35 % each (house 58 %): neither return is likely -> no eco."""
+    calls = await _setup(hass)
+    _climate(hass, "frost")
+    _candidates(hass, 57.8, [("person.alice", 35, 10), ("person.bob", 35, 15)])
+    assert await _run(hass, calls) is None
+    _house(hass, prob=57.8, eta_min=10)  # legacy pairing would pick eco
+    assert await _run(hass, calls) == "eco"
+
+
+async def test_candidates_each_checked_against_schedule(hass: HomeAssistant) -> None:
+    """A likely return outside the zone schedule does not hide a medium one inside it."""
+    calls = await _setup(hass, schedule_entity="schedule.bedroom")
+    _schedule(hass, True, 15)  # zone schedule ends in 15 minutes
+    _climate(hass, "frost")
+    _candidates(hass, 97, [("person.alice", 50, 10), ("person.bob", 95, 25)])
+    assert await _run(hass, calls) == "eco"
