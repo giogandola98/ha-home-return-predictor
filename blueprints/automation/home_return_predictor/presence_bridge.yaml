@@ -1,0 +1,89 @@
+blueprint:
+  name: Home Return Predictor - presence bridge
+  description: >
+    Mirrors "someone is returning" (and optionally "someone is home") into an
+    input_boolean, for tools that only accept an on/off presence or occupancy
+    entity (e.g. the `global_presence` of Ecronika ha-preheat).
+    The input_boolean turns on when the condition holds and off when it does not.
+  domain: automation
+  homeassistant:
+    min_version: 2024.10.0
+  source_url: https://github.com/giogandola98/ha-home-return-predictor/blob/main/blueprints/automation/home_return_predictor/presence_bridge.yaml
+  input:
+    target:
+      name: Target input_boolean
+      selector:
+        entity:
+          domain: input_boolean
+    returning_sensor:
+      name: House "someone returning" sensor
+      default: binary_sensor.house_someone_returning
+      selector:
+        entity:
+          domain: binary_sensor
+    include_home:
+      name: Also on while someone is home
+      default: true
+      selector:
+        boolean: {}
+    someone_home_entity:
+      name: Someone-home source
+      description: zone.home (number of people), a person, a group or a binary_sensor.
+      default: zone.home
+      selector:
+        entity:
+          domain:
+            - zone
+            - person
+            - group
+            - binary_sensor
+            - input_boolean
+            - device_tracker
+    act_only_live:
+      name: Use the returning signal only in live mode
+      description: While the model is learning (advisory), the returning signal is ignored.
+      default: true
+      selector:
+        boolean: {}
+
+mode: queued
+max: 3
+max_exceeded: silent
+
+triggers:
+  - trigger: homeassistant
+    event: start
+  - trigger: time_pattern
+    minutes: /5
+  # any change, attributes included (advisory/mode can change without the state)
+  - trigger: state
+    entity_id: !input returning_sensor
+  - trigger: state
+    entity_id: !input someone_home_entity
+    to: null
+
+variables:
+  target: !input target
+  returning_sensor: !input returning_sensor
+  include_home: !input include_home
+  someone_home_entity: !input someone_home_entity
+  act_only_live: !input act_only_live
+  returning: >-
+    {{ is_state(returning_sensor, 'on')
+       and (not act_only_live or state_attr(returning_sensor, 'advisory') == false
+            or state_attr(returning_sensor, 'mode') == 'live') }}
+  home: >-
+    {% set e = someone_home_entity %}
+    {% if not e %}{{ false }}
+    {% elif e.startswith('zone.') %}{{ states(e) | int(0) > 0 }}
+    {% else %}{{ states(e) in ['home', 'on'] }}{% endif %}
+  wanted: "{{ returning or (include_home and home) }}"
+
+conditions:
+  - condition: template
+    value_template: "{{ wanted != is_state(target, 'on') }}"
+
+actions:
+  - action: "input_boolean.turn_{{ 'on' if wanted else 'off' }}"
+    target:
+      entity_id: "{{ target }}"

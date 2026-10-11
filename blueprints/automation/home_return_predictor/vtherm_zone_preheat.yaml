@@ -1,0 +1,488 @@
+blueprint:
+  name: Home Return Predictor - VTherm zone pre-heat
+  description: >
+    Switches the **preset** (never the temperature) of one heating zone made of
+    Versatile Thermostat (VTherm) entities, using Home Return Predictor.
+
+
+    Priority (highest first): VTherm protections (window open, safety, power
+    shedding, HVAC off, locked) -> bed switch -> zone schedule / occupancy while
+    someone is home -> predicted return (pre-heat N minutes before the house ETA,
+    only if the zone schedule is active at the expected arrival).
+    With someone at home a predicted return can only *upgrade* a zone.
+
+
+    One automation per zone. Disable VTherm's own presence and motion features:
+    this blueprint must be the only thing changing presets. The decision logic is
+    identical to `hrp_core/preset_logic.py` (unit tested).
+  domain: automation
+  homeassistant:
+    min_version: 2024.10.0
+  source_url: https://github.com/giogandola98/ha-home-return-predictor/blob/main/blueprints/automation/home_return_predictor/vtherm_zone_preheat.yaml
+  input:
+    zone:
+      name: Zone
+      icon: mdi:radiator
+      input:
+        climates:
+          name: VTherm thermostats
+          description: One or more Versatile Thermostat climate entities of this zone.
+          selector:
+            entity:
+              domain: climate
+              multiple: true
+        zone_type:
+          name: Zone type
+          description: >
+            day = living areas (go to the night preset when the bed switch is on);
+            night = bedrooms; always = bathroom or zones that are always used.
+          default: day
+          selector:
+            select:
+              options:
+                - label: Day zone (living room, kitchen, office)
+                  value: day
+                - label: Night zone (bedrooms)
+                  value: night
+                - label: Always (bathroom, always used)
+                  value: always
+        schedule_entity:
+          name: Zone schedule (optional)
+          description: >
+            A `schedule` helper describing when the zone is used. With people at
+            home: inside the schedule -> comfort, outside -> "unused" preset.
+            A predicted return pre-heats only if the schedule is active at the ETA.
+            Empty = zone always in use.
+          default: ""
+          selector:
+            entity:
+              domain: schedule
+        occupancy_sensor:
+          name: Zone occupancy sensor (optional)
+          description: >
+            binary_sensor that is `on` when the zone is in use. With someone at home
+            it forces comfort even outside the schedule.
+          default: ""
+          selector:
+            entity:
+              domain: binary_sensor
+        bed_switch:
+          name: Bed / night switch (optional)
+          description: >
+            input_boolean (or switch / binary_sensor) that is on when people are in
+            bed. Day zones -> night preset, night/always zones -> comfort.
+          default: ""
+          selector:
+            entity:
+              domain:
+                - input_boolean
+                - switch
+                - binary_sensor
+    prediction:
+      name: Home Return Predictor
+      icon: mdi:home-clock
+      input:
+        house_probability_sensor:
+          name: House return probability
+          default: sensor.house_return_probability
+          selector:
+            entity:
+              domain: sensor
+        house_eta_sensor:
+          name: House next return ETA
+          default: sensor.house_next_return_eta
+          selector:
+            entity:
+              domain: sensor
+        returning_sensor:
+          name: House "someone returning" sensor
+          description: Its `mode` / `advisory` attributes tell whether the model is live.
+          default: binary_sensor.house_someone_returning
+          selector:
+            entity:
+              domain: binary_sensor
+        someone_home_entity:
+          name: Someone-home source
+          description: >
+            zone.home (state = number of people inside), a person, a group or a
+            binary_sensor/input_boolean. The `occupied` attribute of the house
+            probability sensor is also honoured.
+          default: zone.home
+          selector:
+            entity:
+              domain:
+                - zone
+                - person
+                - group
+                - binary_sensor
+                - input_boolean
+                - device_tracker
+        act_only_live:
+          name: Act on predictions only in live mode
+          description: >
+            When on (default), while the model is still learning the predicted
+            return is ignored (presence, schedule and bed logic still work).
+            Turn off to pre-heat from day one.
+          default: true
+          selector:
+            boolean: {}
+    preheat:
+      name: Pre-heat time
+      icon: mdi:timer-outline
+      input:
+        preheat_minutes:
+          name: Fixed pre-heat minutes
+          default: 30
+          selector:
+            number:
+              min: 0
+              max: 240
+              step: 5
+              unit_of_measurement: min
+              mode: slider
+        preheat_sensor:
+          name: Pre-heat minutes sensor (optional)
+          description: >
+            Sensor giving the needed minutes, e.g. Ecronika ha-preheat
+            `sensor.<zone>_predicted_duration`. Used when numeric, otherwise the
+            fixed value above is used.
+          default: ""
+          selector:
+            entity:
+              domain: sensor
+    presets:
+      name: Presets (chosen per zone)
+      icon: mdi:thermostat
+      input:
+        comfort_preset:
+          name: Comfort preset
+          description: >
+            Zone in use with someone home, bed mode in night zones, and return with high probability.
+          default: comfort
+          selector:
+            select:
+              custom_value: true
+              options:
+                - frost
+                - eco
+                - comfort
+                - boost
+        medium_preset:
+          name: Medium-probability preset
+          description: >
+            Predicted return with medium probability (between the medium and high thresholds).
+          default: eco
+          selector:
+            select:
+              custom_value: true
+              options:
+                - frost
+                - eco
+                - comfort
+                - boost
+        absent_preset:
+          name: Absent preset
+          description: >
+            Nobody home and no likely return. VTherm's `away` preset is NOT selectable when its presence feature is disabled, so the default is `frost`.
+          default: frost
+          selector:
+            select:
+              custom_value: true
+              options:
+                - frost
+                - eco
+                - comfort
+                - boost
+        unused_preset:
+          name: Unused-zone preset
+          description: >
+            Someone home but the zone is outside its schedule.
+          default: eco
+          selector:
+            select:
+              custom_value: true
+              options:
+                - frost
+                - eco
+                - comfort
+                - boost
+        night_preset:
+          name: Night preset for day zones
+          description: >
+            Day zones while the bed switch is on.
+          default: eco
+          selector:
+            select:
+              custom_value: true
+              options:
+                - frost
+                - eco
+                - comfort
+                - boost
+    advanced:
+      name: Thresholds and logging
+      icon: mdi:tune
+      collapsed: true
+      input:
+        high_threshold:
+          name: High probability threshold (comfort)
+          default: 70
+          selector:
+            number:
+              min: 1
+              max: 100
+              unit_of_measurement: "%"
+        medium_threshold:
+          name: Medium probability threshold (eco)
+          default: 40
+          selector:
+            number:
+              min: 1
+              max: 100
+              unit_of_measurement: "%"
+        hysteresis:
+          name: Hysteresis
+          default: 5
+          selector:
+            number:
+              min: 0
+              max: 20
+              unit_of_measurement: "%"
+        log_decisions:
+          name: Write decisions to the logbook
+          default: false
+          selector:
+            boolean: {}
+
+mode: queued
+max: 5
+max_exceeded: silent
+
+trigger_variables:
+  t_schedule: !input schedule_entity
+  t_bed: !input bed_switch
+  t_occupancy: !input occupancy_sensor
+
+triggers:
+  - trigger: homeassistant
+    event: start
+  - trigger: time_pattern
+    minutes: /2
+  - trigger: state
+    entity_id:
+      - !input house_probability_sensor
+      - !input house_eta_sensor
+      - !input returning_sensor
+      - !input someone_home_entity
+    to: null
+  - trigger: state
+    entity_id: !input climates
+    to: null
+  # Optional entities cannot go in a state trigger when empty: template triggers
+  # fire on each on/off transition instead (the 2-minute tick is the safety net).
+  - trigger: template
+    value_template: "{{ t_schedule != '' and is_state(t_schedule, 'on') }}"
+  - trigger: template
+    value_template: "{{ t_schedule != '' and is_state(t_schedule, 'off') }}"
+  - trigger: template
+    value_template: "{{ t_bed != '' and is_state(t_bed, 'on') }}"
+  - trigger: template
+    value_template: "{{ t_bed != '' and is_state(t_bed, 'off') }}"
+  - trigger: template
+    value_template: "{{ t_occupancy != '' and is_state(t_occupancy, 'on') }}"
+  - trigger: template
+    value_template: "{{ t_occupancy != '' and is_state(t_occupancy, 'off') }}"
+
+variables:
+  climates: !input climates
+  zone_type: !input zone_type
+  schedule_entity: !input schedule_entity
+  occupancy_sensor: !input occupancy_sensor
+  bed_switch: !input bed_switch
+  prob_sensor: !input house_probability_sensor
+  eta_sensor: !input house_eta_sensor
+  returning_sensor: !input returning_sensor
+  someone_home_entity: !input someone_home_entity
+  act_only_live: !input act_only_live
+  preheat_fixed: !input preheat_minutes
+  preheat_sensor: !input preheat_sensor
+  comfort_preset: !input comfort_preset
+  medium_preset: !input medium_preset
+  absent_preset: !input absent_preset
+  unused_preset: !input unused_preset
+  night_preset: !input night_preset
+  high_th: !input high_threshold
+  medium_th: !input medium_threshold
+  hyst: !input hysteresis
+  log_decisions: !input log_decisions
+
+  climate_list: "{{ [climates] if climates is string else climates | list }}"
+  now_ts: "{{ as_timestamp(now()) }}"
+
+  # ZoneInputs.someone_home
+  someone_home: >-
+    {% set e = someone_home_entity | default('', true) %}
+    {% set occ = state_attr(prob_sensor, 'occupied') == true %}
+    {% if not e %}{{ occ }}
+    {% elif e.startswith('zone.') %}{{ occ or states(e) | int(0) > 0 }}
+    {% else %}{{ occ or states(e) in ['home', 'on'] }}{% endif %}
+
+  # ZoneInputs.house_eta (0 = none)
+  eta_ts: "{{ as_timestamp(states(eta_sensor), 0) | float(0) }}"
+
+  # ZoneInputs.house_probability, in % (0..100). The house sensor is 100 while
+  # someone is home: then use its `away_probability` attribute if present, else
+  # 100 when an ETA exists (the ETA is only published for returning persons).
+  probability: >-
+    {% if state_attr(prob_sensor, 'occupied') == true %}
+      {% set a = state_attr(prob_sensor, 'away_probability') %}
+      {% if is_number(a) %}{{ a | float }}{% elif eta_ts > 0 %}100{% else %}0{% endif %}
+    {% else %}{{ states(prob_sensor) | float(0) }}{% endif %}
+
+  # ZoneInputs.preheat_minutes: the sensor wins when numeric
+  preheat_min: >-
+    {% set v = states(preheat_sensor) if preheat_sensor else '' %}
+    {{ [v | float if is_number(v) else preheat_fixed | float(30), 0] | max }}
+
+  # ZoneInputs.schedule -> (sched_on, sched_next_ts); next_event 0 = None
+  has_schedule: "{{ schedule_entity not in ['', none] }}"
+  sched_on: "{{ has_schedule and is_state(schedule_entity, 'on') }}"
+  sched_next_ts: >-
+    {{ as_timestamp(state_attr(schedule_entity, 'next_event'), 0) | float(0)
+       if has_schedule else 0 }}
+  # schedule_active_at(state_on, next_event, now)
+  sched_active_now: >-
+    {% if not has_schedule %}{{ true }}
+    {% elif sched_on %}{{ sched_next_ts == 0 or now_ts < sched_next_ts }}
+    {% else %}{{ sched_next_ts != 0 and now_ts >= sched_next_ts }}{% endif %}
+
+  bed_on: "{{ bed_switch not in ['', none] and is_state(bed_switch, 'on') }}"
+  occupied_zone: "{{ occupancy_sensor not in ['', none] and is_state(occupancy_sensor, 'on') }}"
+
+  # ZoneInputs.prediction_enabled ("act only in live mode")
+  prediction_enabled: >-
+    {% if not act_only_live %}{{ true }}
+    {% else %}{{ state_attr(returning_sensor, 'mode') == 'live'
+                 or state_attr(returning_sensor, 'advisory') == false }}{% endif %}
+
+  # decide_preset() part shared by all thermostats of the zone (no current preset):
+  # bed rule and base preset.
+  bed_preset: >-
+    {% if bed_on and someone_home %}
+      {{ night_preset if zone_type == 'day' else comfort_preset }}
+    {% else %}{% endif %}
+  base_preset: >-
+    {% if not someone_home %}{{ absent_preset }}
+    {% elif occupied_zone or not has_schedule or sched_active_now %}{{ comfort_preset }}
+    {% else %}{{ unused_preset }}{% endif %}
+  base_reason: >-
+    {% if not someone_home %}nobody home
+    {% elif occupied_zone %}someone home, zone occupied
+    {% elif not has_schedule %}someone home, zone has no schedule
+    {% elif sched_active_now %}someone home, zone schedule active
+    {% else %}someone home, zone outside schedule{% endif %}
+  # _return_candidate() part that does not depend on the current preset.
+  # window: now >= eta - preheat (also true when the ETA is already past);
+  # schedule evaluated at arrival = max(eta, now).
+  return_applicable: >-
+    {% if not prediction_enabled or eta_ts == 0 %}{{ false }}
+    {% elif now_ts < eta_ts - preheat_min * 60 %}{{ false }}
+    {% elif not has_schedule %}{{ true }}
+    {% else %}
+      {% set arrival = [eta_ts, now_ts] | max %}
+      {% if sched_on %}{{ sched_next_ts == 0 or arrival < sched_next_ts }}
+      {% else %}{{ sched_next_ts != 0 and arrival >= sched_next_ts }}{% endif %}
+    {% endif %}
+  return_reason: >-
+    {% if not prediction_enabled %}prediction ignored (not live)
+    {% elif eta_ts == 0 %}no return predicted
+    {% elif now_ts < eta_ts - preheat_min * 60 %}return ETA {{ eta_ts | timestamp_custom('%H:%M') }} outside pre-heat window
+    {% elif not return_applicable %}zone not scheduled at ETA {{ eta_ts | timestamp_custom('%H:%M') }}
+    {% else %}return probability {{ probability | round(0) }}% ETA {{ eta_ts | timestamp_custom('%H:%M') }}{% endif %}
+
+actions:
+  - repeat:
+      for_each: "{{ climate_list }}"
+      sequence:
+        - variables:
+            ent: "{{ repeat.item }}"
+            current: "{{ state_attr(repeat.item, 'preset_mode') | default('none', true) }}"
+            available: "{{ state_attr(repeat.item, 'preset_modes') or [] }}"
+            # ZoneInputs.protection_active, from VTherm 10.x attributes
+            protection: >-
+              {% set e = repeat.item %}
+              {% set wm = state_attr(e, 'window_manager') or {} %}
+              {% set sm = state_attr(e, 'safety_manager') or {} %}
+              {% set pm = state_attr(e, 'power_manager') or {} %}
+              {% set ss = state_attr(e, 'specific_states') or {} %}
+              {% set window_open = (wm.get('window_state') == 'on'
+                                    or wm.get('window_auto_state') == 'on')
+                                   and wm.get('is_window_bypass') != true %}
+              {{ states(e) in ['off', 'unavailable', 'unknown']
+                 or window_open
+                 or sm.get('safety_state') == 'on'
+                 or pm.get('overpowering_state') == 'on'
+                 or ss.get('is_locked') == true
+                 or state_attr(e, 'preset_mode') in ['safety', 'power'] }}
+            # decide_preset(): returns {'preset': name or '', 'reason': text}
+            decision: >-
+              {% macro rank(p) -%}
+                {%- if p in [none, '', 'none'] -%}-1
+                {%- elif p == comfort_preset -%}2
+                {%- elif p == medium_preset -%}1
+                {%- elif p == absent_preset -%}0
+                {%- else -%}{{ {'frost': 0, 'away': 0, 'eco': 1, 'comfort': 2, 'boost': 3}.get(p, 1) }}
+                {%- endif -%}
+              {%- endmacro %}
+              {% if protection %}
+                {% set t, r = '', 'protection active (window/safety/power/off): not touching' %}
+              {% elif bed_preset | trim != '' %}
+                {% set t = bed_preset | trim %}
+                {% set r = 'bed mode: day zone set to night preset' if zone_type == 'day'
+                           else 'bed mode: night zone kept comfortable' %}
+              {% else %}
+                {# _return_candidate() with hysteresis on the current preset #}
+                {% set cur = rank(current) | int %}
+                {% set hi = high_th - hyst if cur >= 2 else high_th %}
+                {% set med = medium_th - hyst if cur >= 1 else medium_th %}
+                {% if not return_applicable %}{% set cand = '' %}
+                {% elif probability >= hi %}{% set cand = comfort_preset %}
+                {% elif probability >= med %}{% set cand = medium_preset %}
+                {% else %}{% set cand = absent_preset %}{% endif %}
+                {% if someone_home %}
+                  {# never downgrade because of another person's return #}
+                  {% if cand != '' and rank(cand) | int > rank(base_preset | trim) | int %}
+                    {% set t, r = cand, return_reason | trim ~ ' (upgrade over: ' ~ base_reason | trim ~ ')' %}
+                  {% else %}
+                    {% set t, r = base_preset | trim, base_reason | trim %}
+                  {% endif %}
+                {% elif cand != '' %}
+                  {% set t, r = cand, return_reason | trim %}
+                {% else %}
+                  {% set t, r = absent_preset, base_reason | trim ~ '; ' ~ return_reason | trim %}
+                {% endif %}
+              {% endif %}
+              {{ {'preset': t, 'reason': r} }}
+        - if:
+            - condition: template
+              value_template: >-
+                {{ decision.preset != '' and decision.preset != current
+                   and decision.preset in available }}
+          then:
+            - action: climate.set_preset_mode
+              target:
+                entity_id: "{{ ent }}"
+              data:
+                preset_mode: "{{ decision.preset }}"
+        - if:
+            - condition: template
+              value_template: "{{ log_decisions and decision.preset not in ['', current] }}"
+          then:
+            - action: logbook.log
+              data:
+                name: Home Return Predictor
+                entity_id: "{{ ent }}"
+                message: >-
+                  {{ current }} -> {{ decision.preset }} ({{ decision.reason }}{{ ''
+                  if decision.preset in available
+                  else '; preset not available on this thermostat, not applied' }})
