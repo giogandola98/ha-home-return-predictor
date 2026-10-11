@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: "check"
+      - uses: astral-sh/ruff-action@v3
+        with:
+          args: "format --check --diff"
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: requirements_test.txt
+      - run: pip install -r requirements_test.txt
+      - name: Pure model tests (no Home Assistant)
+        run: pytest tests/model -q
+      - name: Integration tests
+        run: pytest tests/integration -q
+      - name: Simulation smoke test
+        run: python scripts/simulate.py --days 45 --seed 1
