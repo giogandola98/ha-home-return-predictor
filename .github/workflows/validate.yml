@@ -21,5 +21,15 @@ jobs:
       - uses: hacs/action@main
         with:
           category: integration
-          # Private repo without brand assets: skip checks that need public metadata.
-          ignore: brands description topics
+          # Private repo: HACS cannot download hacs.json / manifest.json without auth, so
+          # those two checks run offline below (and hassfest validates the manifest).
+          ignore: brands description topics hacsjson integration_manifest
+
+  hacs-offline:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - run: python scripts/validate_hacs.py
