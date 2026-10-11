@@ -285,3 +285,16 @@ def test_log_entry_round_trip_keeps_new_fields() -> None:
         x=[0.5] * N_CHALLENGER_FEATURES,
     )
     assert LogEntry.from_dict(json.loads(json.dumps(entry.to_dict()))) == entry
+
+
+def test_from_dict_rejects_cyclic_tree() -> None:
+    from hrp_core.challenger import GBMChallenger
+
+    payload = {
+        "trained_on": 500,
+        "model": {
+            "baseline": 0.0,
+            "trees": [{"f": [0, -1], "t": [0.5, 0.0], "l": [0, 1], "r": [1, 1], "v": [0.0, 0.1]}],
+        },
+    }
+    assert not GBMChallenger.from_dict(payload).trained

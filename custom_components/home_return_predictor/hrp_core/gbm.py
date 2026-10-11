@@ -288,6 +288,36 @@ class HistGBM:
         }
 
     @staticmethod
+    def validate_exported(model: Any, n_features: int) -> bool:
+        """Structural check of an exported model (guards against corrupt stored payloads).
+
+        Children must come after their parent (so traversal always terminates), feature
+        indices must be in range and every number finite.
+        """
+        try:
+            if not math.isfinite(float(model["baseline"])):
+                return False
+            for tree in model["trees"]:
+                f, t, left, right, v = tree["f"], tree["t"], tree["l"], tree["r"], tree["v"]
+                n = len(f)
+                if n == 0 or not (len(t) == len(left) == len(right) == len(v) == n):
+                    return False
+                for i in range(n):
+                    if not math.isfinite(float(v[i])):
+                        return False
+                    if f[i] < 0:
+                        continue
+                    if not (isinstance(f[i], int) and f[i] < n_features):
+                        return False
+                    if not (i < left[i] < n and i < right[i] < n):
+                        return False
+                    if not math.isfinite(float(t[i])):
+                        return False
+        except (KeyError, TypeError, ValueError, IndexError):
+            return False
+        return True
+
+    @staticmethod
     def predict_proba_exported(model: dict[str, Any], row: Sequence[float]) -> float:
         """Probability of the positive class for one row (pure Python, no numpy)."""
         raw = float(model["baseline"])

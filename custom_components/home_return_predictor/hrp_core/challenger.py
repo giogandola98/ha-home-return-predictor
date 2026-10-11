@@ -170,6 +170,8 @@ class GBMChallenger:
             return ch
         try:
             if isinstance(data.get("model"), dict):
+                if not HistGBM.validate_exported(data["model"], N_CHALLENGER_FEATURES):
+                    return cls()
                 ch._model = data["model"]
             elif data.get("constant") is not None:
                 ch._constant = float(data["constant"])

@@ -196,3 +196,25 @@ def test_import_without_numpy(monkeypatch, fitted, reload_gbm):
 
 def test_numpy_available():
     assert numpy_available() is True
+
+
+def test_validate_exported_rejects_corrupt_payloads() -> None:
+    import random
+
+    rng = random.Random(3)
+    X = [[rng.random(), rng.random()] for _ in range(400)]
+    y = [int(a + b > 1.0) for a, b in X]
+    model = HistGBM(max_iter=10).fit(X, y).export()
+    assert HistGBM.validate_exported(model, 2)
+
+    cyclic = json.loads(json.dumps(model))
+    tree = next(t for t in cyclic["trees"] if t["f"][0] >= 0)
+    tree["l"][0] = 0  # child pointing back to its parent -> endless traversal
+    assert not HistGBM.validate_exported(cyclic, 2)
+
+    out_of_range = json.loads(json.dumps(model))
+    tree = next(t for t in out_of_range["trees"] if t["f"][0] >= 0)
+    tree["f"][0] = 7
+    assert not HistGBM.validate_exported(out_of_range, 2)
+
+    assert not HistGBM.validate_exported({"trees": []}, 2)
