@@ -11,6 +11,7 @@ Stored document (``.storage/home_return_predictor.<entry_id>``)::
           "is_home": false,        # presence at last save (catch up on restart)
           "left_at": "2026-...",   # start of the current absence (ISO) or null
           "event_left_at": "...",  # absence whose return event already fired
+          "bootstrapped": true,  # recorder history merged successfully at least once
         }
       }
     }

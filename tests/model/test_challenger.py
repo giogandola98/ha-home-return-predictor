@@ -298,3 +298,28 @@ def test_from_dict_rejects_cyclic_tree() -> None:
         },
     }
     assert not GBMChallenger.from_dict(payload).trained
+
+
+def test_restart_does_not_make_challenger_due_again(shift_model) -> None:  # type: ignore[no-untyped-def]
+    """Regression: the last training time was not persisted, so every restart re-evaluated
+    the challenger on almost the same holdout and each run counted as a promotion "win"."""
+    model, tl = shift_model
+    now = tl.absences[-1].returned_at
+    copy = KernelBayesReturnModel.from_dict(model.to_dict(), CONFIG)
+    copy.train_challenger(now)
+    restarted = KernelBayesReturnModel.from_dict(json.loads(json.dumps(copy.to_dict())), CONFIG)
+    assert not restarted.challenger_due(now + timedelta(minutes=5))
+    assert restarted.challenger_due(now + timedelta(hours=6))
+
+
+def test_failed_challenger_training_backs_off(shift_model) -> None:  # type: ignore[no-untyped-def]
+    """Regression: a crashing fit left the challenger due, so it was retried every update."""
+    model, tl = shift_model
+    now = tl.absences[-1].returned_at
+    copy = KernelBayesReturnModel.from_dict(model.to_dict(), CONFIG)
+    # independent of what other tests did to the shared model: pick a moment when it is due
+    attempt = now + timedelta(hours=7)
+    assert copy.challenger_due(attempt)
+    copy.note_challenger_failure(attempt)
+    assert not copy.challenger_due(attempt + timedelta(minutes=2))
+    assert copy.challenger_due(attempt + timedelta(hours=6))

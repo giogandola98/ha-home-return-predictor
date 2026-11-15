@@ -68,6 +68,7 @@ from .const import (
     RETURNING_OFF_HYSTERESIS,
 )
 from .history import (
+    HistoryLoadError,
     HomeZone,
     async_load_holidays,
     async_load_person_history,
@@ -112,6 +113,8 @@ class PersonRuntime:
     returning: bool = False
     snapshot: dict[str, Any] | None = None  # last JSON-safe model state
     dirty: bool = True  # model changed since the last snapshot
+    bootstrapped: bool = False  # recorder history merged at least once (persisted)
+    last_error: str | None = None  # last per-person update error (logged once)
     # Serialises every access to ``model`` (always in the executor) so the model
     # is never used concurrently. Only held for short jobs.
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -379,10 +382,14 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                 is_home=pdata.get("is_home"),
                 left_at=_parse_dt(pdata.get("left_at")),
                 event_left_at=_parse_dt(pdata.get("event_left_at")),
+                bootstrapped=bool(pdata.get("bootstrapped")),
             )
-            if model is None:
+            # Bootstrap until it has really succeeded once: a failed or interrupted first
+            # bootstrap must not leave the person on an empty model forever. Re-merging is
+            # safe (episodes are de-duplicated by departure time).
+            if model is None or not runtime.bootstrapped:
                 to_bootstrap.append(person_id)
-            else:
+            if model is not None:
                 runtime.snapshot = pdata["model"]
                 runtime.dirty = False
             self.persons[person_id] = runtime
@@ -640,6 +647,7 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         now = dt_util.utcnow()
         holiday = self._is_holiday()
         results: dict[str, PersonResult] = {}
+        failures: dict[str, Exception] = {}
         async with self._lock:
             for person_id, runtime in self.persons.items():
                 runtime.prune_fixes(now)
@@ -660,11 +668,15 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                         runtime, self._compute, runtime, model_input
                     )
                 except (ArithmeticError, KeyError, TypeError, ValueError) as err:
-                    raise UpdateFailed(
-                        translation_domain=DOMAIN,
-                        translation_key="update_failed",
-                        translation_placeholders={"person": person_id, "error": str(err)},
-                    ) from err
+                    # Isolate the failure: only this person's entities go unavailable.
+                    failures[person_id] = err
+                    if runtime.last_error != str(err):
+                        runtime.last_error = str(err)
+                        _LOGGER.warning("Prediction failed for %s: %s", person_id, err)
+                    continue
+                if runtime.last_error is not None:
+                    _LOGGER.info("Prediction for %s works again", person_id)
+                    runtime.last_error = None
                 if computed.snapshot_changed:
                     self._mark_changed()
                 prediction = computed.prediction
@@ -696,8 +708,15 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                 results[person_id] = result
                 if computed.training_due:
                     self._schedule_training(runtime, now)
+        if failures and not results:
+            person_id, err = next(iter(failures.items()))
+            raise UpdateFailed(
+                translation_domain=DOMAIN,
+                translation_key="update_failed",
+                translation_placeholders={"person": person_id, "error": str(err)},
+            ) from err
         self._schedule_save()
-        return HRPData(persons=results, house=self._aggregate(results))
+        return HRPData(persons=results, house=self._aggregate(results, list(failures)))
 
     @callback
     def _should_fire(self, runtime: PersonRuntime) -> bool:
@@ -739,6 +758,9 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
             raise
         except Exception:  # a failed challenger must never stop the champion
             _LOGGER.warning("Challenger training failed for %s", runtime.entity_id, exc_info=True)
+            # Back off until the normal retrain interval instead of retrying every update.
+            await self._async_model_job(runtime, model.note_challenger_failure, now)
+            runtime.dirty = True
             return
         finally:
             self._training.discard(runtime.entity_id)
@@ -764,14 +786,16 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         )
 
     @staticmethod
-    def _aggregate(results: dict[str, PersonResult]) -> HouseResult:
+    def _aggregate(
+        results: dict[str, PersonResult], failed: list[str] | None = None
+    ) -> HouseResult:
         persons_home = [pid for pid, r in results.items() if r.is_home is True]
         away = {
             pid: r.prediction
             for pid, r in results.items()
             if r.is_home is False and r.prediction is not None
         }
-        unknown = [pid for pid, r in results.items() if r.state_unknown]
+        unknown = [pid for pid, r in results.items() if r.state_unknown] + list(failed or [])
         returning = [pid for pid, r in results.items() if r.returning]
         away_probability = 1.0 - math.prod(1.0 - p.probability for p in away.values())
         probability: float | None
@@ -823,6 +847,7 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                     "is_home": rt.is_home,
                     "left_at": rt.left_at.isoformat() if rt.left_at else None,
                     "event_left_at": rt.event_left_at.isoformat() if rt.event_left_at else None,
+                    "bootstrapped": rt.bootstrapped,
                 }
                 for pid, rt in self.persons.items()
             },
@@ -864,9 +889,13 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         holidays = await async_load_holidays(self.hass, self.holiday_calendar, HISTORY_DAYS)
         for person_id in person_ids or list(self.persons):
             runtime = self.persons[person_id]
-            transitions, fixes = await async_load_person_history(
-                self.hass, person_id, self.home_zone_id, self.home_zone, HISTORY_DAYS
-            )
+            try:
+                transitions, fixes = await async_load_person_history(
+                    self.hass, person_id, self.home_zone_id, self.home_zone, HISTORY_DAYS
+                )
+            except HistoryLoadError as err:
+                _LOGGER.warning("%s; will retry on the next start", err)
+                continue
             _LOGGER.debug(
                 "History for %s: %d transitions, %d fixes", person_id, len(transitions), len(fixes)
             )
@@ -889,6 +918,9 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                     )
                 ):
                     runtime.left_at = last.ts
+                    self._mark_changed()
+                if "recorder" in self.hass.config.components and not runtime.bootstrapped:
+                    runtime.bootstrapped = True
                     self._mark_changed()
                 await self._async_snapshot_dirty([person_id])
         self._schedule_save()
