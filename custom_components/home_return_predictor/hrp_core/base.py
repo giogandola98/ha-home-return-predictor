@@ -72,6 +72,8 @@ class ModelInput:
     left_at: datetime | None  # start of current absence; None if unknown / at home
     is_holiday: bool = False
     fixes: Sequence[PositionFix] = ()  # recent fixes, oldest first
+    # last known fix, kept even when older than the GPS window (used for physical feasibility)
+    last_fix: PositionFix | None = None
 
 
 @dataclass

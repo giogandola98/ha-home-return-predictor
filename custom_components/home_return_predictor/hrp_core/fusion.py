@@ -13,6 +13,9 @@ MIN_POSITION_SPEED_KMH = 5.0
 POSITION_ETA_MAX_HORIZONS = 3.0
 MIN_HABIT_SD_MINUTES = 10.0
 IQR_TO_SD = 1.35
+# Door-to-door upper bound for ground travel (motorway car, high-speed train incl. stops).
+# Straight-line distance / this speed is a hard lower bound on the time needed to get home.
+MAX_TRAVEL_SPEED_KMH = 200.0
 
 
 def clamp(x: float, lo: float, hi: float) -> float:
@@ -34,6 +37,40 @@ def fuse_probability(prior: float, likelihood_ratio: float) -> float:
     """logit(P) = logit(clamp(prior, 0.02, 0.98)) + ln(LR), final P clamped to [0.01, 0.99]."""
     z = logit(clamp(prior, PRIOR_CLAMP, 1 - PRIOR_CLAMP)) + math.log(max(likelihood_ratio, 1e-9))
     return clamp(sigmoid(z), P_MIN, P_MAX)
+
+
+def min_travel_minutes(distance_m: float | None) -> float | None:
+    """Lower bound on the time to get home: straight-line distance at MAX_TRAVEL_SPEED_KMH."""
+    if distance_m is None:
+        return None
+    return max(distance_m, 0.0) / 1000.0 / MAX_TRAVEL_SPEED_KMH * 60.0
+
+
+def apply_feasibility(
+    probability: float,
+    eta_minutes: float | None,
+    distance_m: float | None,
+    horizon_minutes: float,
+    elapsed_minutes: float = 0.0,
+) -> tuple[float, float | None, bool]:
+    """Physical sanity check on top of any model.
+
+    If the person cannot reach home within the horizon even at MAX_TRAVEL_SPEED_KMH, a return
+    within the horizon is impossible: probability -> P_MIN. The ETA is never earlier than the
+    minimum travel time. Unknown distance -> no change.
+    ``elapsed_minutes``: age of the fix the distance comes from; the person may have been
+    travelling since, so it is subtracted from the minimum travel time.
+    Returns (probability, eta_minutes, feasible).
+    """
+    minimum = min_travel_minutes(distance_m)
+    if minimum is None:
+        return probability, eta_minutes, True
+    minimum = max(minimum - max(elapsed_minutes, 0.0), 0.0)
+    if eta_minutes is not None and eta_minutes < minimum:
+        eta_minutes = minimum
+    if minimum > horizon_minutes:
+        return P_MIN, eta_minutes, False
+    return probability, eta_minutes, True
 
 
 def position_eta_minutes(
