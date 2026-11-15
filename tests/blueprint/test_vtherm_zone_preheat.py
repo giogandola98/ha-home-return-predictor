@@ -37,6 +37,21 @@ class _Loader(yaml.SafeLoader):
 _Loader.add_constructor("!input", lambda loader, node: _Input(loader.construct_scalar(node)))
 
 
+@pytest.fixture(autouse=True)
+async def _stop_automations(hass: HomeAssistant) -> Any:
+    """Turn the automation off after each test.
+
+    The blueprint has a ``time_pattern`` trigger; left attached, its timer outlives the test
+    and newer test harnesses fail it with "Lingering timer after test".
+    """
+    yield
+    if hass.services.has_service("automation", "turn_off"):
+        await hass.services.async_call(
+            "automation", "turn_off", {"entity_id": "all"}, blocking=True
+        )
+        await hass.async_block_till_done()
+
+
 def _load() -> dict[str, Any]:
     with BLUEPRINT.open(encoding="utf-8") as fh:
         return yaml.load(fh, Loader=_Loader)  # noqa: S506 - restricted SafeLoader subclass
