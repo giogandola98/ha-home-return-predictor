@@ -70,7 +70,8 @@ through the included blueprint, but the sensors can be used in any automation.
 For each person the model combines two sources of information.
 
 1. **Habit prior.** Past absences (< 10 min discarded as GPS noise, > 36 h treated as
-   trips) are weighted by similarity to the current one:
+   trips; a home stay shorter than 5 min, e.g. driving past home or GPS jitter at the
+   zone edge, does not split an absence) are weighted by similarity to the current one:
    - similar departure time (circular kernel, roughly ±75 min);
    - same weekday / same workday-vs-holiday class (optional holiday calendar);
    - recency (configurable half-life, default 28 days), so a change of habits is
@@ -131,8 +132,16 @@ Each person has a `select.<p>_mode`:
 | `live` | Fully operational predictions, `advisory: false`. |
 | `auto` (default) | Switches to live when maturity exceeds the threshold (default 70%) and back to learning if it drops below threshold − 10 points (**hysteresis**: no flip-flopping). |
 
-The house sensors have `mode: live` if at least one of the relevant people (those
-returning, otherwise everyone) is live, and `advisory` accordingly.
+The house sensors have `mode: live` only if every away person (they all feed
+`away_probability`, `candidates` and the next ETA) is live; with nobody away, if at
+least one of the relevant people (those returning, otherwise everyone) is live.
+`advisory` follows the mode, and each entry of `candidates` has its own `advisory`.
+
+> **`advisory` does not gate anything.** In learning mode `binary_sensor.<p>_returning`
+> and `binary_sensor.house_someone_returning` still turn on and the
+> `home_return_predictor_return_detected` event still fires. Blueprints and
+> automations that should act only on live predictions must check the `advisory`
+> attribute (or the `advisory` field of the event), as the bundled blueprints do.
 
 The VTherm blueprint has the input **"Act on predictions only in live mode"**,
 **enabled by default**. While the model is learning, the blueprint behaves like a
@@ -179,7 +188,7 @@ Options (Configure):
 |---|---|---|
 | Return threshold | 0.6 | Probability above which `returning` turns on |
 | Maturity threshold | 0.7 | Maturity for the automatic switch to live |
-| Horizon | 90 min | Window of the question "will they be back within…?" |
+| Horizon | 90 min | Window of the question "will they be back within…?" Changing it restarts the scoring (prediction log, learnt fusion, champion selection); the learnt habits are kept |
 | Half-life | 28 days | How quickly old habits are forgotten |
 | Update interval | 2 min | Periodic recalculation (in addition to event-driven updates) |
 | Holiday calendar | — | Optional `calendar.*`: days with events are treated as holidays |
@@ -211,8 +220,9 @@ House:
 All house entities have the attributes `occupied`, `persons_home`,
 `returning_persons`, `mode`, `advisory`, `away_probability` and `candidates` (the
 binary sensor also `returning_names`). `candidates` is the list of away people with
-probability ≥ 25%, sorted by ETA: `[{person, probability, eta}]` with `probability`
-in **%** (like the sensors) and `eta` in ISO 8601 (or `null`).
+probability ≥ 25%, sorted by ETA: `[{person, probability, eta, advisory}]` with
+`probability` in **%** (like the sensors), `eta` in ISO 8601 (or `null`) and
+`advisory` of that person's prediction.
 
 ---
 

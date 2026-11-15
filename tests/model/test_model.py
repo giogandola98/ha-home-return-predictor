@@ -105,6 +105,7 @@ def test_log_rate_limit_and_resolution() -> None:
     assert model.resolve(local(day, 560), False) == 0  # horizons not elapsed yet
     assert model.resolve(local(day, 585), False) == 1  # 490 + 90 elapsed -> no return
     model.observe_transition(PresenceTransition(local(day, 595), True))
+    model.resolve(local(day, 600), True)  # arrival scored once the stay is confirmed
     report = model.maturity(local(day, 600))
     assert report.resolved_predictions == 3 and report.episodes == 1
     assert report.maturity == 0.0  # fewer than 30 resolved predictions

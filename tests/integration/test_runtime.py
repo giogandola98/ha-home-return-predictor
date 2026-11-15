@@ -40,6 +40,7 @@ from custom_components.home_return_predictor.history import (
 )
 from custom_components.home_return_predictor.hrp_core import KernelBayesReturnModel
 from custom_components.home_return_predictor.hrp_core.base import (
+    ModelConfig,
     Prediction,
     PresenceTransition,
 )
@@ -331,7 +332,9 @@ async def test_house_eta_from_medium_probability(
     assert dt_util.parse_datetime(eta_state.state) == expected.replace(microsecond=0)
     assert eta_state.attributes["eta_person"] == ALICE
     # Per-person candidates (probability in %), Bob excluded (< 25 %).
-    candidates = [{"person": ALICE, "probability": 45.0, "eta": expected.isoformat()}]
+    candidates = [
+        {"person": ALICE, "probability": 45.0, "eta": expected.isoformat(), "advisory": True}
+    ]
     assert eta_state.attributes["candidates"] == candidates
     prob_attrs = hass.states.get("sensor.house_return_probability").attributes
     assert prob_attrs["candidates"] == candidates
@@ -564,3 +567,110 @@ async def test_one_person_error_does_not_hide_the_others(
         await coordinator.async_refresh()
         await hass.async_block_till_done()
         assert not coordinator.last_update_success
+
+
+# --------------------------------------------------------------------------- learning consistency
+
+
+async def test_home_blip_continues_absence(
+    hass: HomeAssistant, loaded_entry: MockConfigEntry, freezer: FrozenDateTimeFactory
+) -> None:
+    """Leaving again within MIN_HOME_STAY_MINUTES keeps the original departure time."""
+    coordinator = loaded_entry.runtime_data
+    freezer.tick(timedelta(minutes=1))
+    await _leave(hass, ALICE, "Alice")
+    left_at = coordinator.persons[ALICE].left_at
+    freezer.tick(timedelta(hours=3))
+    hass.states.async_set(ALICE, "home", person_attrs("Alice"))
+    await hass.async_block_till_done()
+    freezer.tick(timedelta(minutes=2))
+    await _leave(hass, ALICE, "Alice")
+    runtime = coordinator.persons[ALICE]
+    assert runtime.left_at == left_at
+    assert await coordinator.async_episode_count(ALICE) == 0
+    await coordinator.async_refresh()
+    reason = coordinator.data.persons[ALICE].prediction.reason
+    assert reason["minutes_away"] == pytest.approx(182, abs=1)
+
+
+async def test_house_advisory_when_a_contributor_is_learning(
+    hass: HomeAssistant,
+    loaded_entry: MockConfigEntry,
+    freezer: FrozenDateTimeFactory,
+    forced: dict[str, tuple[float, timedelta | None]],
+) -> None:
+    """House numbers taken from a learning model are advisory, even if someone is live."""
+    coordinator = loaded_entry.runtime_data
+    await hass.services.async_call(
+        "select",
+        "select_option",
+        {"entity_id": "select.alice_mode", "option": "live"},
+        blocking=True,
+    )
+    freezer.tick(timedelta(minutes=1))
+    await _leave(hass, ALICE, "Alice")
+    await _leave(hass, BOB, "Bob")
+    forced[ALICE] = (0.3, timedelta(minutes=40))
+    forced[BOB] = (0.5, timedelta(minutes=20))  # learning model drives the house ETA
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    house = coordinator.data.house
+    assert coordinator.data.persons[ALICE].effective_mode == "live"
+    assert coordinator.data.persons[BOB].effective_mode == "learning"
+    assert house.eta_person == BOB and house.advisory is True
+    attrs = hass.states.get("sensor.house_next_return_eta").attributes
+    assert attrs["advisory"] is True
+    assert {c["person"]: c["advisory"] for c in attrs["candidates"]} == {
+        ALICE: False,
+        BOB: True,
+    }
+    # Only the live person away: the house numbers are live.
+    hass.states.async_set(BOB, "home", person_attrs("Bob"))
+    await hass.async_block_till_done()
+    await coordinator.async_refresh()
+    await hass.async_block_till_done()
+    assert coordinator.data.house.advisory is False
+
+
+async def test_removed_person_keeps_stored_model(
+    hass: HomeAssistant,
+    loaded_entry: MockConfigEntry,
+    hass_storage: dict[str, Any],
+) -> None:
+    """Data of a person no longer configured survives saves (re-adding restores it)."""
+    key = f"{DOMAIN}.{loaded_entry.entry_id}"
+    assert await hass.config_entries.async_unload(loaded_entry.entry_id)
+    await hass.async_block_till_done()
+    carol = {"model": {"episodes": []}, "mode": "live", "is_home": True, "bootstrapped": True}
+    hass_storage[key]["data"]["persons"]["person.carol"] = carol
+    assert await hass.config_entries.async_setup(loaded_entry.entry_id)
+    await hass.async_block_till_done()
+    assert "person.carol" not in loaded_entry.runtime_data.persons
+    assert await hass.config_entries.async_unload(loaded_entry.entry_id)
+    await hass.async_block_till_done()
+    persons = hass_storage[key]["data"]["persons"]
+    assert persons["person.carol"] == carol
+    assert set(persons) == {ALICE, BOB, "person.carol"}
+
+
+async def test_horizon_change_refreshes_stored_snapshot(
+    hass: HomeAssistant,
+    setup_home: None,
+    config_entry: MockConfigEntry,
+    hass_storage: dict[str, Any],
+) -> None:
+    """A snapshot learnt with another horizon is rewritten with the configured one."""
+    old = KernelBayesReturnModel(ModelConfig(horizon_minutes=60.0)).to_dict()
+    hass_storage[f"{DOMAIN}.{config_entry.entry_id}"] = {
+        "version": 1,
+        "minor_version": 1,
+        "key": f"{DOMAIN}.{config_entry.entry_id}",
+        "data": {
+            "schema": 1,
+            "persons": {ALICE: {"model": old, "is_home": True, "bootstrapped": True}},
+        },
+    }
+    assert await hass.config_entries.async_setup(config_entry.entry_id)
+    await hass.async_block_till_done()
+    snapshot = config_entry.runtime_data.persons[ALICE].snapshot
+    assert snapshot["horizon_minutes"] == 90.0

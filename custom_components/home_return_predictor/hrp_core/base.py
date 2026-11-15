@@ -151,6 +151,11 @@ class ReturnModel(ABC):
     ) -> AbsenceEpisode | None:
         """Record a live presence change; returns the episode closed by an arrival."""
 
+    @property
+    def away_since(self) -> datetime | None:
+        """Start of the current absence as seen by the model (None: home / unknown)."""
+        return None
+
     @abstractmethod
     def predict(self, model_input: ModelInput) -> Prediction:
         """Return the current prediction. Must not mutate state."""

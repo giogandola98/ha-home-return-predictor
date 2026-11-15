@@ -3,6 +3,7 @@ cheap observe_transition (M3), compact persistence (M4), split challenger traini
 
 from __future__ import annotations
 
+import dataclasses
 import json
 from datetime import timedelta
 
@@ -188,12 +189,14 @@ def test_observe_transition_defers_refit_to_resolve(monkeypatch: pytest.MonkeyPa
     monkeypatch.setattr(Stacker, "fit", boom)
     monkeypatch.setattr(bayes_module, "numpy_available", boom)
     ep = model.observe_transition(PresenceTransition(local(day, 705), True))
-    assert ep is not None and model._since_refit > STACKER_REFIT_EVERY
+    assert ep is not None
+    model.resolve(local(day, 706), True)  # stay not confirmed yet: nothing scored
+    assert model._since_refit == STACKER_REFIT_EVERY
 
     calls: list[int] = []
     monkeypatch.setattr(Stacker, "fit", lambda self, *a, **k: calls.append(1))
     monkeypatch.setattr(bayes_module, "numpy_available", lambda: False)
-    model.resolve(local(day, 706), True)
+    model.resolve(local(day, 710), True)
     assert calls == [1] and model._since_refit == 0
     assert model.selector.champion == KERNEL_BAYES
 
@@ -266,3 +269,34 @@ def test_split_training_matches_wrapper_and_fit_touches_no_model() -> None:
     model.enable_challenger(False)
     off = model.apply_challenger(KernelBayesReturnModel.fit_challenger(snapshot, now), now)
     assert not off["trained"] and off["reason"] == "disabled"
+
+
+# ------------------------------------------------------------------ horizon change
+def test_horizon_change_discards_horizon_dependent_state(
+    long_model: tuple[KernelBayesReturnModel, object],
+) -> None:
+    """A new horizon redefines the target: log/stacker/selection go, habits stay."""
+    model, _tl = long_model
+    state = model.to_dict()
+    assert state["horizon_minutes"] == CONFIG.horizon_minutes
+    assert model._log.resolved and model.stacker.trained_on > 0
+    now = local(DEFAULT_START + timedelta(days=121), 0)
+
+    same = KernelBayesReturnModel.from_dict(state, CONFIG)
+    assert len(same._log.resolved) == len(model._log.resolved)
+
+    other = dataclasses.replace(CONFIG, horizon_minutes=45.0)
+    changed = KernelBayesReturnModel.from_dict(state, other)
+    assert changed.episodes() == model.episodes() and changed.trips() == model.trips()
+    assert changed._log.resolved == [] and changed._log.pending == []
+    assert changed._calib_pending == []
+    assert changed.stacker.trained_on == 0 and not changed.stacker.active
+    assert changed.selector.champion == KERNEL_BAYES and changed.selector.brier == {}
+    assert changed.maturity(now).resolved_predictions == 0
+    assert changed.to_dict()["horizon_minutes"] == 45.0
+
+    # Snapshots written before the horizon was stored: assume the configured one.
+    legacy = dict(state)
+    del legacy["horizon_minutes"]
+    kept = KernelBayesReturnModel.from_dict(legacy, other)
+    assert len(kept._log.resolved) == len(model._log.resolved)

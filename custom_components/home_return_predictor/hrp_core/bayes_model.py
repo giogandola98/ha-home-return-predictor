@@ -28,6 +28,7 @@ from .challenger import (
 from .episodes import (
     KIND_EPISODE,
     KIND_TRIP,
+    MIN_HOME_STAY_MINUTES,
     build_episodes,
     classify_episode,
     make_episode,
@@ -128,6 +129,9 @@ class KernelBayesReturnModel(ReturnModel):
         self._is_home: bool | None = None
         self._away_since: datetime | None = None
         self._away_is_holiday = False
+        # Arrival whose scoring waits MIN_HOME_STAY_MINUTES (a quick new departure
+        # continues the absence): (arrived_at, left_at, away_is_holiday).
+        self._arrival: tuple[datetime, datetime, bool] | None = None
         self.calibrator = LRCalibrator()
         self.stacker = Stacker()
         self._log = PredictionLog()
@@ -242,17 +246,29 @@ class KernelBayesReturnModel(ReturnModel):
             if self._is_home is False and self._away_since is not None:
                 return None  # duplicate away report
             self._is_home = False
+            arrival = self._arrival
+            if arrival is not None and minutes_between(arrival[0], ts) < MIN_HOME_STAY_MINUTES:
+                # Brief home blip (drive-by, zone-edge jitter): the absence goes on.
+                self._arrival = None
+                arrived, self._away_since, self._away_is_holiday = arrival
+                self._forget_episode(self._away_since, arrived)
+                return None
+            self._settle_arrival()
             self._away_since = ts
             self._away_is_holiday = is_holiday
             return None
 
         was_away = self._is_home is False
         self._is_home = True
-        self._settle(arrival=ts)
         left = self._away_since
         self._away_since = None
         if not was_away or left is None:
+            if self._arrival is None:
+                self._settle(arrival=ts)
             return None
+        self._settle_arrival()
+        # Scored once the stay lasted MIN_HOME_STAY_MINUTES (see resolve).
+        self._arrival = (ts, left, self._away_is_holiday)
         ep = make_episode(left, ts, self.config.timezone, self._away_is_holiday or is_holiday)
         kind = classify_episode(ep, self.config)
         if kind == KIND_EPISODE:
@@ -263,6 +279,29 @@ class KernelBayesReturnModel(ReturnModel):
             return None
         self._prune(ts)
         return ep
+
+    def _forget_episode(self, left_at: datetime, returned_at: datetime) -> None:
+        """Drop the episode/trip closed by an arrival that turned out to be a blip."""
+
+        def keep(e: AbsenceEpisode) -> bool:
+            return not (e.left_at == left_at and e.returned_at == returned_at)
+
+        self._episodes = [e for e in self._episodes if keep(e)]
+        self._trips = [e for e in self._trips if keep(e)]
+        self._key_cache = None
+
+    def _settle_arrival(self) -> int:
+        """Score the pending predictions against a confirmed arrival."""
+        if self._arrival is None:
+            return 0
+        arrived = self._arrival[0]
+        self._arrival = None
+        return self._settle(arrival=arrived)
+
+    @property
+    def away_since(self) -> datetime | None:
+        """Start of the current absence (UTC); a brief home blip does not restart it."""
+        return self._away_since if self._is_home is False else None
 
     def _prune(self, now: datetime) -> None:
         cutoff = now - timedelta(days=EPISODE_RETENTION_HALF_LIVES * self.config.half_life_days)
@@ -732,11 +771,16 @@ class KernelBayesReturnModel(ReturnModel):
     def resolve(self, now: datetime, is_home: bool) -> int:
         now = to_utc(now)
         if is_home:
-            # Arrival is resolved by observe_transition; drop orphans of unknown outcome.
+            count = 0
+            if self._arrival is not None:
+                if minutes_between(self._arrival[0], now) < MIN_HOME_STAY_MINUTES:
+                    return 0  # a quick new departure would continue the absence
+                count = self._settle_arrival()
+            # Drop orphans of unknown outcome.
             self._log.pending = [e for e in self._log.pending if e.horizon_end >= now]
             self._calib_pending = [e for e in self._calib_pending if e.horizon_end >= now]
             self._maybe_refit(now)
-            return 0
+            return count
         count = self._settle(now=now)
         self._maybe_refit(now)
         return count
@@ -763,11 +807,18 @@ class KernelBayesReturnModel(ReturnModel):
     def to_dict(self) -> dict[str, Any]:
         return {
             "version": STATE_VERSION,
+            # Outcome definition of the logged predictions and of the learnt fusion.
+            "horizon_minutes": self.config.horizon_minutes,
             "episodes": [_episode_to_dict(e) for e in self._episodes],
             "trips": [_episode_to_dict(e) for e in self._trips],
             "is_home": self._is_home,
             "away_since": _iso(self._away_since),
             "away_is_holiday": self._away_is_holiday,
+            "arrival": (
+                [self._arrival[0].isoformat(), self._arrival[1].isoformat(), self._arrival[2]]
+                if self._arrival is not None
+                else None
+            ),
             "calibrator": self.calibrator.to_dict(),
             "stacker": self.stacker.to_dict(),
             "log": self._log.to_dict(),
@@ -793,6 +844,9 @@ class KernelBayesReturnModel(ReturnModel):
         model._is_home = data.get("is_home")
         model._away_since = _parse(data.get("away_since"))
         model._away_is_holiday = bool(data.get("away_is_holiday", False))
+        if arrival := data.get("arrival"):
+            arrived, left = datetime.fromisoformat(arrival[0]), datetime.fromisoformat(arrival[1])
+            model._arrival = (arrived, left, bool(arrival[2]))
         model.calibrator = LRCalibrator.from_dict(data.get("calibrator", {}))
         model.stacker = Stacker.from_dict(data.get("stacker", {}))
         model._log = PredictionLog.from_dict(data.get("log", {}))
@@ -808,4 +862,25 @@ class KernelBayesReturnModel(ReturnModel):
             model._challenger = GBMChallenger.from_dict(data.get("challenger"))
         model._generation = int(data.get("generation", 0))
         model._last_training = _parse(data.get("last_training"))
+        stored_horizon = data.get("horizon_minutes")  # missing: older snapshot, keep
+        if stored_horizon is not None and float(stored_horizon) != config.horizon_minutes:
+            model.discard_scoring()
         return model
+
+    def discard_scoring(self) -> None:
+        """Forget everything scored against the horizon; keep habits and GPS calibration.
+
+        Called when the horizon changed: logged outcomes, stacker/GBM features
+        (normalised by the horizon) and the champion selection describe another
+        target. Episodes and trips are horizon-independent and stay.
+        """
+        self._log = PredictionLog()
+        self._calib_pending = []
+        self._segments = CalibrationSegments()
+        self._since_refit = 0
+        self.stacker = Stacker()
+        self.selector = Selector()
+        self._challenger = GBMChallenger()
+        self._last_training = None
+        self._resolved_total = self._resolved_at_training = 0
+        self._generation += 1

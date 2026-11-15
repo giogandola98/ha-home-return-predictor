@@ -112,6 +112,7 @@ class HRPHouseEntity(HRPEntity):
                     "person": pid,
                     "probability": round(probability * 100, 1),
                     "eta": eta.isoformat() if eta else None,
+                    "advisory": self.coordinator.data.persons[pid].advisory,
                 }
                 for pid, probability, eta in house.candidates
             ],
