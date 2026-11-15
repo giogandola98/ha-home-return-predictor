@@ -108,6 +108,7 @@ class PersonRuntime:
     left_at: datetime | None = None
     event_left_at: datetime | None = None  # absence for which the return event fired
     fixes: deque[PositionFix] = field(default_factory=deque)
+    last_fix: PositionFix | None = None  # survives pruning; cleared when home
     trackers: tuple[str, ...] = ()
     returning: bool = False
     snapshot: dict[str, Any] | None = None  # last JSON-safe model state
@@ -125,6 +126,8 @@ class PersonRuntime:
             ):
                 return False
         self.fixes.append(fix)
+        if self.last_fix is None or fix.ts >= self.last_fix.ts:
+            self.last_fix = fix
         if len(self.fixes) > 1 and self.fixes[-2].ts > fix.ts:
             self.fixes = deque(sorted(self.fixes, key=lambda f: f.ts))
         return True
@@ -574,6 +577,7 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
             runtime.dirty = True
             if transition.is_home:
                 runtime.fixes.clear()
+                runtime.last_fix = None
         if not self._unloading:
             await self.async_request_refresh()
 
@@ -653,6 +657,7 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                         left_at=None if is_home else runtime.left_at,
                         is_holiday=holiday,
                         fixes=tuple(runtime.fixes),
+                        last_fix=runtime.last_fix,
                     )
                 )
                 try:
@@ -852,6 +857,7 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
             runtime = self.persons[person_id]
             await self._async_model_job(runtime, self._reset_model, runtime)
             runtime.fixes.clear()
+            runtime.last_fix = None
             runtime.returning = False
             runtime.effective_mode = None
             runtime.dirty = True

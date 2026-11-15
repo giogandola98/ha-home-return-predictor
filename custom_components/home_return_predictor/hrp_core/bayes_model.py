@@ -36,7 +36,13 @@ from .episodes import (
     to_utc,
 )
 from .evidence import CalibrationSegments, LRCalibrator, compute_evidence
-from .fusion import combine_eta, fuse_probability, position_eta_minutes
+from .fusion import (
+    apply_feasibility,
+    combine_eta,
+    fuse_probability,
+    min_travel_minutes,
+    position_eta_minutes,
+)
 from .maturity import (
     LogEntry,
     PredictionLog,
@@ -343,6 +349,18 @@ class KernelBayesReturnModel(ReturnModel):
         )
         pos_min = position_eta_minutes(ev.distance_m, ev.speed_kmh, cfg.horizon_minutes)
         eta_min, eta_source = combine_eta(habit_min, prior.eta_iqr_minutes, pos_min)
+        # Physical sanity check, whatever model is serving: too far to make it within the horizon.
+        # A stationary phone reports rarely, so fall back to the last known fix and its age.
+        feas_distance, feas_age = ev.distance_m, 0.0
+        if feas_distance is None and model_input.last_fix is not None:
+            feas_distance = model_input.last_fix.distance_m
+            feas_age = max(minutes_between(to_utc(model_input.last_fix.ts), now), 0.0)
+        probability, eta_min, feasible = apply_feasibility(
+            probability, eta_min, feas_distance, cfg.horizon_minutes, feas_age
+        )
+        travel_min = min_travel_minutes(feas_distance)
+        if travel_min is not None:
+            travel_min = max(travel_min - feas_age, 0.0)
 
         def at(minutes: float | None) -> datetime | None:
             return now + timedelta(minutes=minutes) if minutes is not None else None
@@ -360,6 +378,8 @@ class KernelBayesReturnModel(ReturnModel):
             "fusion": FUSION_ALIAS[active],
             "active_model": active,
             "probability_bayes": round(p_bayes, 4),
+            "feasible": feasible,
+            "min_travel_minutes": round(travel_min, 1) if travel_min is not None else None,
         }
         return Prediction(
             probability=probability,
