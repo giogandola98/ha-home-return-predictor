@@ -11,6 +11,9 @@ from .base import AbsenceEpisode, ModelConfig, PresenceTransition
 KIND_DROP = "drop"
 KIND_TRIP = "trip"
 KIND_EPISODE = "episode"
+# A home stay shorter than this (driving past home, GPS jitter at the zone edge) does
+# not end the absence: the absences around it are merged.
+MIN_HOME_STAY_MINUTES = 5.0
 
 
 def to_utc(dt: datetime) -> datetime:
@@ -79,21 +82,33 @@ def build_episodes(
     """Pair away -> home transitions into filtered episodes and trips."""
     hol = holiday_dates(holidays, config.timezone)
     result = EpisodeBuild()
+    # Last arrival: (time, departure of the absence it closed, list it was added to).
+    last: tuple[datetime, datetime, list[AbsenceEpisode] | None] | None = None
     for tr in sorted(transitions, key=lambda t: to_utc(t.ts)):
         if tr.is_home == result.is_home:
             continue  # duplicate state report
         if not tr.is_home:
             result.away_since = to_utc(tr.ts)
+            if last is not None and minutes_between(last[0], tr.ts) < MIN_HOME_STAY_MINUTES:
+                # Brief home blip: the previous absence goes on.
+                _arrived, result.away_since, added = last
+                if added is not None:
+                    added.pop()
+            last = None
         elif result.away_since is not None:
             left = result.away_since
             ep = make_episode(
                 left, tr.ts, config.timezone, to_local(left, config.timezone).date() in hol
             )
             kind = classify_episode(ep, config)
+            added = None
             if kind == KIND_EPISODE:
-                result.episodes.append(ep)
+                added = result.episodes
             elif kind == KIND_TRIP:
-                result.trips.append(ep)
+                added = result.trips
+            if added is not None:
+                added.append(ep)
+            last = (to_utc(tr.ts), left, added)
             result.away_since = None
         result.is_home = tr.is_home
     return result

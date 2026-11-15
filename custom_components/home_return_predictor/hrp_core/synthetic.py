@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta, tzinfo
 
 from .base import ModelInput, PositionFix, Prediction, PresenceTransition, ReturnModel
+from .episodes import MIN_HOME_STAY_MINUTES
 
 try:
     from zoneinfo import ZoneInfo
@@ -300,6 +301,7 @@ def replay_online(
             yield StepRecord(t, pred, truth, logged)
             t += step
         model.observe_transition(PresenceTransition(ab.returned_at, True))
-        model.resolve(ab.returned_at, True)
+        # Like the integration's periodic update: the arrival is scored once confirmed.
+        model.resolve(ab.returned_at + timedelta(minutes=MIN_HOME_STAY_MINUTES), True)
         if on_absence_end is not None:
             on_absence_end(ab.returned_at)

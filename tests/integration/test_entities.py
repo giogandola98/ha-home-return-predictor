@@ -195,3 +195,6 @@ async def test_return_event_rising_edge(
     assert house.state == "on"
     assert house.attributes["returning_persons"] == [BOB]
     assert house.attributes["returning_names"] == ["Bob"]
+    # advisory is informative only: learning still turns the sensors on (see README).
+    assert house.attributes["advisory"] is True
+    assert hass.states.get("binary_sensor.bob_returning").attributes["advisory"] is True

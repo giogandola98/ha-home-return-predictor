@@ -316,6 +316,8 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         # it moved since the last scheduled save.
         self._data_version = 0
         self._saved_version = 0
+        # Stored data of persons no longer configured: kept so re-adding restores them.
+        self._stored_other_persons: dict[str, Any] = {}
 
     # ------------------------------------------------------------------ helpers
 
@@ -366,6 +368,9 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         self.config_entry.async_on_unload(self._async_unsubscribe)
         stored = await self.storage.async_load()
         stored_persons: dict[str, Any] = stored.get("persons", {})
+        self._stored_other_persons = {
+            pid: pdata for pid, pdata in stored_persons.items() if pid not in self.person_ids
+        }
         to_bootstrap: list[str] = []
         for person_id in self.person_ids:
             pdata: dict[str, Any] = stored_persons.get(person_id) or {}
@@ -394,17 +399,26 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                 to_bootstrap.append(person_id)
             if model is not None:
                 runtime.snapshot = pdata["model"]
-                runtime.dirty = False
+                # Learnt with another horizon: from_dict discarded the scoring state.
+                stored_horizon = pdata["model"].get("horizon_minutes")
+                runtime.dirty = stored_horizon is not None and float(stored_horizon) != (
+                    self.model_config.horizon_minutes
+                )
+                if runtime.dirty:
+                    _LOGGER.info(
+                        "Horizon of %s changed (%s -> %s min): prediction log and learnt "
+                        "fusion reset, habits kept",
+                        person_id,
+                        stored_horizon,
+                        self.model_config.horizon_minutes,
+                    )
             self.persons[person_id] = runtime
             state = self.hass.states.get(person_id)
             runtime.trackers = self._trackers_of(state)
             if state is not None:
                 transition = self._handle_presence(runtime, state, at_setup=True)
                 if transition is not None:
-                    await self._async_model_job(
-                        runtime, runtime.model.observe_transition, transition, self._is_holiday()
-                    )
-                    runtime.dirty = True
+                    await self._async_feed_transition(runtime, transition, self._is_holiday())
                 fix = state_to_fix(state, self.home_zone)
                 if fix is not None and runtime.is_home is False:
                     runtime.add_fix(fix)
@@ -578,15 +592,37 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         self, runtime: PersonRuntime, transition: PresenceTransition, holiday: bool
     ) -> None:
         async with self._lock:
-            await self._async_model_job(
-                runtime, runtime.model.observe_transition, transition, holiday
-            )
-            runtime.dirty = True
+            await self._async_feed_transition(runtime, transition, holiday)
             if transition.is_home:
                 runtime.fixes.clear()
                 runtime.last_fix = None
         if not self._unloading:
             await self.async_request_refresh()
+
+    @staticmethod
+    def _observe(
+        model: ReturnModel, transition: PresenceTransition, holiday: bool
+    ) -> datetime | None:
+        """Feed a presence change (executor); returns the model's absence start."""
+        model.observe_transition(transition, holiday)
+        return model.away_since
+
+    async def _async_feed_transition(
+        self, runtime: PersonRuntime, transition: PresenceTransition, holiday: bool
+    ) -> None:
+        away_since = await self._async_model_job(
+            runtime, self._observe, runtime.model, transition, holiday
+        )
+        runtime.dirty = True
+        if (
+            not transition.is_home
+            and away_since is not None
+            and runtime.left_at is not None
+            and away_since < runtime.left_at
+        ):
+            # Left again right after a brief home blip: the same absence goes on.
+            runtime.left_at = away_since
+            self._mark_changed()
 
     # ------------------------------------------------------------------ update
 
@@ -820,13 +856,15 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         )
         eta_candidates = [(eta, pid) for pid, _p, eta in candidates if eta is not None]
         next_eta, eta_person = min(eta_candidates) if eta_candidates else (None, None)
-        known = [pid for pid in results if pid not in unknown]
-        mode_source = returning or known or list(results)
-        mode = (
-            MODE_LIVE
-            if any(results[pid].effective_mode == MODE_LIVE for pid in mode_source)
-            else MODE_LEARNING
-        )
+        if away:
+            # away_probability, candidates and next ETA come from every away person:
+            # live only when none of them is still learning.
+            live = all(results[pid].effective_mode == MODE_LIVE for pid in away)
+        else:
+            known = [pid for pid in results if pid not in unknown]
+            mode_source = returning or known or list(results)
+            live = any(results[pid].effective_mode == MODE_LIVE for pid in mode_source)
+        mode = MODE_LIVE if live else MODE_LEARNING
         return HouseResult(
             probability=probability,
             occupied=bool(persons_home),
@@ -843,20 +881,17 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
     # ------------------------------------------------------------------ storage
 
     def _store_data(self) -> StoredData:
-        return {
-            "schema": STORAGE_SCHEMA,
-            "persons": {
-                pid: {
-                    "model": rt.snapshot,
-                    "mode": rt.mode,
-                    "is_home": rt.is_home,
-                    "left_at": rt.left_at.isoformat() if rt.left_at else None,
-                    "event_left_at": rt.event_left_at.isoformat() if rt.event_left_at else None,
-                    "bootstrapped": rt.bootstrapped,
-                }
-                for pid, rt in self.persons.items()
-            },
-        }
+        persons: dict[str, Any] = dict(self._stored_other_persons)
+        for pid, rt in self.persons.items():
+            persons[pid] = {
+                "model": rt.snapshot,
+                "mode": rt.mode,
+                "is_home": rt.is_home,
+                "left_at": rt.left_at.isoformat() if rt.left_at else None,
+                "event_left_at": rt.event_left_at.isoformat() if rt.event_left_at else None,
+                "bootstrapped": rt.bootstrapped,
+            }
+        return {"schema": STORAGE_SCHEMA, "persons": persons}
 
     @callback
     def _schedule_save(self, force: bool = False) -> None:

@@ -196,6 +196,7 @@ def test_drive_by_then_real_return_counts_positive() -> None:
         dist = 300 + (17 * 60 + 41 - minute) * 50_000 / 60
         _feed(model, day, 465, minute, approach_fixes(local(day, minute), dist, 50))
     model.observe_transition(PresenceTransition(local(day, 17 * 60 + 45), True))
+    model.resolve(local(day, 17 * 60 + 50), True)  # scored once the stay is confirmed
     assert model.calibrator.returned["approach_fast"] == base_r + 1  # real return: positive
     assert model.calibrator.not_returned["approach_fast"] == base_n + 1
 
