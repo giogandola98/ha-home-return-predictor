@@ -595,6 +595,15 @@ class KernelBayesReturnModel(ReturnModel):
         new = self._resolved_total - self._resolved_at_training
         return elapsed_h >= CHALLENGER_RETRAIN_HOURS or new >= CHALLENGER_RETRAIN_ENTRIES
 
+    def note_challenger_failure(self, now: datetime) -> None:
+        """Record a failed training attempt so the next one waits for the normal interval.
+
+        Without this ``challenger_due`` stays true and a heavy, failing fit is retried on
+        every update (~every 2 minutes).
+        """
+        self._last_training = to_utc(now)
+        self._resolved_at_training = self._resolved_total
+
     def challenger_snapshot(self) -> Any:
         """Cheap copy of what ``fit_challenger`` needs (call under the person lock).
 
@@ -769,6 +778,9 @@ class KernelBayesReturnModel(ReturnModel):
             "challenger_enabled": self._challenger_enabled,
             "challenger": self._challenger.to_dict(),
             "generation": self._generation,
+            # Persisted so a restart does not make the challenger immediately due again
+            # (each re-evaluation on almost the same holdout would count as a new "win").
+            "last_training": _iso(self._last_training),
         }
 
     @classmethod
@@ -795,4 +807,5 @@ class KernelBayesReturnModel(ReturnModel):
         if model._challenger_enabled:
             model._challenger = GBMChallenger.from_dict(data.get("challenger"))
         model._generation = int(data.get("generation", 0))
+        model._last_training = _parse(data.get("last_training"))
         return model

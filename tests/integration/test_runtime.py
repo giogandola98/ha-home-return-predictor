@@ -530,3 +530,37 @@ def test_build_reason_uses_shift_label() -> None:
         reason={"shift_label": "morning"},
     )
     assert "(morning)" in build_reason(prediction, left)
+
+
+# --------------------------------------------------------------------------- per-person isolation
+
+
+async def test_one_person_error_does_not_hide_the_others(
+    hass: HomeAssistant, loaded_entry: MockConfigEntry
+) -> None:
+    """A failing model only makes that person's entities unavailable."""
+    coordinator = loaded_entry.runtime_data
+    original = HRPCoordinator._compute
+
+    def _compute(self: HRPCoordinator, runtime: Any, model_input: Any) -> Any:
+        if runtime.entity_id == BOB:
+            raise ValueError("corrupt model")
+        return original(self, runtime, model_input)
+
+    with patch.object(HRPCoordinator, "_compute", _compute):
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+        assert coordinator.last_update_success
+        assert BOB not in coordinator.data.persons
+        assert ALICE in coordinator.data.persons
+        assert BOB in coordinator.data.house.persons_unknown
+        assert hass.states.get("sensor.bob_return_probability").state == "unavailable"
+        assert hass.states.get("sensor.alice_return_probability").state != "unavailable"
+
+    def _all_fail(self: HRPCoordinator, runtime: Any, model_input: Any) -> Any:
+        raise ValueError("corrupt model")
+
+    with patch.object(HRPCoordinator, "_compute", _all_fail):
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+        assert not coordinator.last_update_success

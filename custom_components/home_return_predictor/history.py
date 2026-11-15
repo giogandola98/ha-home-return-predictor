@@ -44,6 +44,10 @@ from .hrp_core.base import PositionFix, PresenceTransition
 _LOGGER = logging.getLogger(__name__)
 
 
+class HistoryLoadError(Exception):
+    """Reading the recorder failed; the caller should retry later (unlike "no data")."""
+
+
 @dataclass(frozen=True, slots=True)
 class HomeZone:
     """Snapshot of the configured home zone."""
@@ -100,7 +104,9 @@ def state_is_home(state: State, zone_id: str, zone: HomeZone | None) -> bool | N
     if zone_id == DEFAULT_HOME_ZONE:
         return state.state == STATE_HOME
     if zone is None:
-        return False
+        # Custom home zone missing (renamed, deleted or not loaded yet): no information.
+        # Answering "away" here would make everyone look away and teach the model fake absences.
+        return None
     if state.state == zone.name:
         return True
     coords = _coordinates(state)
@@ -231,6 +237,7 @@ async def async_load_person_history(
     """Load presence transitions and fixes for a person from the recorder.
 
     Returns empty lists when the recorder is not available or has no data.
+    Raises HistoryLoadError when reading fails (retry on a later start).
     """
     if "recorder" not in hass.config.components:
         _LOGGER.debug("Recorder not loaded, skipping history bootstrap for %s", person_id)
@@ -243,9 +250,8 @@ async def async_load_person_history(
         return await get_instance(hass).async_add_executor_job(
             _load_history_chunked, hass, person_id, zone_id, zone, start, end
         )
-    except (HomeAssistantError, KeyError, ValueError) as err:
-        _LOGGER.warning("Could not read history for %s: %s", person_id, err)
-        return [], []
+    except Exception as err:  # noqa: BLE001 - any recorder/database error is retryable
+        raise HistoryLoadError(f"Could not read history for {person_id}: {err}") from err
 
 
 def _event_dates(event: dict[str, Any]) -> list[date]:
