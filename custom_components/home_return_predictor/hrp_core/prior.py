@@ -80,6 +80,9 @@ class PriorResult:
     kernel_weight: float
     eta_duration_minutes: float | None  # weighted median total absence duration
     eta_iqr_minutes: float | None
+    # (total duration, kernel weight) of the past absences longer than the current one
+    # (empty beyond LONG_ABSENCE_MINUTES): the habit arrival distribution (arrival.py).
+    durations: tuple[tuple[float, float], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -184,7 +187,7 @@ def estimate_prior(
         q3 = weighted_quantile(durations, 0.75)
         if q1 is not None and q3 is not None:
             iqr = q3 - q1
-    return PriorResult(min(max(p, 0.0), 1.0), n_eff, k_total, median, iqr)
+    return PriorResult(min(max(p, 0.0), 1.0), n_eff, k_total, median, iqr, tuple(durations))
 
 
 def duration_baseline(

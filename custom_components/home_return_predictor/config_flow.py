@@ -17,6 +17,7 @@ from homeassistant.helpers.selector import (
 )
 
 from .const import (
+    CONF_ARRIVAL_QUANTILE,
     CONF_ENABLE_CHALLENGER,
     CONF_HALF_LIFE_DAYS,
     CONF_HOLIDAY_CALENDAR,
@@ -26,6 +27,7 @@ from .const import (
     CONF_PERSONS,
     CONF_RETURN_THRESHOLD,
     CONF_UPDATE_INTERVAL_MINUTES,
+    DEFAULT_ARRIVAL_QUANTILE,
     DEFAULT_ENABLE_CHALLENGER,
     DEFAULT_HALF_LIFE_DAYS,
     DEFAULT_HOME_ZONE,
@@ -103,6 +105,7 @@ class HomeReturnPredictorOptionsFlow(OptionsFlowWithReload):
             CONF_HALF_LIFE_DAYS: DEFAULT_HALF_LIFE_DAYS,
             CONF_UPDATE_INTERVAL_MINUTES: DEFAULT_UPDATE_INTERVAL_MINUTES,
             CONF_ENABLE_CHALLENGER: DEFAULT_ENABLE_CHALLENGER,
+            CONF_ARRIVAL_QUANTILE: DEFAULT_ARRIVAL_QUANTILE,
         }
         current.update({k: v for k, v in entry.options.items() if k != CONF_PERSONS})
         if user_input is not None:
@@ -119,6 +122,7 @@ class HomeReturnPredictorOptionsFlow(OptionsFlowWithReload):
                     EntitySelectorConfig(domain="calendar")
                 ),
                 vol.Optional(CONF_ENABLE_CHALLENGER): BooleanSelector(),
+                vol.Optional(CONF_ARRIVAL_QUANTILE): _number(0.05, 0.95, 0.05),
             }
         )
         return self.async_show_form(

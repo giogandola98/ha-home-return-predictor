@@ -28,6 +28,8 @@ HOUSE_ENTITIES = {
     "sensor.house_return_probability": "house_return_probability",
     "sensor.house_next_return_eta": "house_next_return_eta",
     "binary_sensor.house_someone_returning": "house_someone_returning",
+    "sensor.house_next_arrival": "house_next_arrival",
+    "sensor.house_expected_absence": "house_expected_absence",
 }
 
 

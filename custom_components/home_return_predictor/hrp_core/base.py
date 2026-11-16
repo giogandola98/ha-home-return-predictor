@@ -160,6 +160,11 @@ class ReturnModel(ABC):
     def predict(self, model_input: ModelInput) -> Prediction:
         """Return the current prediction. Must not mutate state."""
 
+    def arrival(self, model_input: ModelInput, prediction: Prediction) -> Any:
+        """Distribution of the time until the arrival home (``arrival.ArrivalDistribution``)
+        while away; None when unknown (default: not supported)."""
+        return None
+
     @abstractmethod
     def log_prediction(self, model_input: ModelInput, prediction: Prediction) -> bool:
         """Store the prediction for later scoring; returns True if it was logged."""

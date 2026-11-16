@@ -33,7 +33,8 @@
           "half_life_days": "History half-life",
           "update_interval_minutes": "Update interval",
           "holiday_calendar": "Holiday calendar",
-          "enable_sklearn_challenger": "Challenger model (gradient boosting, numpy)"
+          "enable_sklearn_challenger": "Challenger model (gradient boosting, numpy)",
+          "arrival_quantile": "Arrival quantile"
         },
         "data_description": {
           "persons": "Person entities whose return home will be predicted.",
@@ -43,7 +44,8 @@
           "half_life_days": "Older habits weigh half after this many days.",
           "update_interval_minutes": "How often predictions are recomputed, in minutes.",
           "holiday_calendar": "Optional calendar whose events mark holidays.",
-          "enable_sklearn_challenger": "Experimental. Trains a gradient boosting challenger in the background with numpy (already part of Home Assistant on most installs; installed at runtime otherwise). Single thread, every few hours, under a second on an Intel N100. It is used only while it beats the built-in model on recent, unseen predictions; otherwise the built-in model keeps working."
+          "enable_sklearn_challenger": "Experimental. Trains a gradient boosting challenger in the background with numpy (already part of Home Assistant on most installs; installed at runtime otherwise). Single thread, every few hours, under a second on an Intel N100. It is used only while it beats the built-in model on recent, unseen predictions; otherwise the built-in model keeps working.",
+          "arrival_quantile": "Quantile (0-1) of the first arrival home published by the next-arrival sensor. Preheating a room L minutes before it means heating when P(arrival within L) reaches this value: lower = warm more often, higher = save more."
         }
       }
     },
@@ -93,6 +95,12 @@
       },
       "house_next_return_eta": {
         "name": "Next return ETA"
+      },
+      "house_next_arrival": {
+        "name": "Next arrival"
+      },
+      "house_expected_absence": {
+        "name": "Expected absence"
       }
     }
   },

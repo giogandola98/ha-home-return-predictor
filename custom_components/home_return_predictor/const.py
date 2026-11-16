@@ -23,6 +23,9 @@ CONF_HOLIDAY_CALENDAR: Final = "holiday_calendar"  # optional calendar.* entity
 # scikit-learn until scikit-learn proved uninstallable on HA OS) so that existing
 # config entries keep their setting; only the UI label changed.
 CONF_ENABLE_CHALLENGER: Final = "enable_sklearn_challenger"
+# Quantile of the first arrival published by sensor.house_next_arrival: preheating
+# ``L`` minutes before it is the cost rule "P(arrival <= now + L) >= quantile".
+CONF_ARRIVAL_QUANTILE: Final = "arrival_quantile"
 
 DEFAULT_RETURN_THRESHOLD: Final = 0.6
 DEFAULT_MATURITY_THRESHOLD: Final = 0.7
@@ -30,6 +33,10 @@ DEFAULT_HORIZON_MINUTES: Final = 90
 DEFAULT_HALF_LIFE_DAYS: Final = 28
 DEFAULT_UPDATE_INTERVAL_MINUTES: Final = 2
 DEFAULT_ENABLE_CHALLENGER: Final = False
+DEFAULT_ARRIVAL_QUANTILE: Final = 0.25
+# Expected absence classes (hours, judged on the q25 of the remaining empty time)
+SHORT_ABSENCE_HOURS: Final = 4.0
+LONG_ABSENCE_HOURS: Final = 14.0
 MATURITY_HYSTERESIS: Final = 0.1
 RETURNING_OFF_HYSTERESIS: Final = 0.05  # returning stays on until p < threshold - this
 HOUSE_ETA_MIN_PROBABILITY: Final = 0.25  # away persons considered for the house ETA
@@ -68,6 +75,8 @@ KEY_MODE: Final = "mode"
 KEY_HOUSE_RETURN_PROBABILITY: Final = "house_return_probability"
 KEY_HOUSE_NEXT_RETURN_ETA: Final = "house_next_return_eta"
 KEY_HOUSE_SOMEONE_RETURNING: Final = "house_someone_returning"
+KEY_HOUSE_NEXT_ARRIVAL: Final = "house_next_arrival"
+KEY_HOUSE_EXPECTED_ABSENCE: Final = "house_expected_absence"
 HOUSE_DEVICE_SLUG: Final = "house"
 
 # Recorder bootstrap

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from homeassistant.components.sensor import (
@@ -11,20 +11,25 @@ from homeassistant.components.sensor import (
     SensorEntity,
     SensorStateClass,
 )
-from homeassistant.const import PERCENTAGE, EntityCategory
+from homeassistant.const import PERCENTAGE, EntityCategory, UnitOfTime
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import (
+    KEY_HOUSE_EXPECTED_ABSENCE,
+    KEY_HOUSE_NEXT_ARRIVAL,
     KEY_HOUSE_NEXT_RETURN_ETA,
     KEY_HOUSE_RETURN_PROBABILITY,
     KEY_MODEL_MATURITY,
     KEY_RETURN_ETA,
     KEY_RETURN_PROBABILITY,
     KEY_RETURN_REASON,
+    LONG_ABSENCE_HOURS,
+    SHORT_ABSENCE_HOURS,
 )
-from .coordinator import HRPConfigEntry, HRPCoordinator
+from .coordinator import HouseResult, HRPConfigEntry, HRPCoordinator
 from .entity import HRPHouseEntity, HRPPersonEntity
+from .hrp_core.arrival import CDF_POINTS, QUANTILES
 
 PARALLEL_UPDATES = 0
 
@@ -48,7 +53,12 @@ async def async_setup_entry(
             ModelMaturitySensor(coordinator, person_id),
             ReturnReasonSensor(coordinator, person_id),
         ]
-    entities += [HouseReturnProbabilitySensor(coordinator), HouseNextReturnEtaSensor(coordinator)]
+    entities += [
+        HouseReturnProbabilitySensor(coordinator),
+        HouseNextReturnEtaSensor(coordinator),
+        HouseNextArrivalSensor(coordinator),
+        HouseExpectedAbsenceSensor(coordinator),
+    ]
     async_add_entities(entities)
 
 
@@ -224,3 +234,111 @@ class HouseNextReturnEtaSensor(HRPHouseEntity, SensorEntity):
         if (house := self.house) is not None:
             attrs["eta_person"] = house.eta_person
         return attrs
+
+
+def _arrival_at(house: HouseResult, q: float) -> datetime | None:
+    """Time at which the first arrival has probability ``q`` (never before the next
+    update, so the timestamp stays in the future while the house is empty)."""
+    if house.arrival is None or house.arrival_now is None:
+        return None
+    minutes = house.arrival.quantile(q)
+    if minutes is None:
+        return None
+    return _in_minutes(house.arrival_now, minutes)
+
+
+def _in_minutes(now: datetime, minutes: float | None) -> datetime | None:
+    if minutes is None:
+        return None
+    return (now + timedelta(minutes=max(minutes, MIN_ARRIVAL_MINUTES))).replace(microsecond=0)
+
+
+MIN_ARRIVAL_MINUTES = 2.0
+
+
+class HouseNextArrivalSensor(HRPHouseEntity, SensorEntity):
+    """Quantile ``arrival_quantile`` of the first arrival home (house empty)."""
+
+    _attr_device_class = SensorDeviceClass.TIMESTAMP
+
+    def __init__(self, coordinator: HRPCoordinator) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, KEY_HOUSE_NEXT_ARRIVAL, ENTITY_ID_FORMAT)
+
+    @property
+    def native_value(self) -> datetime | None:
+        """Arrival time at the configured quantile; unknown with someone home or no data."""
+        house = self.house
+        return _arrival_at(house, house.arrival_quantile) if house else None
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Quantiles, CDF and per-person quantiles of the arrival distribution."""
+        house = self.house
+        if house is None:
+            return {}
+        attrs: dict[str, Any] = {
+            "quantile": house.arrival_quantile,
+            "mode": house.mode,
+            "advisory": house.advisory,
+        }
+        dist, now = house.arrival, house.arrival_now
+        if dist is None or now is None:
+            return attrs
+        attrs["quantiles"] = {f"q{round(q * 100)}": _iso(_arrival_at(house, q)) for q in QUANTILES}
+        attrs["cdf"] = [[m, round(dist.cdf(m), 3)] for m in CDF_POINTS]
+        attrs["source"] = dist.source
+        attrs["persons"] = {
+            pid: {
+                f"q{round(q * 100)}": _iso(_in_minutes(now, pdist.quantile(q))) for q in (0.25, 0.5)
+            }
+            for pid, pdist in house.arrival_persons.items()
+        }
+        return attrs
+
+
+def absence_class(q25_hours: float | None) -> str | None:
+    """short (< 4 h) / day (4-14 h) / long (> 14 h), judged on the q25."""
+    if q25_hours is None:
+        return "long"
+    if q25_hours < SHORT_ABSENCE_HOURS:
+        return "short"
+    return "day" if q25_hours <= LONG_ABSENCE_HOURS else "long"
+
+
+class HouseExpectedAbsenceSensor(HRPHouseEntity, SensorEntity):
+    """Median remaining time with the house empty (hours)."""
+
+    _attr_device_class = SensorDeviceClass.DURATION
+    _attr_native_unit_of_measurement = UnitOfTime.HOURS
+    _attr_suggested_display_precision = 1
+
+    def __init__(self, coordinator: HRPCoordinator) -> None:
+        """Initialize the sensor."""
+        super().__init__(coordinator, KEY_HOUSE_EXPECTED_ABSENCE, ENTITY_ID_FORMAT)
+
+    def _hours(self, q: float) -> float | None:
+        house = self.house
+        if house is None or house.arrival is None:
+            return None
+        minutes = house.arrival.quantile(q)
+        return round(minutes / 60.0, 2) if minutes is not None else None
+
+    @property
+    def native_value(self) -> float | None:
+        """Median of the remaining empty time; unknown with someone home or no data."""
+        return self._hours(0.5)
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """q25 / q75 (hours), class and start of the empty period."""
+        house = self.house
+        if house is None or house.arrival is None:
+            return {}
+        q25 = self._hours(0.25)
+        return {
+            "q25": q25,
+            "q75": self._hours(0.75),
+            "absence_class": absence_class(q25),
+            "empty_since": _iso(house.empty_since),
+        }

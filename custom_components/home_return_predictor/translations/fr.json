@@ -33,7 +33,8 @@
           "half_life_days": "Demi-vie de l'historique",
           "update_interval_minutes": "Intervalle de mise à jour",
           "holiday_calendar": "Calendrier des jours fériés",
-          "enable_sklearn_challenger": "Modèle challenger (gradient boosting, numpy)"
+          "enable_sklearn_challenger": "Modèle challenger (gradient boosting, numpy)",
+          "arrival_quantile": "Quantile d'arrivée"
         },
         "data_description": {
           "persons": "Entités person dont le retour au domicile sera prédit.",
@@ -43,7 +44,8 @@
           "half_life_days": "Les habitudes plus anciennes pèsent moitié moins après ce nombre de jours.",
           "update_interval_minutes": "Fréquence de recalcul des prédictions, en minutes.",
           "holiday_calendar": "Calendrier facultatif dont les événements marquent les jours fériés.",
-          "enable_sklearn_challenger": "Expérimental. Entraîne en arrière-plan un challenger gradient boosting avec numpy (déjà inclus dans Home Assistant sur la plupart des installations ; installé à l'exécution sinon). Un seul thread, toutes les quelques heures, moins d'une seconde sur un Intel N100. Il n'est utilisé que tant qu'il bat le modèle intégré sur des prédictions récentes et inédites ; sinon le modèle intégré continue de fonctionner."
+          "enable_sklearn_challenger": "Expérimental. Entraîne en arrière-plan un challenger gradient boosting avec numpy (déjà inclus dans Home Assistant sur la plupart des installations ; installé à l'exécution sinon). Un seul thread, toutes les quelques heures, moins d'une seconde sur un Intel N100. Il n'est utilisé que tant qu'il bat le modèle intégré sur des prédictions récentes et inédites ; sinon le modèle intégré continue de fonctionner.",
+          "arrival_quantile": "Quantile (0-1) de la première arrivée publié par le capteur de prochaine arrivée. Préchauffer L minutes avant revient à chauffer quand P(arrivée dans L) atteint cette valeur : plus bas = plus de confort, plus haut = plus d'économies."
         }
       }
     },
@@ -93,6 +95,12 @@
       },
       "house_next_return_eta": {
         "name": "Prochaine heure de retour prévue"
+      },
+      "house_next_arrival": {
+        "name": "Prochaine arrivée"
+      },
+      "house_expected_absence": {
+        "name": "Absence prévue"
       }
     }
   },

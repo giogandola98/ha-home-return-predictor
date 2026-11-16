@@ -9,6 +9,7 @@ from collections.abc import Iterable
 from datetime import date, datetime, timedelta
 from typing import Any
 
+from .arrival import arrival_tod_density, habit_arrival, with_evidence
 from .base import (
     AbsenceEpisode,
     MaturityReport,
@@ -146,6 +147,7 @@ class KernelBayesReturnModel(ReturnModel):
         self._segments = CalibrationSegments()
         self._since_refit = 0
         self.selector = Selector()
+        self._tod_density: tuple[Any, Any] | None = None  # arrival() cache, not persisted
         # Challenger: the enable flag, the selection state and the exported trees
         # (when small enough) are persisted.
         self._challenger_enabled = False
@@ -443,6 +445,66 @@ class KernelBayesReturnModel(ReturnModel):
             is_home=False,
             prior_effective_samples=prior.effective_samples,
             reason=reason,
+        )
+
+    def arrival(self, model_input: ModelInput, prediction: Prediction) -> Any:
+        """Arrival distribution while away (``arrival.py``); None at home or without habits.
+
+        Habits from the kernel prior's weighted durations; the GPS evidence of
+        ``prediction`` (habit x GPS probability, position ETA, physical minimum travel
+        time) moves and truncates the mass.
+        """
+        if model_input.is_home or prediction.is_home:
+            return None
+        cfg = self.config
+        now = to_utc(model_input.now)
+        left_at = to_utc(model_input.left_at) if model_input.left_at else self._away_since
+        minutes_away = max(minutes_between(left_at, now), 0.0) if left_at else 0.0
+        ref = to_local(left_at if left_at else now, cfg.timezone)
+        ep_keys, trip_keys = self._keys()
+        prior = estimate_prior(
+            ep_keys,
+            trip_keys,
+            now=now,
+            left_at=left_at,
+            minutes_away=minutes_away,
+            horizon_minutes=cfg.horizon_minutes,
+            weekday=ref.weekday(),
+            is_holiday=model_input.is_holiday,
+            half_life_days=cfg.half_life_days,
+            tz=cfg.timezone,
+        )
+        # The arrival time-of-day density only moves with the recency weights: cache it
+        # per hour and per set of absences.
+        cache_key = (len(ep_keys), len(trip_keys), self._generation, int(now.timestamp() // 3600))
+        if self._tod_density is None or self._tod_density[0] != cache_key:
+            pool = (*ep_keys, *trip_keys)
+            density = arrival_tod_density(pool, now, cfg.half_life_days) if pool else None
+            self._tod_density = (cache_key, density)
+        habit = habit_arrival(
+            ep_keys,
+            trip_keys,
+            prior.durations,
+            now=now,
+            minutes_away=minutes_away,
+            half_life_days=cfg.half_life_days,
+            tz=cfg.timezone,
+            density=self._tod_density[1],
+        )
+        if habit is None:
+            return None
+        reason = prediction.reason or {}
+        eta_pos = (
+            minutes_between(now, to_utc(prediction.eta_position))
+            if prediction.eta_position is not None
+            else None
+        )
+        return with_evidence(
+            habit,
+            prior=prediction.prior_probability,
+            p_bayes=reason.get("probability_bayes"),
+            eta_minutes=eta_pos,
+            min_minutes=reason.get("min_travel_minutes"),
         )
 
     def _features(

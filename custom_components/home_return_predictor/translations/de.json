@@ -33,7 +33,8 @@
           "half_life_days": "Halbwertszeit des Verlaufs",
           "update_interval_minutes": "Aktualisierungsintervall",
           "holiday_calendar": "Feiertagskalender",
-          "enable_sklearn_challenger": "Challenger-Modell (Gradient Boosting, numpy)"
+          "enable_sklearn_challenger": "Challenger-Modell (Gradient Boosting, numpy)",
+          "arrival_quantile": "Ankunftsquantil"
         },
         "data_description": {
           "persons": "Person-Entitäten, deren Heimkehr vorhergesagt wird.",
@@ -43,7 +44,8 @@
           "half_life_days": "Ältere Gewohnheiten zählen nach so vielen Tagen nur noch halb.",
           "update_interval_minutes": "Wie oft die Vorhersagen neu berechnet werden, in Minuten.",
           "holiday_calendar": "Optionaler Kalender, dessen Termine Feiertage markieren.",
-          "enable_sklearn_challenger": "Experimentell. Trainiert im Hintergrund einen Gradient-Boosting-Challenger mit numpy (bei den meisten Installationen bereits Teil von Home Assistant, sonst zur Laufzeit installiert). Ein Thread, alle paar Stunden, unter einer Sekunde auf einem Intel N100. Er wird nur verwendet, solange er das eingebaute Modell bei aktuellen, ungesehenen Vorhersagen schlägt; andernfalls arbeitet das eingebaute Modell weiter."
+          "enable_sklearn_challenger": "Experimentell. Trainiert im Hintergrund einen Gradient-Boosting-Challenger mit numpy (bei den meisten Installationen bereits Teil von Home Assistant, sonst zur Laufzeit installiert). Ein Thread, alle paar Stunden, unter einer Sekunde auf einem Intel N100. Er wird nur verwendet, solange er das eingebaute Modell bei aktuellen, ungesehenen Vorhersagen schlägt; andernfalls arbeitet das eingebaute Modell weiter.",
+          "arrival_quantile": "Quantil (0-1) der ersten Ankunft, das der Sensor für die nächste Ankunft veröffentlicht. L Minuten davor vorzuheizen heißt heizen, sobald P(Ankunft innerhalb L) diesen Wert erreicht: niedriger = öfter warm, höher = mehr Ersparnis."
         }
       }
     },
@@ -93,6 +95,12 @@
       },
       "house_next_return_eta": {
         "name": "Nächste voraussichtliche Rückkehr"
+      },
+      "house_next_arrival": {
+        "name": "Nächste Ankunft"
+      },
+      "house_expected_absence": {
+        "name": "Erwartete Abwesenheit"
       }
     }
   },
