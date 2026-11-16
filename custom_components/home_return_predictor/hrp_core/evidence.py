@@ -40,6 +40,17 @@ DISTANCE_MAX_AGE_FACTOR = 3.0  # distance valid if last fix within 3 x window
 # regression window: the speed then falls back to the last MIN_FIXES fixes, as long as
 # they span at most EXTENDED_WINDOW_FACTOR x window and the newest one is within the window.
 EXTENDED_WINDOW_FACTOR = 2.0
+# iPhones go silent while the phone does not move: the first fix after a silence of at
+# least DEPARTURE_SILENCE_MINUTES that is DEPARTURE_MIN_DISPLACEMENT_M (or the two fixes'
+# accuracy, if larger) closer to home than the last fix before it means "left, heading
+# home" long before three fixes allow a regression.
+DEPARTURE_SILENCE_MINUTES = 20.0
+DEPARTURE_MIN_DISPLACEMENT_M = 500.0
+DEFAULT_ACCURACY_M = 30.0
+MIN_WEIGHT_ACCURACY_M = 10.0
+# Each calibration observation shrinks the learnt part of the counts (count - default
+# pseudo-count) by this factor: habits and phones change, ~200 observations of memory.
+LR_COUNT_DECAY = 0.995
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -66,6 +77,7 @@ class Evidence:
     approach_class: str | None
     distance_m: float | None
     n_fixes: int
+    departure: bool = False  # class from a first fix after a silence (no regression)
 
 
 def regression_fixes(
@@ -116,18 +128,59 @@ def compute_evidence(
         else None
     )
     recent = regression_fixes(valid, now, window_minutes)
-    if len(recent) < MIN_FIXES:
-        return Evidence(None, None, distance, len(recent))
-    xs = [minutes_between(recent[0].ts, f.ts) for f in recent]
-    if xs[-1] - xs[0] < MIN_SPAN_MINUTES:
-        return Evidence(None, None, distance, len(recent))
-    ys = [f.distance_m for f in recent]
-    mx, my = sum(xs) / len(xs), sum(ys) / len(ys)
-    sxx = sum((x - mx) ** 2 for x in xs)
-    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys, strict=True))
-    slope_m_per_min = sxy / sxx
-    speed = -slope_m_per_min * 60.0 / 1000.0
+    if len(recent) < MIN_FIXES or (minutes_between(recent[0].ts, recent[-1].ts) < MIN_SPAN_MINUTES):
+        return _departure(valid, now, window_minutes, distance, len(recent))
+    speed = _weighted_speed(recent)
     return Evidence(speed, classify_speed(speed), distance, len(recent))
+
+
+def _weight(f: PositionFix) -> float:
+    acc = DEFAULT_ACCURACY_M if f.accuracy_m is None else f.accuracy_m
+    return 1.0 / max(acc, MIN_WEIGHT_ACCURACY_M) ** 2
+
+
+def _weighted_speed(fixes: Sequence[PositionFix]) -> float:
+    """Approach speed (km/h, > 0 toward home): least squares weighted by 1 / accuracy^2."""
+    xs = [minutes_between(fixes[0].ts, f.ts) for f in fixes]
+    ys = [f.distance_m for f in fixes]
+    ws = [_weight(f) for f in fixes]
+    sw = sum(ws)
+    mx = sum(w * x for w, x in zip(ws, xs, strict=True)) / sw
+    my = sum(w * y for w, y in zip(ws, ys, strict=True)) / sw
+    sxx = sum(w * (x - mx) ** 2 for w, x in zip(ws, xs, strict=True))
+    if sxx <= 0:
+        return 0.0
+    sxy = sum(w * (x - mx) * (y - my) for w, x, y in zip(ws, xs, ys, strict=True))
+    return -(sxy / sxx) * 60.0 / 1000.0
+
+
+def _departure(
+    valid: Sequence[PositionFix],
+    now: datetime,
+    window_minutes: float,
+    distance: float | None,
+    n_recent: int,
+) -> Evidence:
+    """Departure evidence from the first fix(es) after a silence (see the constants)."""
+    none = Evidence(None, None, distance, n_recent)
+    horizon = EXTENDED_WINDOW_FACTOR * window_minutes
+    new = [f for f in valid if minutes_between(f.ts, now) <= horizon]
+    older = [f for f in valid if minutes_between(f.ts, now) > horizon]
+    if not new or not older or minutes_between(new[-1].ts, now) > window_minutes:
+        return none
+    anchor = older[-1]
+    if minutes_between(anchor.ts, new[0].ts) < DEPARTURE_SILENCE_MINUTES:
+        return none
+    latest = new[-1]
+    noise = (anchor.accuracy_m or DEFAULT_ACCURACY_M) + (latest.accuracy_m or DEFAULT_ACCURACY_M)
+    if anchor.distance_m - latest.distance_m <= max(DEPARTURE_MIN_DISPLACEMENT_M, noise):
+        return none
+    speed = None
+    if len(new) >= 2 and minutes_between(new[0].ts, latest.ts) >= MIN_SPAN_MINUTES:
+        speed = _weighted_speed(new)
+    if speed is None or speed < CLASS_UPPER_KMH[2]:  # unknown or not clearly approaching
+        return Evidence(None, "approach", distance, n_recent, departure=True)
+    return Evidence(speed, classify_speed(speed), distance, n_recent, departure=True)
 
 
 def _solve_scale(lrs: Sequence[float]) -> float:
@@ -176,6 +229,13 @@ class LRCalibrator:
         """Add one observation of ``approach_class`` with its outcome."""
         if approach_class not in self.returned:
             return
+        fresh = _DEFAULT_COUNTS
+        for counts, default in (
+            (self.returned, fresh.returned),
+            (self.not_returned, fresh.not_returned),
+        ):
+            for c in counts:
+                counts[c] = default[c] + (counts[c] - default[c]) * LR_COUNT_DECAY
         target = self.returned if returned else self.not_returned
         target[approach_class] += 1.0
 
@@ -201,6 +261,8 @@ class LRCalibrator:
             )
         return cal
 
+
+_DEFAULT_COUNTS = LRCalibrator()
 
 APPROACH_CLASSES: frozenset[str] = frozenset({"approach_slow", "approach", "approach_fast"})
 SEGMENT_RESET_MINUTES = 10.0

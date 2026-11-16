@@ -329,6 +329,17 @@ class KernelBayesReturnModel(ReturnModel):
             )
         return self._key_cache
 
+    def _departure_holiday(self, model_input: ModelInput, left_at: datetime | None) -> bool:
+        """Holiday flag of the departure day (the habits are keyed on the departure, like
+        the weekday); today's flag only when the model did not see the departure."""
+        if (
+            left_at is not None
+            and self._away_since is not None
+            and abs(minutes_between(self._away_since, left_at)) < 1.0
+        ):
+            return self._away_is_holiday
+        return model_input.is_holiday
+
     def predict(self, model_input: ModelInput) -> Prediction:
         cfg = self.config
         now = to_utc(model_input.now)
@@ -363,7 +374,7 @@ class KernelBayesReturnModel(ReturnModel):
             minutes_away=minutes_away,
             horizon_minutes=cfg.horizon_minutes,
             weekday=ref.weekday(),
-            is_holiday=model_input.is_holiday,
+            is_holiday=self._departure_holiday(model_input, left_at),
             half_life_days=cfg.half_life_days,
             tz=cfg.timezone,
         )
@@ -470,7 +481,7 @@ class KernelBayesReturnModel(ReturnModel):
             minutes_away=minutes_away,
             horizon_minutes=cfg.horizon_minutes,
             weekday=ref.weekday(),
-            is_holiday=model_input.is_holiday,
+            is_holiday=self._departure_holiday(model_input, left_at),
             half_life_days=cfg.half_life_days,
             tz=cfg.timezone,
         )

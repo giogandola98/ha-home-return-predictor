@@ -57,6 +57,7 @@ from .const import (
     DEFAULT_RETURN_THRESHOLD,
     DEFAULT_UPDATE_INTERVAL_MINUTES,
     DOMAIN,
+    EVENT_REARM_MINUTES,
     EVENT_RETURN_DETECTED,
     FIX_WINDOW_MINUTES,
     HISTORY_DAYS,
@@ -119,6 +120,7 @@ class PersonRuntime:
     dirty: bool = True  # model changed since the last snapshot
     bootstrapped: bool = False  # recorder history merged at least once (persisted)
     last_error: str | None = None  # last per-person update error (logged once)
+    below_since: datetime | None = None  # not returning since (re-arms the event)
     # Serialises every access to ``model`` (always in the executor) so the model
     # is never used concurrently. Only held for short jobs.
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -139,9 +141,10 @@ class PersonRuntime:
         return True
 
     def prune_fixes(self, now: datetime) -> None:
-        """Drop fixes older than the tracking window."""
+        """Drop fixes older than the tracking window, except the newest one before it:
+        the first fix after a long silence is compared with it (departure evidence)."""
         cutoff = now - timedelta(minutes=FIX_WINDOW_MINUTES)
-        while self.fixes and self.fixes[0].ts < cutoff:
+        while len(self.fixes) > 1 and self.fixes[1].ts < cutoff:
             self.fixes.popleft()
 
 
@@ -764,9 +767,13 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                     arrival=computed.arrival,
                     left_at=runtime.left_at if is_home is False else None,
                 )
-                if returning and self._should_fire(runtime):
+                if returning and self._should_fire(runtime, now):
                     self._fire_return_event(result)
                 runtime.returning = returning
+                if returning:
+                    runtime.below_since = None
+                elif runtime.below_since is None:
+                    runtime.below_since = now
                 results[person_id] = result
                 if computed.training_due:
                     self._schedule_training(runtime, now)
@@ -784,12 +791,21 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         return HRPData(persons=results, house=house)
 
     @callback
-    def _should_fire(self, runtime: PersonRuntime) -> bool:
-        """One return event per absence (keyed on left_at, persisted across restarts)."""
+    def _should_fire(self, runtime: PersonRuntime, now: datetime) -> bool:
+        """One return event per absence (keyed on left_at, persisted across restarts),
+        re-armed when the probability stayed below the threshold for
+        ``EVENT_REARM_MINUTES`` in the same absence (an early false alarm no longer
+        swallows the event of the real return)."""
         if runtime.left_at is None:
             return not runtime.returning  # unknown departure: rising edge only
         if runtime.event_left_at == runtime.left_at:
-            return False
+            below = runtime.below_since
+            return (
+                not runtime.returning
+                and below is not None
+                and below >= runtime.left_at
+                and now - below >= timedelta(minutes=EVENT_REARM_MINUTES)
+            )
         runtime.event_left_at = runtime.left_at
         self._mark_changed()
         return True

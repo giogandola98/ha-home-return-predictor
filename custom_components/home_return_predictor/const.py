@@ -55,6 +55,7 @@ MODES: Final = [MODE_AUTO, MODE_LEARNING, MODE_LIVE]
 
 # Event
 EVENT_RETURN_DETECTED: Final = f"{DOMAIN}_return_detected"
+EVENT_REARM_MINUTES: Final = 30  # below the threshold this long -> the event fires again
 
 # Services
 SERVICE_RETRAIN: Final = "retrain"

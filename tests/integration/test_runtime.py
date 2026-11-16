@@ -204,6 +204,39 @@ async def test_return_event_once_per_absence_with_hysteresis(
     assert len(events) == 2
 
 
+async def test_return_event_rearms_after_30_minutes_below(
+    hass: HomeAssistant,
+    loaded_entry: MockConfigEntry,
+    freezer: FrozenDateTimeFactory,
+    forced: dict[str, tuple[float, timedelta | None]],
+) -> None:
+    """An early false alarm does not swallow the event of the real return."""
+    coordinator = loaded_entry.runtime_data
+    events = async_capture_events(hass, EVENT_RETURN_DETECTED)
+    freezer.tick(timedelta(minutes=1))
+    await _leave(hass, BOB, "Bob")
+
+    async def _refresh(p: float, minutes: float = 2) -> str:
+        freezer.tick(timedelta(minutes=minutes))
+        forced[BOB] = (p, timedelta(minutes=20))
+        await coordinator.async_refresh()
+        await hass.async_block_till_done()
+        return hass.states.get("binary_sensor.bob_returning").state
+
+    assert await _refresh(0.7) == "on"  # false alarm
+    assert len(events) == 1
+    assert await _refresh(0.2) == "off"
+    assert await _refresh(0.2, 20) == "off"  # 22 min below
+    assert await _refresh(0.7) == "on"
+    assert len(events) == 1  # not re-armed yet
+    assert await _refresh(0.2) == "off"
+    assert await _refresh(0.2, 31) == "off"  # 31 min below
+    assert await _refresh(0.7) == "on"
+    assert len(events) == 2  # the real return
+    assert await _refresh(0.7) == "on"
+    assert len(events) == 2  # rising edge only
+
+
 async def test_return_event_not_refired_after_restart(
     hass: HomeAssistant,
     loaded_entry: MockConfigEntry,

@@ -191,14 +191,18 @@ def test_drive_by_then_real_return_counts_positive() -> None:
     for minute in range(11 * 60 + 5, 11 * 60 + 40, 5):  # parked again, 10 km away
         _feed(model, day, 465, minute, approach_fixes(local(day, minute), 10_000, 0))
     _feed(model, day, 465, 13 * 60, approach_fixes(local(day, 13 * 60), 10_000, 0))
-    assert model.calibrator.not_returned["approach_fast"] == base_n + 1  # drive-by: negative
+    assert model.calibrator.not_returned["approach_fast"] == pytest.approx(
+        base_n + 1, abs=0.05
+    )  # drive-by: negative
     for minute in range(17 * 60 + 30, 17 * 60 + 41, 2):  # real return
         dist = 300 + (17 * 60 + 41 - minute) * 50_000 / 60
         _feed(model, day, 465, minute, approach_fixes(local(day, minute), dist, 50))
     model.observe_transition(PresenceTransition(local(day, 17 * 60 + 45), True))
     model.resolve(local(day, 17 * 60 + 50), True)  # scored once the stay is confirmed
-    assert model.calibrator.returned["approach_fast"] == base_r + 1  # real return: positive
-    assert model.calibrator.not_returned["approach_fast"] == base_n + 1
+    assert model.calibrator.returned["approach_fast"] == pytest.approx(
+        base_r + 1, abs=0.05
+    )  # real return: positive (decayed counts)
+    assert model.calibrator.not_returned["approach_fast"] == pytest.approx(base_n + 1, abs=0.05)
 
 
 def test_calibration_segments_rules() -> None:
