@@ -39,6 +39,20 @@ def fuse_probability(prior: float, likelihood_ratio: float) -> float:
     return clamp(sigmoid(z), P_MIN, P_MAX)
 
 
+# Approach classes on which a learned model never serves less than habit x GPS: it saw
+# few such moments in training and must not override a clear approach.
+GPS_FLOOR_CLASSES = frozenset({"approach_slow", "approach", "approach_fast"})
+
+
+def gps_floor(
+    probability: float, p_bayes: float, approach_class: str | None, likelihood_ratio: float
+) -> tuple[float, bool]:
+    """(probability, applied): at least ``p_bayes`` while the phone is clearly approaching."""
+    if approach_class in GPS_FLOOR_CLASSES and likelihood_ratio > 1.0 and probability < p_bayes:
+        return p_bayes, True
+    return probability, False
+
+
 def min_travel_minutes(distance_m: float | None) -> float | None:
     """Lower bound on the time to get home: straight-line distance at MAX_TRAVEL_SPEED_KMH."""
     if distance_m is None:

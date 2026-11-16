@@ -14,7 +14,7 @@ from datetime import datetime
 from typing import Any
 
 from .episodes import minutes_between
-from .fusion import P_MAX, P_MIN, PRIOR_CLAMP, clamp, logit, sigmoid
+from .fusion import P_MAX, P_MIN, PRIOR_CLAMP, clamp, gps_floor, logit, sigmoid
 from .maturity import LogEntry
 from .prior import DAY_MINUTES, recency_weight
 from .selection import informative_split
@@ -148,6 +148,13 @@ def _brier(
     return num / den if den > 0 else 0.0
 
 
+def _served(weights: Sequence[float], entry: LogEntry) -> float:
+    """Learned-fusion probability as ``predict`` serves it (GPS floor included)."""
+    f = entry.features
+    p_bayes = bayes_from_features(f)
+    return gps_floor(apply_weights(weights, f), p_bayes, entry.approach_class, math.exp(f[1]))[0]
+
+
 class Stacker:
     """Per-person learned fusion with holdout-gated activation."""
 
@@ -193,7 +200,11 @@ class Stacker:
 
         split: int | None = None
         if len(usable) >= MIN_ENTRIES_TO_ACTIVATE:
-            split = informative_split([int(e.outcome or 0) for e in usable], HOLDOUT_FRACTION)
+            split = informative_split(
+                [int(e.outcome or 0) for e in usable],
+                HOLDOUT_FRACTION,
+                times=[e.ts for e in usable],
+            )
             if split is None:
                 return False
         self.trained_on = len(usable)
@@ -206,7 +217,7 @@ class Stacker:
         train, hold = usable[:split], usable[split:]
         w_train = weights_for(train)
         hl = half_life_days
-        learned = _brier(hold, [apply_weights(w_train, e.features) for e in hold], now, hl)
+        learned = _brier(hold, [_served(w_train, e) for e in hold], now, hl)
         bayes = _brier(hold, [bayes_from_features(e.features) for e in hold], now, hl)
         self.holdout_brier_learned, self.holdout_brier_bayes = learned, bayes
         self.active = learned < bayes * (1.0 - ACTIVATION_MARGIN)

@@ -88,7 +88,7 @@ def test_stacker_skips_a_holdout_without_returns() -> None:
     assert st.holdout_brier_bayes is not None
 
 
-def test_challenger_on_a_trip_keeps_the_selection() -> None:
+def test_challenger_on_a_trip_falls_back_to_the_reference() -> None:
     model = KernelBayesReturnModel(CONFIG)
     model.enable_challenger(True)
     model.selector.champion = LEARNED_FUSION
@@ -110,7 +110,8 @@ def test_challenger_on_a_trip_keeps_the_selection() -> None:
     assert fitted["status"] == "uninformative_holdout"
     summary = model.apply_challenger(fitted, now)
     assert summary["trained"] is False and summary["reason"] == "uninformative_holdout"
-    assert model.selector.champion == LEARNED_FUSION and model.selector.brier == brier
+    # nothing can vouch for the learned champion: the reference model serves
+    assert model.selector.champion == KERNEL_BAYES and model.selector.brier == brier
 
 
 def test_learned_model_never_undercuts_a_clear_gps_approach() -> None:
@@ -127,3 +128,38 @@ def test_learned_model_never_undercuts_a_clear_gps_approach() -> None:
     still = model.predict(away_input(DAY, 300, 600))
     assert still.reason["gps_floor"] is False
     assert still.probability < still.reason["probability_bayes"]
+
+
+def test_returns_separated_by_a_stay_at_home_are_counted_apart() -> None:
+    # absence A ends with 10 positive entries; after 3 h at home a short absence B
+    # (5 entries, all positive) follows. The log only holds absences, so the runs touch.
+    y = [0] * 85 + [1] * 10 + [1] * 5
+    start = local(DAY, 0)
+    times = [start + timedelta(minutes=10 * i) for i in range(95)]
+    times += [times[-1] + timedelta(hours=3, minutes=10 * i) for i in range(1, 6)]
+    assert informative_split(y, min_returns=2) is None  # by runs alone: one return
+    split = informative_split(y, min_returns=2, times=times)
+    assert split == 80  # the plain 20 % holdout already holds both returns
+
+
+def test_keeping_a_return_whole_respects_the_maximum_holdout() -> None:
+    y = [1] * 60 + [0, 1, 0, 1, 0] * 8  # a 60-entry run right below the 50 % bound
+    split = informative_split(y, min_returns=8)
+    assert split is not None and split >= int(len(y) * 0.5)
+
+
+def test_burst_of_fixes_falls_back_to_the_extended_window() -> None:
+    now = local(DAY, 600)
+    older = [PositionFix(now - timedelta(minutes=m), 9000 - 800 * (15 - m), 15.0) for m in (15, 9)]
+    burst = [PositionFix(now - timedelta(seconds=s), 9000 - 800 * 15, 15.0) for s in (50, 30, 10)]
+    ev = compute_evidence([*older, *burst], now, 10, 250)
+    assert ev.approach_class is not None and ev.speed_kmh > 30
+
+
+def test_stacker_refit_on_a_trip_demotes_a_learned_champion() -> None:
+    model = KernelBayesReturnModel(CONFIG)
+    model.selector.champion = LEARNED_FUSION
+    model._log.resolved.extend(_entries([1, 0, 0] * 50 + [0] * 300))
+    model._since_refit = 10_000
+    model._maybe_refit(local(DAY, 0) + timedelta(days=5))
+    assert model.selector.champion == KERNEL_BAYES
