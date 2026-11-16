@@ -36,6 +36,10 @@ CALIBRATION_PRIOR_STRENGTH = 8.0
 MIN_FIXES = 3
 MIN_SPAN_MINUTES = 2.0
 DISTANCE_MAX_AGE_FACTOR = 3.0  # distance valid if last fix within 3 x window
+# A phone on the move often reports only every ~5 min, so three fixes rarely fit in the
+# regression window: the speed then falls back to the last MIN_FIXES fixes, as long as
+# they span at most EXTENDED_WINDOW_FACTOR x window and the newest one is within the window.
+EXTENDED_WINDOW_FACTOR = 2.0
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -64,6 +68,27 @@ class Evidence:
     n_fixes: int
 
 
+def regression_fixes(
+    fixes: Sequence[PositionFix], now: datetime, window_minutes: float
+) -> list[PositionFix]:
+    """Fixes the speed regression uses (``fixes`` sorted by time, none in the future).
+
+    All fixes within ``window_minutes``; with fewer than ``MIN_FIXES`` of them, the last
+    ``MIN_FIXES`` fixes if the newest is within the window and the oldest within
+    ``EXTENDED_WINDOW_FACTOR`` x window (sparse reporting while travelling).
+    """
+    recent = [f for f in fixes if minutes_between(f.ts, now) <= window_minutes]
+    if len(recent) >= MIN_FIXES or not recent:
+        return recent
+    tail = list(fixes[-MIN_FIXES:])
+    if (
+        len(tail) == MIN_FIXES
+        and minutes_between(tail[0].ts, now) <= EXTENDED_WINDOW_FACTOR * window_minutes
+    ):
+        return tail
+    return recent
+
+
 def compute_evidence(
     fixes: Sequence[PositionFix],
     now: datetime,
@@ -86,7 +111,7 @@ def compute_evidence(
         if minutes_between(last.ts, now) <= DISTANCE_MAX_AGE_FACTOR * window_minutes
         else None
     )
-    recent = [f for f in valid if minutes_between(f.ts, now) <= window_minutes]
+    recent = regression_fixes(valid, now, window_minutes)
     if len(recent) < MIN_FIXES:
         return Evidence(None, None, distance, len(recent))
     xs = [minutes_between(recent[0].ts, f.ts) for f in recent]

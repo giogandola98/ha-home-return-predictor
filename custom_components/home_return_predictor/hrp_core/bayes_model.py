@@ -36,7 +36,12 @@ from .episodes import (
     to_local,
     to_utc,
 )
-from .evidence import CalibrationSegments, LRCalibrator, compute_evidence
+from .evidence import (
+    EXTENDED_WINDOW_FACTOR,
+    CalibrationSegments,
+    LRCalibrator,
+    compute_evidence,
+)
 from .fusion import (
     apply_feasibility,
     combine_eta,
@@ -61,7 +66,7 @@ from .selection import (
     LEARNED_FUSION,
     RULES,
     Selector,
-    chronological_split,
+    informative_split,
     recency_weights,
     weighted_brier,
 )
@@ -80,6 +85,9 @@ STACKER_REFIT_EVERY = 150  # newly resolved entries between stacker refits
 CHALLENGER_RETRAIN_HOURS = 6.0
 CHALLENGER_RETRAIN_ENTRIES = 150
 MERGE_TOLERANCE = timedelta(minutes=10)  # same departure in stored and recorder data
+# A learned model never serves less than habit x GPS while the phone is clearly
+# approaching: it was trained on few such moments and must not override them.
+GPS_FLOOR_CLASSES = frozenset({"approach", "approach_fast"})
 
 
 def shift_label(local_hour: int) -> str:
@@ -211,7 +219,8 @@ class KernelBayesReturnModel(ReturnModel):
         cfg = self.config
         self.calibrator.reset()
         times = [to_utc(f.ts) for f in fixes]
-        window = timedelta(minutes=cfg.regression_window_minutes)
+        # fixes the regression may use, incl. the sparse-reporting fallback
+        window = timedelta(minutes=EXTENDED_WINDOW_FACTOR * cfg.regression_window_minutes)
         idx = 0
         segments = CalibrationSegments()
         for ep in sorted((*self._episodes, *self._trips), key=lambda e: e.left_at):
@@ -380,6 +389,14 @@ class KernelBayesReturnModel(ReturnModel):
             probability = self._challenger.predict_proba(row)
         else:
             probability = p_bayes
+        gps_floor = (
+            active != KERNEL_BAYES
+            and ev.approach_class in GPS_FLOOR_CLASSES
+            and lr > 1.0
+            and probability < p_bayes
+        )
+        if gps_floor:
+            probability = p_bayes
 
         habit_min = (
             prior.eta_duration_minutes - minutes_away
@@ -417,6 +434,7 @@ class KernelBayesReturnModel(ReturnModel):
             "fusion": FUSION_ALIAS[active],
             "active_model": active,
             "probability_bayes": round(p_bayes, 4),
+            "gps_floor": gps_floor,
             "feasible": feasible,
             "min_travel_minutes": round(travel_min, 1) if travel_min is not None else None,
         }
@@ -590,7 +608,8 @@ class KernelBayesReturnModel(ReturnModel):
         self._since_refit = 0
         if self._challenger_mode():
             return
-        self.stacker.fit(self._log.resolved, now, self.config.half_life_days)
+        if not self.stacker.fit(self._log.resolved, now, self.config.half_life_days):
+            return  # no holdout with real returns: keep the current selection
         self.selector.update(
             {
                 KERNEL_BAYES: self.stacker.holdout_brier_bayes,
@@ -665,8 +684,10 @@ class KernelBayesReturnModel(ReturnModel):
     def fit_challenger(snapshot: Any, now: datetime) -> Any:
         """Heavy part of the training: fit and evaluate all candidates (no model state).
 
-        Holdout = last 20 % of the resolved entries (chronological); the stacker and
-        the GBM are fit on the first 80 % for the evaluation, then the GBM is refit
+        Holdout = last 20 % of the resolved entries (chronological), grown back until it
+        holds a few real returns (``informative_split``; none -> no evaluation, the
+        selection stays as it is); the stacker and the GBM are fit on the older entries
+        for the evaluation, then the GBM is refit
         on everything for serving. The learned-fusion weights evaluated here are
         the ones installed (and served) by ``apply_challenger``.
         """
@@ -695,7 +716,10 @@ class KernelBayesReturnModel(ReturnModel):
 
         hl = snapshot["half_life_days"]
         ts, xs, fs, ys = snapshot["ts"], snapshot["x"], snapshot["f"], snapshot["y"]
-        idx_train, idx_hold = chronological_split(range(n))
+        split = informative_split(snapshot["y"])
+        if split is None:
+            return done("uninformative_holdout")
+        idx_train, idx_hold = list(range(split)), list(range(split, n))
         w_all = recency_weights(ts, now, hl)
         w_train = [w_all[i] for i in idx_train]
         w_hold = [w_all[i] for i in idx_hold]
