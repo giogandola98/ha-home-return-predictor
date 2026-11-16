@@ -569,6 +569,29 @@ python -m venv .venv && .venv/bin/pip install -r requirements_test.txt
   fake states and checks the requested presets, to guarantee that the Jinja matches
   `preset_logic.py`.
 
+### Replay scripts (`scripts/replay/`)
+
+Decision-oriented evaluation (`hrp_core/house_metric.py`): for every period with the
+house empty, a policy "preheat when ..." is scored with a simple room model (default
+0.55 K/h warm-up, 50 h cooling time constant, 12 K setback): degrees missing at the
+arrival and hours heated before they were useful, against never-setback, fixed-schedule
+and oracle baselines. Real data are passed as arguments (Home Assistant REST exports)
+and never stored in the repository.
+
+```bash
+# recorded predictor outputs (GET /api/history/period/... with person.* and *_return_probability)
+.venv/bin/python scripts/replay/house_eval.py --history history.json --threshold 0.4 0.68 -v
+# GPS approach signal with / without the sparse-reporting fallback
+.venv/bin/python scripts/replay/replay_gps.py --states states.json --history history.json \
+    --start 2026-01-01T18:00:00+01:00 --end 2026-01-01T19:00:00+01:00
+# synthetic couple: kernel_bayes vs learned fusion vs GBM on the house metric
+.venv/bin/python scripts/replay/engine_compare.py --days 150 --warmup 60 --seed 21
+```
+
+`hrp_core/synthetic.py` also generates iPhone-like GPS (`iphone_fixes`), trips of
+several days (`trip`), couples with shared outings (`couple`), drive-bys near home and a
+known zone (`zone_passby`) and stays in a known zone (`workplace_zone`).
+
 ---
 
 ## Known limitations
