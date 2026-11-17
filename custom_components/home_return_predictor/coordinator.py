@@ -37,6 +37,7 @@ from homeassistant.requirements import RequirementsNotFound, async_process_requi
 from homeassistant.util import dt as dt_util
 
 from .const import (
+    CONF_ARRIVAL_QUANTILE,
     CONF_ENABLE_CHALLENGER,
     CONF_HALF_LIFE_DAYS,
     CONF_HOLIDAY_CALENDAR,
@@ -47,6 +48,7 @@ from .const import (
     CONF_RETURN_THRESHOLD,
     CONF_UPDATE_INTERVAL_MINUTES,
     DEFAULT_ACTIVE_MODEL,
+    DEFAULT_ARRIVAL_QUANTILE,
     DEFAULT_ENABLE_CHALLENGER,
     DEFAULT_HALF_LIFE_DAYS,
     DEFAULT_HOME_ZONE,
@@ -76,6 +78,7 @@ from .history import (
     state_to_fix,
 )
 from .hrp_core import KernelBayesReturnModel, create_model, numpy_available
+from .hrp_core.arrival import ArrivalDistribution, first_arrival
 from .hrp_core.base import (
     MaturityReport,
     ModelConfig,
@@ -156,6 +159,8 @@ class PersonResult:
     effective_mode: str  # learning/live
     returning: bool
     reason: str
+    arrival: ArrivalDistribution | None = None  # while away, with habits
+    left_at: datetime | None = None  # start of the current absence
 
     @property
     def state_unknown(self) -> bool:
@@ -194,6 +199,13 @@ class HouseResult:
     # (person, probability 0..1, ETA) of away persons with p >= HOUSE_ETA_MIN_PROBABILITY,
     # sorted by ETA (None last): each return judged on its own (blueprint).
     candidates: list[tuple[str, float, datetime | None]] = field(default_factory=list)
+    # First-arrival distribution of the persons away (None when someone is home or
+    # nobody away has habits yet); minutes count from ``arrival_now``.
+    arrival: ArrivalDistribution | None = None
+    arrival_now: datetime | None = None
+    arrival_quantile: float = DEFAULT_ARRIVAL_QUANTILE
+    arrival_persons: dict[str, ArrivalDistribution] = field(default_factory=dict)
+    empty_since: datetime | None = None  # the last person left at (house empty)
 
     @property
     def advisory(self) -> bool:
@@ -222,6 +234,7 @@ class _Computed:
     maturity: MaturityReport
     training_due: bool
     snapshot_changed: bool
+    arrival: ArrivalDistribution | None = None
 
 
 def _numpy_installed() -> bool:
@@ -286,6 +299,9 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         )
         self.home_zone_id: str = entry.data.get(CONF_HOME_ZONE, DEFAULT_HOME_ZONE)
         self.return_threshold: float = options.get(CONF_RETURN_THRESHOLD, DEFAULT_RETURN_THRESHOLD)
+        self.arrival_quantile: float = float(
+            options.get(CONF_ARRIVAL_QUANTILE, DEFAULT_ARRIVAL_QUANTILE)
+        )
         self.maturity_threshold: float = options.get(
             CONF_MATURITY_THRESHOLD, DEFAULT_MATURITY_THRESHOLD
         )
@@ -631,18 +647,21 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         model = runtime.model
         now = model_input.now if model_input is not None else dt_util.utcnow()
         prediction: Prediction | None = None
+        arrival: ArrivalDistribution | None = None
         changed = runtime.dirty or runtime.snapshot is None
         if model_input is not None:
             resolved = model.resolve(model_input.now, model_input.is_home)
             prediction = model.predict(model_input)
             logged = model.log_prediction(model_input, prediction)
             changed = changed or bool(resolved) or logged
+            if not model_input.is_home:
+                arrival = model.arrival(model_input, prediction)
         maturity = model.maturity(now)
         if changed:
             runtime.snapshot = model.to_dict()
             runtime.dirty = False
         training_due = self.challenger_enabled and model.challenger_due(now)
-        return _Computed(prediction, maturity, training_due, changed)
+        return _Computed(prediction, maturity, training_due, changed, arrival)
 
     @staticmethod
     def _snapshot(runtime: PersonRuntime) -> bool:
@@ -742,6 +761,8 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                         if prediction is not None
                         else REASON_STATE_UNKNOWN
                     ),
+                    arrival=computed.arrival,
+                    left_at=runtime.left_at if is_home is False else None,
                 )
                 if returning and self._should_fire(runtime):
                     self._fire_return_event(result)
@@ -757,7 +778,10 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                 translation_placeholders={"person": person_id, "error": str(err)},
             ) from err
         self._schedule_save()
-        return HRPData(persons=results, house=self._aggregate(results, list(failures)))
+        house = self._aggregate(
+            results, list(failures), now=now, arrival_quantile=self.arrival_quantile
+        )
+        return HRPData(persons=results, house=house)
 
     @callback
     def _should_fire(self, runtime: PersonRuntime) -> bool:
@@ -828,7 +852,11 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
 
     @staticmethod
     def _aggregate(
-        results: dict[str, PersonResult], failed: list[str] | None = None
+        results: dict[str, PersonResult],
+        failed: list[str] | None = None,
+        *,
+        now: datetime | None = None,
+        arrival_quantile: float = DEFAULT_ARRIVAL_QUANTILE,
     ) -> HouseResult:
         persons_home = [pid for pid, r in results.items() if r.is_home is True]
         away = {
@@ -865,6 +893,14 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
             mode_source = returning or known or list(results)
             live = any(results[pid].effective_mode == MODE_LIVE for pid in mode_source)
         mode = MODE_LIVE if live else MODE_LEARNING
+        arrival_persons = {
+            pid: r.arrival
+            for pid, r in results.items()
+            if r.is_home is False and r.arrival is not None
+        }
+        house_arrival = None if persons_home else first_arrival(arrival_persons.values())
+        lefts = [r.left_at for r in results.values() if r.is_home is False and r.left_at]
+        empty_since = max(lefts) if lefts and not persons_home and not unknown else None
         return HouseResult(
             probability=probability,
             occupied=bool(persons_home),
@@ -876,6 +912,11 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
             eta_person=eta_person,
             persons_unknown=unknown,
             candidates=candidates,
+            arrival=house_arrival,
+            arrival_now=now if house_arrival is not None else None,
+            arrival_quantile=arrival_quantile,
+            arrival_persons=arrival_persons if house_arrival is not None else {},
+            empty_since=empty_since,
         )
 
     # ------------------------------------------------------------------ storage

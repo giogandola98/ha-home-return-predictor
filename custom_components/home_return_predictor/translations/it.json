@@ -33,7 +33,8 @@
           "half_life_days": "Emivita dello storico",
           "update_interval_minutes": "Intervallo di aggiornamento",
           "holiday_calendar": "Calendario festività",
-          "enable_sklearn_challenger": "Modello sfidante (gradient boosting, numpy)"
+          "enable_sklearn_challenger": "Modello sfidante (gradient boosting, numpy)",
+          "arrival_quantile": "Quantile di arrivo"
         },
         "data_description": {
           "persons": "Entità persona di cui prevedere il rientro.",
@@ -43,7 +44,8 @@
           "half_life_days": "Le abitudini più vecchie pesano la metà dopo questo numero di giorni.",
           "update_interval_minutes": "Ogni quanti minuti ricalcolare le previsioni.",
           "holiday_calendar": "Calendario opzionale i cui eventi indicano i giorni festivi.",
-          "enable_sklearn_challenger": "Sperimentale. Addestra in background un modello sfidante gradient boosting con numpy (già incluso in Home Assistant nella maggior parte delle installazioni; altrimenti viene installato durante l'esecuzione). Un solo thread, ogni qualche ora, meno di un secondo su un Intel N100. Viene usato solo finché batte il modello integrato sulle previsioni recenti non viste in addestramento; altrimenti resta attivo il modello integrato."
+          "enable_sklearn_challenger": "Sperimentale. Addestra in background un modello sfidante gradient boosting con numpy (già incluso in Home Assistant nella maggior parte delle installazioni; altrimenti viene installato durante l'esecuzione). Un solo thread, ogni qualche ora, meno di un secondo su un Intel N100. Viene usato solo finché batte il modello integrato sulle previsioni recenti non viste in addestramento; altrimenti resta attivo il modello integrato.",
+          "arrival_quantile": "Quantile (0-1) del primo arrivo a casa pubblicato dal sensore del prossimo arrivo. Preriscaldare una stanza L minuti prima equivale a scaldare quando P(arrivo entro L) raggiunge questo valore: più basso = casa calda più spesso, più alto = più risparmio."
         }
       }
     },
@@ -93,6 +95,12 @@
       },
       "house_next_return_eta": {
         "name": "Prossimo rientro"
+      },
+      "house_next_arrival": {
+        "name": "Prossimo arrivo"
+      },
+      "house_expected_absence": {
+        "name": "Assenza prevista"
       }
     }
   },

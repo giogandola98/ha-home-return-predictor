@@ -13,9 +13,10 @@ MIN_POSITION_SPEED_KMH = 5.0
 POSITION_ETA_MAX_HORIZONS = 3.0
 MIN_HABIT_SD_MINUTES = 10.0
 IQR_TO_SD = 1.35
-# Door-to-door upper bound for ground travel (motorway car, high-speed train incl. stops).
+# Radial (straight-line) door-to-door speed bound: roads are not straight, so even a
+# motorway trip rarely closes the distance faster than this.
 # Straight-line distance / this speed is a hard lower bound on the time needed to get home.
-MAX_TRAVEL_SPEED_KMH = 200.0
+MAX_TRAVEL_SPEED_KMH = 90.0
 
 
 def clamp(x: float, lo: float, hi: float) -> float:

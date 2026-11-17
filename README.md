@@ -193,6 +193,7 @@ Options (Configure):
 | Update interval | 2 min | Periodic recalculation (in addition to event-driven updates) |
 | Holiday calendar | — | Optional `calendar.*`: days with events are treated as holidays |
 | Challenger model (gradient boosting, numpy) | off | Trains an alternative numpy model in the background, used only if it is better (see [below](#challenger-model-gradient-boosting-optional)) |
+| Arrival quantile | 0.25 | Quantile of the first arrival published by `sensor.house_next_arrival`. Preheating `L` minutes before it = heating as soon as P(arrival within `L`) reaches this value: lower = warm more often, higher = save more |
 
 ---
 
@@ -216,6 +217,8 @@ House:
 | `sensor.house_return_probability` | % that at least one away person returns within the horizon; **100 when someone is home** |
 | `sensor.house_next_return_eta` | Earliest ETA among away people with probability ≥ 25% (attribute `eta_person`), so the blueprint can also use the "medium probability" band |
 | `binary_sensor.house_someone_returning` | On when at least one person is returning |
+| `sensor.house_next_arrival` | Timestamp of the first arrival home at the configured quantile (default q25), recomputed at every update and always in the future while the house is empty; `unknown` with someone home or without habits. No probability gate and no 90-min horizon: built for preheating (e.g. as `arrival_sensor` of Room Thermal Model) |
+| `sensor.house_expected_absence` | Median remaining time with the house empty (hours); `unknown` with someone home |
 
 All house entities have the attributes `occupied`, `persons_home`,
 `returning_persons`, `mode`, `advisory`, `away_probability` and `candidates` (the
@@ -223,6 +226,23 @@ binary sensor also `returning_names`). `candidates` is the list of away people w
 probability ≥ 25%, sorted by ETA: `[{person, probability, eta, advisory}]` with
 `probability` in **%** (like the sensors), `eta` in ISO 8601 (or `null`) and
 `advisory` of that person's prediction.
+
+`sensor.house_next_arrival` has its own attributes: `quantiles` (`q10` … `q90`, ISO
+timestamps), `cdf` (`[minutes, P(first arrival within minutes)]` at 15, 30, 60, 90, 120,
+180, 240, 360, 480, 720 and 1440 min), `quantile` (the one used), `source` (`habit`, or
+`gps` when a position moved or truncated the distribution), `persons` (per person `q25`
+and `q50`), `mode`, `advisory`. `sensor.house_expected_absence` has `q25` and `q75`
+(hours), `absence_class` (`short` < 4 h, `day` 4–14 h, `long` > 14 h, judged on `q25`)
+and `empty_since`.
+
+How the distribution is built (per person, then the first of the persons away,
+assumed independent): up to 12 h away, the residual durations of past absences longer
+than the current one, weighted like the habit prior; beyond 12 h, a daily return hazard
+spread over the habitual arrival times of day (a trip keeps a far arrival instead of
+dropping to nothing); a GPS approach moves the mass the evidence adds onto the
+kinematic ETA; nobody can arrive before `distance / 90 km/h` (straight line), whatever
+the horizon. The same 90 km/h bound now also drives the feasibility cap of the return
+probability (it was 200 km/h).
 
 ---
 
