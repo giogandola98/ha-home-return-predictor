@@ -551,8 +551,8 @@ the shift worker. You can force `live` from the select if you trust it earlier.
 
 Earlier releases could train a gradient-boosting *challenger* (numpy) and a learnt
 fusion of the Bayesian terms, served only while they beat the built-in model on a
-holdout. Measured on the house metric (`scripts/replay/engine_compare.py`), the
-built-in kernel prior × calibrated GPS evidence was never worse, while the selection
+holdout. Measured on the house metric (`engine_compare.py`, removed with the engines;
+see the pull request that retired them), the built-in kernel prior × calibrated GPS evidence was never worse, while the selection
 on autocorrelated log entries could keep a learnt champion after a trip. Since state
 version 2 **one engine serves** (`active_model` is always `kernel_bayes`):
 
@@ -601,8 +601,10 @@ and never stored in the repository.
 # GPS approach signal with / without the sparse-reporting fallback
 .venv/bin/python scripts/replay/replay_gps.py --states states.json --history history.json \
     --start 2026-01-01T18:00:00+01:00 --end 2026-01-01T19:00:00+01:00
-# synthetic couple: kernel_bayes vs learned fusion vs GBM on the house metric
-.venv/bin/python scripts/replay/engine_compare.py --days 150 --warmup 60 --seed 21
+# house metric of "now >= q25 - L" with models rebuilt from a real presence history
+.venv/bin/python scripts/replay/arrival_eval.py --states states.json --history history.json
+# minutes from the start of the drive home to the first approach class (synthetic)
+.venv/bin/python scripts/replay/approach_latency.py --days 60
 ```
 
 `hrp_core/synthetic.py` also generates iPhone-like GPS (`iphone_fixes`), trips of

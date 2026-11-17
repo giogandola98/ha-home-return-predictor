@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import bisect
-import math
-import time
 from collections.abc import Iterable
 from datetime import date, datetime, timedelta
 from typing import Any
@@ -19,13 +17,6 @@ from .base import (
     Prediction,
     PresenceTransition,
     ReturnModel,
-)
-from .challenger import (
-    N_CHALLENGER_FEATURES,
-    GBMChallenger,
-    bayes_from_challenger_features,
-    build_challenger_features,
-    numpy_available,
 )
 from .episodes import (
     KIND_EPISODE,
@@ -48,7 +39,6 @@ from .fusion import (
     apply_feasibility,
     combine_eta,
     fuse_probability,
-    gps_floor,
     min_travel_minutes,
     position_eta_minutes,
 )
@@ -67,36 +57,16 @@ from .prior import (
     duration_baseline,
     episode_keys,
     estimate_prior,
-    is_rest_day,
-)
-from .selection import (
-    FUSION_ALIAS,
-    GBM,
-    KERNEL_BAYES,
-    LEARNED_FUSION,
-    RULES,
-    Selector,
-    informative_split,
-    recency_weights,
-    weighted_brier,
-)
-from .stacker import (
-    ACTIVATION_MARGIN,
-    N_FEATURES,
-    Stacker,
-    apply_weights,
-    build_features,
-    fit_weights,
 )
 
+KERNEL_BAYES = "kernel_bayes"  # the only engine (name kept for the attributes)
+FUSION_ALIAS = {KERNEL_BAYES: "bayes"}
+
 # v2: single engine. The learned-engine blocks of v1 (stacker, selection, challenger,
-# last_training) are no longer written and are ignored when loading; episodes, trips,
-# GPS calibration and the prediction log are kept.
+# last_training, since_refit) are no longer written and are ignored when loading;
+# episodes, trips, GPS calibration and the prediction log are kept.
 STATE_VERSION = 2
 EPISODE_RETENTION_HALF_LIVES = 10.0
-STACKER_REFIT_EVERY = 150  # newly resolved entries between stacker refits
-CHALLENGER_RETRAIN_HOURS = 6.0
-CHALLENGER_RETRAIN_ENTRIES = 150
 MERGE_TOLERANCE = timedelta(minutes=10)  # same departure in stored and recorder data
 
 
@@ -151,32 +121,19 @@ class KernelBayesReturnModel(ReturnModel):
         # continues the absence): (arrived_at, left_at, away_is_holiday).
         self._arrival: tuple[datetime, datetime, bool] | None = None
         self.calibrator = LRCalibrator()
-        self.stacker = Stacker()
         self._log = PredictionLog()
         self._calib_pending: list[LogEntry] = []
         self._segments = CalibrationSegments()
-        self._since_refit = 0
-        self.selector = Selector()
         self._tod_density: tuple[Any, Any] | None = None  # arrival() cache, not persisted
-        # Challenger: the enable flag, the selection state and the exported trees
-        # (when small enough) are persisted.
-        self._challenger_enabled = False
-        self._challenger = GBMChallenger()
-        self._last_training: datetime | None = None
-        self._resolved_total = 0  # resolved entries seen in this process
-        self._resolved_at_training = 0
-        # Bumped whenever the learnt state is discarded (reset / replacing history);
-        # a challenger fit started on an older generation is stale and discarded.
+        # Bumped whenever the learnt state is discarded (reset / replacing history).
         self._generation = 0
         # Prior keys cache; set to None whenever episodes/trips change.
         self._key_cache: tuple[list[EpisodeKey], list[EpisodeKey]] | None = None
 
     # ------------------------------------------------------------------ lifecycle
     def reset(self) -> None:
-        enabled = self._challenger_enabled
         generation = self._generation
         self.__init__(self.config)  # type: ignore[misc]
-        self._challenger_enabled = enabled
         self._generation = generation + 1
 
     @property
@@ -452,7 +409,6 @@ class KernelBayesReturnModel(ReturnModel):
             "fusion": FUSION_ALIAS[active],
             "active_model": active,
             "probability_bayes": round(p_bayes, 4),
-            "gps_floor": False,
             "feasible": feasible,
             "min_travel_minutes": round(travel_min, 1) if travel_min is not None else None,
         }
@@ -539,56 +495,6 @@ class KernelBayesReturnModel(ReturnModel):
             density=self._tod_density[1],
         )
 
-    def _features(
-        self,
-        now: datetime,
-        prior: float,
-        lr: float,
-        minutes_away: float,
-        distance_m: float | None,
-    ) -> list[float]:
-        local_now = to_local(now, self.config.timezone)
-        return build_features(
-            prior,
-            lr,
-            minutes_away,
-            self.config.horizon_minutes,
-            distance_m,
-            distance_m is not None,
-            local_now.hour + local_now.minute / 60.0,
-        )
-
-    def _challenger_row(
-        self,
-        now: datetime,
-        left_at: datetime | None,
-        minutes_away: float,
-        prior: float,
-        lr: float,
-        distance_m: float | None,
-        speed_kmh: float | None,
-        is_holiday: bool,
-    ) -> list[float]:
-        tz = self.config.timezone
-        local_now = to_local(now, tz)
-        local_dep = to_local(left_at, tz) if left_at is not None else None
-        ref = local_dep or local_now
-        return build_challenger_features(
-            prior=prior,
-            likelihood_ratio=lr,
-            minutes_away=minutes_away,
-            horizon_minutes=self.config.horizon_minutes,
-            departure_hour=(
-                local_dep.hour + local_dep.minute / 60.0 if local_dep is not None else None
-            ),
-            local_hour=local_now.hour + local_now.minute / 60.0,
-            rest_day=is_rest_day(ref.weekday(), is_holiday),
-            distance_m=distance_m,
-            speed_kmh=speed_kmh,
-            has_gps=distance_m is not None,
-            p_bayes=fuse_probability(prior, lr),
-        )
-
     def _serving_model(self) -> str:
         """Always the kernel prior x GPS evidence (single engine since state v2)."""
         return KERNEL_BAYES
@@ -600,27 +506,7 @@ class KernelBayesReturnModel(ReturnModel):
         now = to_utc(model_input.now)
         horizon_end = now + timedelta(minutes=self.config.horizon_minutes)
         left_at = to_utc(model_input.left_at) if model_input.left_at else self._away_since
-        features: list[float] = []
-        row: list[float] = []
         minutes_away = max(minutes_between(left_at, now), 0.0) if left_at else 0.0
-        if prediction.prior_probability is not None:
-            features = self._features(
-                now,
-                prediction.prior_probability,
-                prediction.likelihood_ratio,
-                minutes_away,
-                prediction.distance_m,
-            )
-            row = self._challenger_row(
-                now,
-                left_at,
-                minutes_away,
-                prediction.prior_probability,
-                prediction.likelihood_ratio,
-                prediction.distance_m,
-                prediction.approach_speed_kmh,
-                model_input.is_holiday,
-            )
         cls = prediction.approach_class
         if self._segments.observe(now, cls, _iso(left_at), self.config.horizon_minutes):
             # Calibration observation: first time this class is seen in this
@@ -638,8 +524,6 @@ class KernelBayesReturnModel(ReturnModel):
             prediction.prior_probability,
             cls,
             horizon_end,
-            features=features,
-            x=row,
         )
         if self._log.last_logged is not None and (
             minutes_between(self._log.last_logged, now)
@@ -669,211 +553,7 @@ class KernelBayesReturnModel(ReturnModel):
         if ref is None or not resolved:
             return 0
         self._log.settle(resolved, ref)
-        self._since_refit += len(resolved)
-        self._resolved_total += len(resolved)
         return len(resolved)
-
-    def _maybe_refit(self, now: datetime) -> None:
-        """Refit the stacker after enough new resolved entries (called by resolve only).
-
-        In challenger mode ``train_challenger`` evaluates and installs the learned
-        fusion weights, so the stacker is not refit here: the weights served are
-        always the ones the selector evaluated.
-        """
-        # Single engine: nothing is refit from the prediction log any more.
-        self._since_refit = 0
-
-    # ----------------------------------------------------------------- challenger
-    def _challenger_rows(self) -> list[LogEntry]:
-        return [
-            e
-            for e in self._log.resolved
-            if e.outcome is not None
-            and len(e.x) == N_CHALLENGER_FEATURES
-            and len(e.features) == N_FEATURES
-        ]
-
-    def _challenger_mode(self) -> bool:
-        """True when train_challenger (not the stacker refit) drives selection."""
-        return (
-            self._challenger_enabled
-            and numpy_available()
-            and len(self._challenger_rows()) >= RULES[GBM].min_entries
-        )
-
-    def enable_challenger(self, enabled: bool) -> None:
-        """Ignored: the gradient-boosting challenger is retired (single engine)."""
-        self._challenger_enabled = False
-        self._challenger = GBMChallenger()
-        self._last_training = None
-
-    def challenger_due(self, now: datetime) -> bool:
-        """True when ``train_challenger`` should run (cheap; call from the event loop)."""
-        if not self._challenger_enabled or not numpy_available():
-            return False
-        if self._last_training is None:
-            return len(self._challenger_rows()) >= RULES[GBM].min_entries
-        elapsed_h = minutes_between(self._last_training, to_utc(now)) / 60.0
-        new = self._resolved_total - self._resolved_at_training
-        return elapsed_h >= CHALLENGER_RETRAIN_HOURS or new >= CHALLENGER_RETRAIN_ENTRIES
-
-    def note_challenger_failure(self, now: datetime) -> None:
-        """Record a failed training attempt so the next one waits for the normal interval.
-
-        Without this ``challenger_due`` stays true and a heavy, failing fit is retried on
-        every update (~every 2 minutes).
-        """
-        self._last_training = to_utc(now)
-        self._resolved_at_training = self._resolved_total
-
-    def challenger_snapshot(self) -> Any:
-        """Cheap copy of what ``fit_challenger`` needs (call under the person lock).
-
-        Only list copies: the logged feature rows are never mutated after logging,
-        so the snapshot can be fit in another thread while the model keeps running.
-        """
-        rows = self._challenger_rows()
-        return {
-            "enabled": self._challenger_enabled,
-            "generation": self._generation,
-            "half_life_days": self.config.half_life_days,
-            "resolved_total": self._resolved_total,
-            "ts": [e.ts for e in rows],
-            "x": [e.x for e in rows],
-            "f": [e.features for e in rows],
-            "y": [int(e.outcome or 0) for e in rows],
-            "cls": [e.approach_class for e in rows],
-        }
-
-    @staticmethod
-    def fit_challenger(snapshot: Any, now: datetime) -> Any:
-        """Heavy part of the training: fit and evaluate all candidates (no model state).
-
-        Holdout = last 20 % of the resolved entries (chronological), grown back until it
-        holds a few real returns (``informative_split``; none -> no evaluation, the
-        selection stays as it is); the stacker and the GBM are fit on the older entries
-        for the evaluation, then the GBM is refit
-        on everything for serving. The learned-fusion weights evaluated here are
-        the ones installed (and served) by ``apply_challenger``.
-        """
-        started = time.perf_counter()
-        now = to_utc(now)
-        n = len(snapshot["y"])
-        result: dict[str, Any] = {
-            "status": "ok",
-            "rows": n,
-            "resolved_total": snapshot["resolved_total"],
-            "generation": snapshot.get("generation", 0),
-            "brier": {},
-        }
-
-        def done(status: str) -> dict[str, Any]:
-            result["status"] = status
-            result["seconds"] = round(time.perf_counter() - started, 3)
-            return result
-
-        if not snapshot["enabled"]:
-            return done("disabled")
-        if not numpy_available():
-            return done("numpy_unavailable")
-        if n < RULES[GBM].min_entries:
-            return done("insufficient_data")
-
-        hl = snapshot["half_life_days"]
-        ts, xs, fs, ys = snapshot["ts"], snapshot["x"], snapshot["f"], snapshot["y"]
-        split = informative_split(snapshot["y"], times=snapshot["ts"])
-        if split is None:
-            return done("uninformative_holdout")
-        idx_train, idx_hold = list(range(split)), list(range(split, n))
-        w_all = recency_weights(ts, now, hl)
-        w_train = [w_all[i] for i in idx_train]
-        w_hold = [w_all[i] for i in idx_hold]
-        y_train = [ys[i] for i in idx_train]
-        y_hold = [ys[i] for i in idx_hold]
-
-        classes = snapshot.get("cls") or [None] * n
-
-        def floored(p: float, i: int) -> float:
-            """Score the candidate as it is served (GPS floor, see ``predict``)."""
-            p_bayes = bayes_from_challenger_features(xs[i])
-            return gps_floor(p, p_bayes, classes[i], math.exp(xs[i][1]))[0]
-
-        weights = fit_weights([fs[i] for i in idx_train], y_train, w_train)
-        candidate = GBMChallenger()
-        candidate.fit([xs[i] for i in idx_train], y_train, w_train)
-        result["brier"] = {
-            KERNEL_BAYES: weighted_brier(
-                [bayes_from_challenger_features(xs[i]) for i in idx_hold], y_hold, w_hold
-            ),
-            LEARNED_FUSION: weighted_brier(
-                [floored(apply_weights(weights, fs[i]), i) for i in idx_hold], y_hold, w_hold
-            ),
-            GBM: weighted_brier(
-                [
-                    floored(p, i)
-                    for p, i in zip(
-                        candidate.predict_many([xs[i] for i in idx_hold]), idx_hold, strict=True
-                    )
-                ],
-                y_hold,
-                w_hold,
-            ),
-        }
-        result["weights"] = weights
-        serving = GBMChallenger()
-        serving.fit(xs, ys, w_all)
-        result["challenger"] = serving
-        return done("ok")
-
-    def apply_challenger(self, result: Any, now: datetime) -> dict[str, Any]:
-        """Cheap: install the fitted challenger / fusion weights and update selection."""
-        status = result["status"]
-        brier = dict(result.get("brier") or {})
-
-        def summary(trained: bool, reason: str) -> dict[str, Any]:
-            return {
-                "trained": trained,
-                "reason": reason,
-                "rows": result["rows"],
-                "seconds": result.get("seconds", 0.0),
-                "brier": brier if trained else {},
-                "active_model": self._serving_model(),
-            }
-
-        if int(result.get("generation", 0)) != self._generation:
-            # Reset / history replaced while the fit ran: the result describes a
-            # model that no longer exists; leave selection and counters untouched.
-            return summary(False, "stale")
-        if status == "ok" and not self._challenger_enabled:
-            status = "disabled"  # switched off while training ran
-        if status in ("disabled", "numpy_unavailable"):
-            return summary(False, status)
-        self._last_training = to_utc(now)
-        self._resolved_at_training = int(result["resolved_total"])
-        if status == "uninformative_holdout":
-            self.selector.demote()  # nothing can vouch for a learned champion now
-        if status != "ok":
-            return summary(False, status)
-
-        self.selector.update(brier, result["rows"])
-        st = self.stacker
-        st.weights = list(result["weights"])
-        st.trained_on = int(result["rows"])
-        st.holdout_brier_learned = brier.get(LEARNED_FUSION)
-        st.holdout_brier_bayes = brier.get(KERNEL_BAYES)
-        learned, bayes = st.holdout_brier_learned, st.holdout_brier_bayes
-        st.active = (
-            learned is not None and bayes is not None and learned < bayes * (1 - ACTIVATION_MARGIN)
-        )
-        self._challenger = result["challenger"]
-        return summary(True, "ok")
-
-    def train_challenger(self, now: datetime) -> dict[str, Any]:
-        """Train + evaluate the challenger and update the selection (blocking).
-
-        Equivalent to ``apply_challenger(fit_challenger(challenger_snapshot(), now))``.
-        """
-        return self.apply_challenger(self.fit_challenger(self.challenger_snapshot(), now), now)
 
     def resolve(self, now: datetime, is_home: bool) -> int:
         now = to_utc(now)
@@ -886,11 +566,8 @@ class KernelBayesReturnModel(ReturnModel):
             # Drop orphans of unknown outcome.
             self._log.pending = [e for e in self._log.pending if e.horizon_end >= now]
             self._calib_pending = [e for e in self._calib_pending if e.horizon_end >= now]
-            self._maybe_refit(now)
             return count
-        count = self._settle(now=now)
-        self._maybe_refit(now)
-        return count
+        return self._settle(now=now)
 
     def maturity(self, now: datetime) -> MaturityReport:
         return maturity_report(
@@ -900,7 +577,6 @@ class KernelBayesReturnModel(ReturnModel):
             self.config.half_life_days,
             fusion=FUSION_ALIAS[self._serving_model()],
             active_model=self._serving_model(),
-            candidate_brier=dict(self.selector.brier),
         )
 
     def episodes(self) -> list[AbsenceEpisode]:
@@ -930,7 +606,6 @@ class KernelBayesReturnModel(ReturnModel):
             "log": self._log.to_dict(),
             "calib_pending": encode_entries(self._calib_pending),
             "segments": self._segments.to_dict(),
-            "since_refit": self._since_refit,
             "generation": self._generation,
         }
 
@@ -953,7 +628,6 @@ class KernelBayesReturnModel(ReturnModel):
         model._log = PredictionLog.from_dict(data.get("log", {}))
         model._calib_pending = decode_entries(data.get("calib_pending"))
         model._segments = CalibrationSegments.from_dict(data.get("segments") or {})
-        model._since_refit = int(data.get("since_refit", 0))
         model._generation = int(data.get("generation", 0))
         stored_horizon = data.get("horizon_minutes")  # missing: older snapshot, keep
         if stored_horizon is not None and float(stored_horizon) != config.horizon_minutes:
@@ -963,17 +637,10 @@ class KernelBayesReturnModel(ReturnModel):
     def discard_scoring(self) -> None:
         """Forget everything scored against the horizon; keep habits and GPS calibration.
 
-        Called when the horizon changed: logged outcomes, stacker/GBM features
-        (normalised by the horizon) and the champion selection describe another
-        target. Episodes and trips are horizon-independent and stay.
+        Called when the horizon changed: logged outcomes describe another target.
+        Episodes and trips are horizon-independent and stay.
         """
         self._log = PredictionLog()
         self._calib_pending = []
         self._segments = CalibrationSegments()
-        self._since_refit = 0
-        self.stacker = Stacker()
-        self.selector = Selector()
-        self._challenger = GBMChallenger()
-        self._last_training = None
-        self._resolved_total = self._resolved_at_training = 0
         self._generation += 1

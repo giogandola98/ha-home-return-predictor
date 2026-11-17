@@ -1,4 +1,2 @@
-numpy
 pytest-homeassistant-custom-component
 ruff
-# Optional: scikit-learn enables the dev-only GBM comparison test (skipped without it).

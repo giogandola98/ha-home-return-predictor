@@ -5,9 +5,7 @@ Concurrency rules:
 * every model call runs in the executor while holding the person's
   ``PersonRuntime.lock`` (the model is never used concurrently);
 * lock order is always ``HRPCoordinator._lock`` (updates/observations/retrain)
-  then ``PersonRuntime.lock``; nothing holds a person lock for long work:
-  challenger training snapshots under the lock, fits without it and applies
-  the result under the lock again.
+  then ``PersonRuntime.lock``; nothing holds a person lock for long work.
 """
 
 from __future__ import annotations
@@ -33,12 +31,10 @@ from homeassistant.core import (
 )
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from homeassistant.requirements import RequirementsNotFound, async_process_requirements
 from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_ARRIVAL_QUANTILE,
-    CONF_ENABLE_CHALLENGER,
     CONF_HALF_LIFE_DAYS,
     CONF_HOLIDAY_CALENDAR,
     CONF_HOME_ZONE,
@@ -49,7 +45,6 @@ from .const import (
     CONF_UPDATE_INTERVAL_MINUTES,
     DEFAULT_ACTIVE_MODEL,
     DEFAULT_ARRIVAL_QUANTILE,
-    DEFAULT_ENABLE_CHALLENGER,
     DEFAULT_HALF_LIFE_DAYS,
     DEFAULT_HOME_ZONE,
     DEFAULT_HORIZON_MINUTES,
@@ -67,7 +62,6 @@ from .const import (
     MODE_LEARNING,
     MODE_LIVE,
     MODES,
-    NUMPY_REQUIREMENT,
     RETURNING_OFF_HYSTERESIS,
 )
 from .history import (
@@ -78,7 +72,7 @@ from .history import (
     state_is_home,
     state_to_fix,
 )
-from .hrp_core import KernelBayesReturnModel, create_model, numpy_available
+from .hrp_core import KernelBayesReturnModel, create_model
 from .hrp_core.arrival import ArrivalDistribution, first_arrival
 from .hrp_core.base import (
     MaturityReport,
@@ -106,7 +100,7 @@ class PersonRuntime:
 
     entity_id: str
     slug: str
-    model: ReturnModel  # KernelBayesReturnModel (also provides the challenger hooks)
+    model: ReturnModel  # KernelBayesReturnModel
     mode: str = MODE_AUTO
     effective_mode: str | None = None
     is_home: bool | None = None
@@ -177,7 +171,7 @@ class PersonResult:
 
     @property
     def active_model(self) -> str:
-        """Model whose probability is currently served (champion or promoted challenger)."""
+        """Engine whose probability is served (always ``kernel_bayes`` since state v2)."""
         reason = self.prediction.reason if self.prediction is not None else {}
         return str(
             reason.get("active_model")
@@ -235,7 +229,6 @@ class _Computed:
 
     prediction: Prediction | None
     maturity: MaturityReport
-    training_due: bool
     snapshot_changed: bool
     arrival: ArrivalDistribution | None = None
 
@@ -321,13 +314,8 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         # The gradient-boosting challenger is retired (single kernel engine): its
         # stored option is read and ignored, numpy is never installed.
         self.challenger_requested: bool = False
-        self.challenger_option_ignored: bool = bool(
-            options.get(CONF_ENABLE_CHALLENGER, DEFAULT_ENABLE_CHALLENGER)
-        )
-        self.challenger_enabled: bool = False  # requested and numpy importable
+        self.challenger_enabled: bool = False
         self.numpy_available: bool = False
-        self._train_lock = asyncio.Lock()  # one challenger fit at a time
-        self._training: set[str] = set()  # persons with a scheduled/running training
         self._unsub_tracking: CALLBACK_TYPE | None = None
         self._unsub_stop: CALLBACK_TYPE | None = None
         self._tracked: set[str] = set()
@@ -345,8 +333,8 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
 
     @property
     def training_persons(self) -> set[str]:
-        """Persons whose challenger training is scheduled or running."""
-        return set(self._training)
+        """Always empty (no background training since the challenger was retired)."""
+        return set()
 
     @property
     def home_zone(self) -> HomeZone | None:
@@ -448,9 +436,8 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         self._unsub_stop = self.hass.bus.async_listen_once(
             EVENT_HOMEASSISTANT_STOP, self._async_handle_stop
         )
-        self.config_entry.async_create_background_task(
-            self.hass, self._async_setup_challenger(), f"{DOMAIN}_challenger_setup"
-        )
+        # Attribute kept for compatibility (the retired challenger needed numpy).
+        self.numpy_available = await self.hass.async_add_executor_job(_numpy_installed)
         if to_bootstrap:
             self.config_entry.async_create_background_task(
                 self.hass, self.async_retrain(to_bootstrap, bootstrap=True), f"{DOMAIN}_bootstrap"
@@ -460,47 +447,6 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
     def sklearn_available(self) -> bool:
         """Deprecated alias of ``numpy_available`` (attribute kept for one release)."""
         return self.numpy_available
-
-    async def _async_setup_challenger(self) -> None:
-        """Make numpy available on demand and switch the challenger on/off.
-
-        numpy ships with Home Assistant on most installs: then nothing is installed.
-        Otherwise it is requested without a version (HA's constraints pin it).
-        """
-        enabled = False
-        if self.challenger_requested:
-            available = await self.hass.async_add_executor_job(numpy_available)
-            if not available:
-                try:
-                    await async_process_requirements(self.hass, DOMAIN, [NUMPY_REQUIREMENT])
-                except (RequirementsNotFound, OSError) as err:
-                    _LOGGER.warning(
-                        "Could not install %s (%s); the gradient-boosting challenger stays "
-                        "disabled and the built-in model keeps working",
-                        NUMPY_REQUIREMENT,
-                        err,
-                    )
-                else:
-                    available = await self.hass.async_add_executor_job(numpy_available)
-                    if not available:
-                        _LOGGER.warning(
-                            "%s reported installed but cannot be imported; the "
-                            "gradient-boosting challenger stays disabled",
-                            NUMPY_REQUIREMENT,
-                        )
-            self.numpy_available = enabled = available
-        else:
-            # Challenger off: only a cheap check, no import.
-            self.numpy_available = await self.hass.async_add_executor_job(_numpy_installed)
-        self.challenger_enabled = enabled
-        for runtime in self.persons.values():
-            await self._async_model_job(runtime, runtime.model.enable_challenger, enabled)
-        # Entities read these flags from the coordinator: show them right away.
-        if self.data is not None:
-            self.async_update_listeners()
-        if enabled:
-            _LOGGER.debug("gradient-boosting challenger enabled")
-            await self.async_request_refresh()
 
     @callback
     def _async_subscribe(self) -> None:
@@ -666,8 +612,7 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         if changed:
             runtime.snapshot = model.to_dict()
             runtime.dirty = False
-        training_due = self.challenger_enabled and model.challenger_due(now)
-        return _Computed(prediction, maturity, training_due, changed, arrival)
+        return _Computed(prediction, maturity, changed, arrival)
 
     @staticmethod
     def _snapshot(runtime: PersonRuntime) -> bool:
@@ -686,9 +631,8 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                 self._mark_changed()
 
     def _reset_model(self, runtime: PersonRuntime) -> None:
-        """Reset a model, keeping the challenger switch (executor, under runtime.lock)."""
+        """Reset a model (executor, under runtime.lock)."""
         runtime.model.reset()
-        runtime.model.enable_challenger(self.challenger_enabled)
 
     def _effective_mode(self, runtime: PersonRuntime, maturity: float) -> str:
         if runtime.mode != MODE_AUTO:
@@ -778,8 +722,6 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
                 elif runtime.below_since is None:
                     runtime.below_since = now
                 results[person_id] = result
-                if computed.training_due:
-                    self._schedule_training(runtime, now)
         if failures and not results:
             person_id, err = next(iter(failures.items()))
             raise UpdateFailed(
@@ -812,45 +754,6 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         runtime.event_left_at = runtime.left_at
         self._mark_changed()
         return True
-
-    # ------------------------------------------------------------------ challenger
-
-    @callback
-    def _schedule_training(self, runtime: PersonRuntime, now: datetime) -> None:
-        """Train the challenger of a person in the background (once at a time)."""
-        if runtime.entity_id in self._training:
-            return
-        self._training.add(runtime.entity_id)
-        self.config_entry.async_create_background_task(
-            self.hass,
-            self._async_train(runtime, now),
-            f"{DOMAIN}_train_challenger_{runtime.slug}",
-        )
-
-    async def _async_train(self, runtime: PersonRuntime, now: datetime) -> None:
-        """Snapshot (locked) -> fit (unlocked, heavy) -> apply (locked)."""
-        model = runtime.model
-        try:
-            async with self._train_lock:
-                snapshot = await self._async_model_job(runtime, model.challenger_snapshot)
-                fitted = await self.hass.async_add_executor_job(
-                    type(model).fit_challenger, snapshot, now
-                )
-                summary = await self._async_model_job(runtime, model.apply_challenger, fitted, now)
-                runtime.dirty = True
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # a failed challenger must never stop the champion
-            _LOGGER.warning("Challenger training failed for %s", runtime.entity_id, exc_info=True)
-            # Back off until the normal retrain interval instead of retrying every update.
-            await self._async_model_job(runtime, model.note_challenger_failure, now)
-            runtime.dirty = True
-            return
-        finally:
-            self._training.discard(runtime.entity_id)
-        _LOGGER.debug("Challenger training for %s: %s", runtime.entity_id, summary)
-        await self._async_snapshot_dirty([runtime.entity_id])
-        self._schedule_save()
 
     def _fire_return_event(self, result: PersonResult) -> None:
         prediction = result.prediction

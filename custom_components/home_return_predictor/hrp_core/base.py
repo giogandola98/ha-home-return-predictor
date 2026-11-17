@@ -105,8 +105,8 @@ class MaturityReport:
     brier_score: float | None
     baseline_brier_score: float | None  # duration-only survival baseline
     brier_skill_score: float | None
-    fusion: str = "bayes"  # "bayes" / "learned" / "gbm" (compat alias of active_model)
-    active_model: str = "kernel_bayes"  # kernel_bayes / learned_fusion / gbm
+    fusion: str = "bayes"  # compat alias of active_model
+    active_model: str = "kernel_bayes"  # the only engine since state v2
     candidate_brier: dict[str, float | None] = field(default_factory=dict)  # last holdout
     # Return-based skill behind the maturity (maturity.return_skill)
     return_recall: float | None = None

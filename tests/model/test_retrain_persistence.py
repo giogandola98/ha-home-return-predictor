@@ -1,5 +1,5 @@
-"""Section 6 model fixes: merge on retrain (M1), served = evaluated fusion weights (M2),
-cheap observe_transition (M3), compact persistence (M4), split challenger training (M5)."""
+"""Section 6 model fixes: merge on retrain (M1),
+cheap observe_transition (M3), compact persistence (M4)."""
 
 from __future__ import annotations
 

@@ -18,15 +18,11 @@ from custom_components.home_return_predictor.const import (
 )
 from custom_components.home_return_predictor.hrp_core import KernelBayesReturnModel, ModelConfig
 from custom_components.home_return_predictor.hrp_core.base import PresenceTransition
-from custom_components.home_return_predictor.hrp_core.challenger import (
-    N_CHALLENGER_FEATURES,
-    GBMChallenger,
-)
 from custom_components.home_return_predictor.hrp_core.maturity import LogEntry
 
 from .conftest import ALICE, BOB, HOME_LAT, HOME_LON, person_attrs
 
-COORD = "custom_components.home_return_predictor.coordinator"
+N_CHALLENGER_FEATURES = 12  # row width of the retired challenger in v1 logs
 
 
 def _v1_state_with_gbm_champion() -> dict[str, Any]:
@@ -56,15 +52,13 @@ def _v1_state_with_gbm_champion() -> dict[str, Any]:
                 [0.0] * N_CHALLENGER_FEATURES,
             )  # fmt: skip
         )
-    gbm = GBMChallenger()
-    gbm.fit([[0.0] * N_CHALLENGER_FEATURES] * 4, [0, 0, 0, 0])
     data = model.to_dict()
     data.update(
         version=1,
         stacker={"weights": [0.1] * 8, "active": True, "trained_on": 400},
         selection={"champion": "gbm", "streak": {}, "brier": {"gbm": 0.01}, "evaluations": 3},
         challenger_enabled=True,
-        challenger=gbm.to_dict(),
+        challenger={"trained_on": 4, "constant": -4.6},
         last_training=now.isoformat(),
     )
     return data
@@ -90,7 +84,7 @@ async def test_v1_state_with_gbm_champion_loads_on_the_kernel_engine(
         "data": {"schema": 1, "persons": {ALICE: {"model": stored, "is_home": True}}},
     }
     install = AsyncMock(return_value=None)
-    with patch(f"{COORD}.async_process_requirements", install):
+    with patch("homeassistant.requirements.async_process_requirements", install):
         assert await hass.config_entries.async_setup(entry.entry_id)
         await hass.async_block_till_done(wait_background_tasks=True)
     install.assert_not_awaited()  # numpy is never installed any more
