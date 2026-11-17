@@ -9,7 +9,7 @@ from collections.abc import Iterable
 from datetime import date, datetime, timedelta
 from typing import Any
 
-from .arrival import arrival_tod_density, habit_arrival, with_evidence
+from .arrival import ArrivalDistribution, arrival_tod_density, habit_arrival, with_evidence
 from .base import (
     AbsenceEpisode,
     MaturityReport,
@@ -61,7 +61,14 @@ from .maturity import (
     maturity_report,
     resolve_entries,
 )
-from .prior import EpisodeKey, duration_baseline, episode_keys, estimate_prior, is_rest_day
+from .prior import (
+    EpisodeKey,
+    PriorResult,
+    duration_baseline,
+    episode_keys,
+    estimate_prior,
+    is_rest_day,
+)
 from .selection import (
     FUSION_ALIAS,
     GBM,
@@ -82,7 +89,10 @@ from .stacker import (
     fit_weights,
 )
 
-STATE_VERSION = 1
+# v2: single engine. The learned-engine blocks of v1 (stacker, selection, challenger,
+# last_training) are no longer written and are ignored when loading; episodes, trips,
+# GPS calibration and the prediction log are kept.
+STATE_VERSION = 2
 EPISODE_RETENTION_HALF_LIVES = 10.0
 STACKER_REFIT_EVERY = 150  # newly resolved entries between stacker refits
 CHALLENGER_RETRAIN_HOURS = 6.0
@@ -384,44 +394,47 @@ class KernelBayesReturnModel(ReturnModel):
         lr = self.calibrator.likelihood_ratio(ev.approach_class)
         p_bayes = fuse_probability(prior.probability, lr)
         active = self._serving_model()
-        if active == LEARNED_FUSION:
-            features = self._features(now, prior.probability, lr, minutes_away, ev.distance_m)
-            probability = self.stacker.predict(features)
-        elif active == GBM:
-            row = self._challenger_row(
-                now,
-                left_at,
-                minutes_away,
-                prior.probability,
-                lr,
-                ev.distance_m,
-                ev.speed_kmh,
-                model_input.is_holiday,
-            )
-            probability = self._challenger.predict_proba(row)
-        else:
-            probability = p_bayes
-        probability, floored = gps_floor(probability, p_bayes, ev.approach_class, lr)
+
+        pos_min = position_eta_minutes(ev.distance_m, ev.speed_kmh, cfg.horizon_minutes)
+        # Physical bound, whatever the horizon: too far to be home before travel_min.
+        # A stationary phone reports rarely, so fall back to the last known fix and its age.
+        feas_distance, feas_age = ev.distance_m, 0.0
+        if feas_distance is None and model_input.last_fix is not None:
+            feas_distance = model_input.last_fix.distance_m
+            feas_age = max(minutes_between(to_utc(model_input.last_fix.ts), now), 0.0)
+        travel_min = min_travel_minutes(feas_distance)
+        if travel_min is not None:
+            travel_min = max(travel_min - feas_age, 0.0)
+
+        # Single engine: habit prior x calibrated GPS likelihood ratio.
+        probability = p_bayes
 
         habit_min = (
             prior.eta_duration_minutes - minutes_away
             if prior.eta_duration_minutes is not None
             else None
         )
-        pos_min = position_eta_minutes(ev.distance_m, ev.speed_kmh, cfg.horizon_minutes)
-        eta_min, eta_source = combine_eta(habit_min, prior.eta_iqr_minutes, pos_min)
-        # Physical sanity check, whatever model is serving: too far to make it within the horizon.
-        # A stationary phone reports rarely, so fall back to the last known fix and its age.
-        feas_distance, feas_age = ev.distance_m, 0.0
-        if feas_distance is None and model_input.last_fix is not None:
-            feas_distance = model_input.last_fix.distance_m
-            feas_age = max(minutes_between(to_utc(model_input.last_fix.ts), now), 0.0)
+        habit_iqr = prior.eta_iqr_minutes
+        habit = (
+            self._arrival_model(now, minutes_away, prior)
+            if habit_min is None and left_at is not None
+            else None
+        )
+        if habit is not None:
+            # Past the usual time (or beyond 12 h): the arrival distribution's median
+            # instead of no habit ETA at all.
+            dist = with_evidence(
+                habit, prior=prior.probability, p_bayes=p_bayes, eta_minutes=pos_min,
+                min_minutes=travel_min,
+            )  # fmt: skip
+            q50, q25, q75 = dist.quantile(0.5), dist.quantile(0.25), dist.quantile(0.75)
+            if q50 is not None:
+                habit_min = q50
+                habit_iqr = q75 - q25 if q25 is not None and q75 is not None else None
+        eta_min, eta_source = combine_eta(habit_min, habit_iqr, pos_min)
         probability, eta_min, feasible = apply_feasibility(
             probability, eta_min, feas_distance, cfg.horizon_minutes, feas_age
         )
-        travel_min = min_travel_minutes(feas_distance)
-        if travel_min is not None:
-            travel_min = max(travel_min - feas_age, 0.0)
 
         def at(minutes: float | None) -> datetime | None:
             return now + timedelta(minutes=minutes) if minutes is not None else None
@@ -439,7 +452,7 @@ class KernelBayesReturnModel(ReturnModel):
             "fusion": FUSION_ALIAS[active],
             "active_model": active,
             "probability_bayes": round(p_bayes, 4),
-            "gps_floor": floored,
+            "gps_floor": False,
             "feasible": feasible,
             "min_travel_minutes": round(travel_min, 1) if travel_min is not None else None,
         }
@@ -485,23 +498,7 @@ class KernelBayesReturnModel(ReturnModel):
             half_life_days=cfg.half_life_days,
             tz=cfg.timezone,
         )
-        # The arrival time-of-day density only moves with the recency weights: cache it
-        # per hour and per set of absences.
-        cache_key = (len(ep_keys), len(trip_keys), self._generation, int(now.timestamp() // 3600))
-        if self._tod_density is None or self._tod_density[0] != cache_key:
-            pool = (*ep_keys, *trip_keys)
-            density = arrival_tod_density(pool, now, cfg.half_life_days) if pool else None
-            self._tod_density = (cache_key, density)
-        habit = habit_arrival(
-            ep_keys,
-            trip_keys,
-            prior.durations,
-            now=now,
-            minutes_away=minutes_away,
-            half_life_days=cfg.half_life_days,
-            tz=cfg.timezone,
-            density=self._tod_density[1],
-        )
+        habit = self._arrival_model(now, minutes_away, prior)
         if habit is None:
             return None
         reason = prediction.reason or {}
@@ -516,6 +513,30 @@ class KernelBayesReturnModel(ReturnModel):
             p_bayes=reason.get("probability_bayes"),
             eta_minutes=eta_pos,
             min_minutes=reason.get("min_travel_minutes"),
+        )
+
+    def _arrival_model(
+        self, now: datetime, minutes_away: float, prior: PriorResult
+    ) -> ArrivalDistribution | None:
+        """Habit-only arrival distribution (``arrival.habit_arrival``), cached density."""
+        cfg = self.config
+        ep_keys, trip_keys = self._keys()
+        # The arrival time-of-day density only moves with the recency weights: cache it
+        # per hour and per set of absences.
+        cache_key = (len(ep_keys), len(trip_keys), self._generation, int(now.timestamp() // 3600))
+        if self._tod_density is None or self._tod_density[0] != cache_key:
+            pool = (*ep_keys, *trip_keys)
+            density = arrival_tod_density(pool, now, cfg.half_life_days) if pool else None
+            self._tod_density = (cache_key, density)
+        return habit_arrival(
+            ep_keys,
+            trip_keys,
+            prior.durations,
+            now=now,
+            minutes_away=minutes_away,
+            half_life_days=cfg.half_life_days,
+            tz=cfg.timezone,
+            density=self._tod_density[1],
         )
 
     def _features(
@@ -569,16 +590,7 @@ class KernelBayesReturnModel(ReturnModel):
         )
 
     def _serving_model(self) -> str:
-        """Champion, or the next-best candidate while the champion cannot serve."""
-        champ = self.selector.champion
-        if champ != GBM:
-            return champ
-        if self._challenger_enabled and self._challenger.trained:
-            return GBM
-        brier = self.selector.brier
-        learned, bayes = brier.get(LEARNED_FUSION), brier.get(KERNEL_BAYES)
-        if learned is not None and bayes is not None and learned < bayes:
-            return LEARNED_FUSION
+        """Always the kernel prior x GPS evidence (single engine since state v2)."""
         return KERNEL_BAYES
 
     # ------------------------------------------------------------ logging/scoring
@@ -668,21 +680,8 @@ class KernelBayesReturnModel(ReturnModel):
         fusion weights, so the stacker is not refit here: the weights served are
         always the ones the selector evaluated.
         """
-        if self._since_refit < STACKER_REFIT_EVERY:
-            return
+        # Single engine: nothing is refit from the prediction log any more.
         self._since_refit = 0
-        if self._challenger_mode():
-            return
-        if not self.stacker.fit(self._log.resolved, now, self.config.half_life_days):
-            self.selector.demote()  # no holdout with real returns: serve the reference
-            return
-        self.selector.update(
-            {
-                KERNEL_BAYES: self.stacker.holdout_brier_bayes,
-                LEARNED_FUSION: self.stacker.holdout_brier_learned,
-            },
-            self.stacker.trained_on,
-        )
 
     # ----------------------------------------------------------------- challenger
     def _challenger_rows(self) -> list[LogEntry]:
@@ -703,11 +702,10 @@ class KernelBayesReturnModel(ReturnModel):
         )
 
     def enable_challenger(self, enabled: bool) -> None:
-        """Switch the optional gradient-boosting challenger on or off."""
-        self._challenger_enabled = bool(enabled)
-        if not enabled:
-            self._challenger = GBMChallenger()
-            self._last_training = None
+        """Ignored: the gradient-boosting challenger is retired (single engine)."""
+        self._challenger_enabled = False
+        self._challenger = GBMChallenger()
+        self._last_training = None
 
     def challenger_due(self, now: datetime) -> bool:
         """True when ``train_challenger`` should run (cheap; call from the event loop)."""
@@ -929,18 +927,11 @@ class KernelBayesReturnModel(ReturnModel):
                 else None
             ),
             "calibrator": self.calibrator.to_dict(),
-            "stacker": self.stacker.to_dict(),
             "log": self._log.to_dict(),
             "calib_pending": encode_entries(self._calib_pending),
             "segments": self._segments.to_dict(),
             "since_refit": self._since_refit,
-            "selection": self.selector.to_dict(),
-            "challenger_enabled": self._challenger_enabled,
-            "challenger": self._challenger.to_dict(),
             "generation": self._generation,
-            # Persisted so a restart does not make the challenger immediately due again
-            # (each re-evaluation on almost the same holdout would count as a new "win").
-            "last_training": _iso(self._last_training),
         }
 
     @classmethod
@@ -957,20 +948,13 @@ class KernelBayesReturnModel(ReturnModel):
             arrived, left = datetime.fromisoformat(arrival[0]), datetime.fromisoformat(arrival[1])
             model._arrival = (arrived, left, bool(arrival[2]))
         model.calibrator = LRCalibrator.from_dict(data.get("calibrator", {}))
-        model.stacker = Stacker.from_dict(data.get("stacker", {}))
+        # v1 blocks of the retired learned engines (stacker, selection, challenger,
+        # last_training) are ignored: the kernel engine serves.
         model._log = PredictionLog.from_dict(data.get("log", {}))
         model._calib_pending = decode_entries(data.get("calib_pending"))
         model._segments = CalibrationSegments.from_dict(data.get("segments") or {})
         model._since_refit = int(data.get("since_refit", 0))
-        if "selection" in data:
-            model.selector = Selector.from_dict(data["selection"] or {})
-        elif model.stacker.active:  # state written before the generic selection existed
-            model.selector.champion = LEARNED_FUSION
-        model._challenger_enabled = bool(data.get("challenger_enabled", False))
-        if model._challenger_enabled:
-            model._challenger = GBMChallenger.from_dict(data.get("challenger"))
         model._generation = int(data.get("generation", 0))
-        model._last_training = _parse(data.get("last_training"))
         stored_horizon = data.get("horizon_minutes")  # missing: older snapshot, keep
         if stored_horizon is not None and float(stored_horizon) != config.horizon_minutes:
             model.discard_scoring()

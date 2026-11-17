@@ -5,12 +5,12 @@ from __future__ import annotations
 from datetime import date, timedelta
 
 import pytest
-from model_helpers import CONFIG, approach_fixes, away_input, local
+from model_helpers import approach_fixes, local
 
-from hrp_core import KernelBayesReturnModel, PositionFix
+from hrp_core import PositionFix
 from hrp_core.evidence import compute_evidence
 from hrp_core.maturity import LogEntry
-from hrp_core.selection import GBM, KERNEL_BAYES, LEARNED_FUSION, informative_split
+from hrp_core.selection import informative_split
 from hrp_core.stacker import N_FEATURES, Stacker
 
 DAY = date(2026, 3, 2)
@@ -88,48 +88,6 @@ def test_stacker_skips_a_holdout_without_returns() -> None:
     assert st.holdout_brier_bayes is not None
 
 
-def test_challenger_on_a_trip_falls_back_to_the_reference() -> None:
-    model = KernelBayesReturnModel(CONFIG)
-    model.enable_challenger(True)
-    model.selector.champion = LEARNED_FUSION
-    brier = {KERNEL_BAYES: 0.05, LEARNED_FUSION: 0.04, GBM: None}
-    model.selector.brier = dict(brier)
-    entries = _entries([1, 0, 0] * 100 + [0] * 400)
-    snapshot = {
-        "enabled": True,
-        "generation": model.generation,
-        "half_life_days": 28.0,
-        "resolved_total": len(entries),
-        "ts": [e.ts for e in entries],
-        "x": [[0.0] * 12 for _ in entries],
-        "f": [e.features for e in entries],
-        "y": [int(e.outcome or 0) for e in entries],
-    }
-    now = entries[-1].ts
-    fitted = model.fit_challenger(snapshot, now)
-    assert fitted["status"] == "uninformative_holdout"
-    summary = model.apply_challenger(fitted, now)
-    assert summary["trained"] is False and summary["reason"] == "uninformative_holdout"
-    # nothing can vouch for the learned champion: the reference model serves
-    assert model.selector.champion == KERNEL_BAYES and model.selector.brier == brier
-
-
-def test_learned_model_never_undercuts_a_clear_gps_approach() -> None:
-    model = KernelBayesReturnModel(CONFIG)
-    model.selector.champion = LEARNED_FUSION
-    model.stacker.weights = [-12.0] + [0.0] * N_FEATURES  # always ~P_MIN
-    now = local(DAY, 600)
-    approaching = away_input(DAY, 300, 600, approach_fixes(now, 6000, 50))
-    pred = model.predict(approaching)
-    assert pred.approach_class == "approach_fast" and pred.likelihood_ratio > 1
-    assert pred.reason["gps_floor"] is True
-    assert pred.probability == pytest.approx(pred.reason["probability_bayes"], abs=1e-4)
-    # without GPS the learned model serves as it is
-    still = model.predict(away_input(DAY, 300, 600))
-    assert still.reason["gps_floor"] is False
-    assert still.probability < still.reason["probability_bayes"]
-
-
 def test_returns_separated_by_a_stay_at_home_are_counted_apart() -> None:
     # absence A ends with 10 positive entries; after 3 h at home a short absence B
     # (5 entries, all positive) follows. The log only holds absences, so the runs touch.
@@ -154,12 +112,3 @@ def test_burst_of_fixes_falls_back_to_the_extended_window() -> None:
     burst = [PositionFix(now - timedelta(seconds=s), 9000 - 800 * 15, 15.0) for s in (50, 30, 10)]
     ev = compute_evidence([*older, *burst], now, 10, 250)
     assert ev.approach_class is not None and ev.speed_kmh > 30
-
-
-def test_stacker_refit_on_a_trip_demotes_a_learned_champion() -> None:
-    model = KernelBayesReturnModel(CONFIG)
-    model.selector.champion = LEARNED_FUSION
-    model._log.resolved.extend(_entries([1, 0, 0] * 50 + [0] * 300))
-    model._since_refit = 10_000
-    model._maybe_refit(local(DAY, 0) + timedelta(days=5))
-    assert model.selector.champion == KERNEL_BAYES

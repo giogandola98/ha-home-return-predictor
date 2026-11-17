@@ -11,22 +11,11 @@ import pytest
 from model_helpers import CONFIG, approach_fixes, away_input, local
 
 from hrp_core import KernelBayesReturnModel, ModelInput, PresenceTransition
-from hrp_core import bayes_model as bayes_module
-from hrp_core.bayes_model import STACKER_REFIT_EVERY
 from hrp_core.maturity import LogEntry, decode_entries, encode_entries
-from hrp_core.selection import (
-    KERNEL_BAYES,
-    LEARNED_FUSION,
-    informative_split,
-    recency_weights,
-    weighted_brier,
-)
-from hrp_core.stacker import Stacker, _served, apply_weights
 from hrp_core.synthetic import (
     DEFAULT_START,
     fixed_schedule_person,
     replay_online,
-    rotating_shift_person,
 )
 
 MAX_STATE_BYTES = 400_000
@@ -114,97 +103,6 @@ def test_merge_warms_calibration_only_when_empty() -> None:
 
 
 # --------------------------------------------------------------------------- M2
-def test_stacker_serves_the_evaluated_weights() -> None:
-    tl = rotating_shift_person(days=40, seed=6, drive_by_rate=0.6)
-    model = KernelBayesReturnModel(CONFIG)
-    for _ in replay_online(model, tl):
-        pass
-    now = tl.absences[-1].returned_at
-    st = Stacker()
-    st.fit(model._log.resolved, now, CONFIG.half_life_days)
-    assert st.holdout_brier_learned is not None
-    usable = [e for e in model._log.resolved if e.outcome is not None and e.features]
-    usable = usable[-1500:]
-    split = informative_split([int(e.outcome or 0) for e in usable], times=[e.ts for e in usable])
-    hold = usable[split:]
-    w = recency_weights([e.ts for e in hold], now, CONFIG.half_life_days)
-    served = weighted_brier(
-        [_served(st.weights, e) for e in hold],  # as predict serves it (GPS floor)
-        [int(e.outcome or 0) for e in hold],
-        w,
-    )
-    assert served == pytest.approx(st.holdout_brier_learned, rel=1e-9)
-
-
-def test_challenger_installs_the_evaluated_fusion_weights() -> None:
-    pytest.importorskip("numpy")
-    tl = rotating_shift_person(days=35, seed=5)
-    model = KernelBayesReturnModel(CONFIG)
-    model.enable_challenger(True)
-    for _ in replay_online(model, tl):
-        pass
-    now = tl.absences[-1].returned_at
-    summary = model.train_challenger(now)
-    assert summary["trained"]
-    rows = model._challenger_rows()
-    split = informative_split([int(e.outcome or 0) for e in rows], times=[e.ts for e in rows])
-    hold = rows[split:]
-    w = recency_weights([e.ts for e in hold], now, CONFIG.half_life_days)
-    served = weighted_brier(
-        [_served(model.stacker.weights, e) for e in hold],
-        [int(e.outcome or 0) for e in hold],
-        w,
-    )
-    assert served == pytest.approx(summary["brier"][LEARNED_FUSION], rel=1e-9)
-
-    # Learned fusion champion: predict uses exactly those weights.
-    model.selector.champion = LEARNED_FUSION
-    weights = list(model.stacker.weights)
-    inp = away_input(tl.absences[-1].returned_at.date() + timedelta(days=1), 400, 600)
-    pred = model.predict(inp)
-    assert pred.reason["active_model"] == LEARNED_FUSION
-    assert pred.prior_probability is not None
-    features = model._features(
-        inp.now, pred.prior_probability, pred.likelihood_ratio, 200.0, pred.distance_m
-    )
-    assert pred.probability == apply_weights(weights, features)
-
-    # A stacker refit due in challenger mode must not overwrite the evaluated weights.
-    model._since_refit = STACKER_REFIT_EVERY
-    model.resolve(now + timedelta(minutes=1), True)
-    assert model.stacker.weights == weights
-
-
-# --------------------------------------------------------------------------- M3
-def test_observe_transition_defers_refit_to_resolve(monkeypatch: pytest.MonkeyPatch) -> None:
-    model = KernelBayesReturnModel(CONFIG)
-    model.enable_challenger(True)
-    day = DEFAULT_START
-    model.observe_transition(PresenceTransition(local(day, 480), False))
-    for minute in range(490, 700, 10):
-        inp = away_input(day, 480, minute)
-        model.log_prediction(inp, model.predict(inp))
-    model._since_refit = STACKER_REFIT_EVERY
-
-    def boom(*args: object, **kwargs: object) -> None:
-        raise AssertionError("heavy work inside observe_transition")
-
-    monkeypatch.setattr(Stacker, "fit", boom)
-    monkeypatch.setattr(bayes_module, "numpy_available", boom)
-    ep = model.observe_transition(PresenceTransition(local(day, 705), True))
-    assert ep is not None
-    model.resolve(local(day, 706), True)  # stay not confirmed yet: nothing scored
-    assert model._since_refit == STACKER_REFIT_EVERY
-
-    calls: list[int] = []
-    monkeypatch.setattr(Stacker, "fit", lambda self, *a, **k: calls.append(1))
-    monkeypatch.setattr(bayes_module, "numpy_available", lambda: False)
-    model.resolve(local(day, 710), True)
-    assert calls == [1] and model._since_refit == 0
-    assert model.selector.champion == KERNEL_BAYES
-
-
-# --------------------------------------------------------------------------- M4
 def test_compact_state_size_and_round_trip(long_model) -> None:  # type: ignore[no-untyped-def]
     model, _ = long_model
     state = model.to_dict()
@@ -244,45 +142,14 @@ def test_encode_keeps_unusual_rows_verbatim() -> None:
 
 
 # --------------------------------------------------------------------------- M5
-def test_split_training_matches_wrapper_and_fit_touches_no_model() -> None:
-    pytest.importorskip("numpy")
-    tl = rotating_shift_person(days=35, seed=5)
-    model = KernelBayesReturnModel(CONFIG)
-    model.enable_challenger(True)
-    for _ in replay_online(model, tl):
-        pass
-    now = tl.absences[-1].returned_at
-    twin = KernelBayesReturnModel.from_dict(json.loads(json.dumps(model.to_dict())), CONFIG)
-    twin.enable_challenger(True)
-
-    snapshot = model.challenger_snapshot()
-    before = json.dumps(model.to_dict())
-    result = KernelBayesReturnModel.fit_challenger(snapshot, now)
-    assert json.dumps(model.to_dict()) == before
-    summary = model.apply_challenger(result, now)
-    expected = twin.train_challenger(now)
-    assert summary["trained"] and summary["reason"] == "ok"
-    for key in ("trained", "reason", "rows", "brier", "active_model"):
-        assert summary[key] == expected[key]
-    assert model.stacker.weights == twin.stacker.weights
-    assert not model.challenger_due(now + timedelta(hours=1))
-    inp = away_input(now.date() + timedelta(days=1), 400, 600)
-    assert model.predict(inp) == twin.predict(inp)
-
-    model.enable_challenger(False)
-    off = model.apply_challenger(KernelBayesReturnModel.fit_challenger(snapshot, now), now)
-    assert not off["trained"] and off["reason"] == "disabled"
-
-
-# ------------------------------------------------------------------ horizon change
 def test_horizon_change_discards_horizon_dependent_state(
     long_model: tuple[KernelBayesReturnModel, object],
 ) -> None:
-    """A new horizon redefines the target: log/stacker/selection go, habits stay."""
+    """A new horizon redefines the target: the prediction log goes, habits stay."""
     model, _tl = long_model
     state = model.to_dict()
     assert state["horizon_minutes"] == CONFIG.horizon_minutes
-    assert model._log.resolved and model.stacker.trained_on > 0
+    assert model._log.resolved
     now = local(DEFAULT_START + timedelta(days=121), 0)
 
     same = KernelBayesReturnModel.from_dict(state, CONFIG)
@@ -293,8 +160,6 @@ def test_horizon_change_discards_horizon_dependent_state(
     assert changed.episodes() == model.episodes() and changed.trips() == model.trips()
     assert changed._log.resolved == [] and changed._log.pending == []
     assert changed._calib_pending == []
-    assert changed.stacker.trained_on == 0 and not changed.stacker.active
-    assert changed.selector.champion == KERNEL_BAYES and changed.selector.brier == {}
     assert changed.maturity(now).resolved_predictions == 0
     assert changed.to_dict()["horizon_minutes"] == 45.0
 

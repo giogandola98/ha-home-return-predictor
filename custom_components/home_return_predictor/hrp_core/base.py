@@ -108,6 +108,9 @@ class MaturityReport:
     fusion: str = "bayes"  # "bayes" / "learned" / "gbm" (compat alias of active_model)
     active_model: str = "kernel_bayes"  # kernel_bayes / learned_fusion / gbm
     candidate_brier: dict[str, float | None] = field(default_factory=dict)  # last holdout
+    # Return-based skill behind the maturity (maturity.return_skill)
+    return_recall: float | None = None
+    false_alarms_per_return: float | None = None
 
 
 class ReturnModel(ABC):
