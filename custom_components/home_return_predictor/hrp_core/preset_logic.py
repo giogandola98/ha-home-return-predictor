@@ -24,6 +24,13 @@ Priority, highest first:
    single (house probability, house ETA) pair is used.
    With someone home the result is the higher-ranked of (3) and (4): another
    person's return never downgrades a zone. With nobody home it is (4) or ``absent``.
+   With a ``preheat_now`` sensor (e.g. Room Thermal Model's
+   ``binary_sensor.<zone>_preheat_now``) the decision "when" is taken by that sensor:
+   ``on`` -> ``comfort`` if the zone schedule is active at its ``arrival``, ``off`` ->
+   no predicted return; probability, ETA and pre-heat window are not used.
+5. Short absence (only with an expected-absence sensor, nobody home): when the q25 of
+   the remaining empty time is below ``short_absence_hours`` the ``absent`` preset is
+   replaced by ``short_absence`` (no deep setback for a few hours).
 
 The blueprint never sets temperatures; it only switches VTherm presets.
 """
@@ -31,7 +38,7 @@ The blueprint never sets temperatures; it only switches VTherm presets.
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 
 ZONE_DAY = "day"
@@ -63,6 +70,7 @@ class PresetConfig:
     absent: str = "frost"
     unused: str = "eco"  # zone outside its schedule while people are home
     night: str = "eco"  # day zones while the bed switch is on
+    short_absence: str = "eco"  # nobody home, short expected absence
 
 
 @dataclass(frozen=True)
@@ -97,6 +105,12 @@ class ZoneInputs:
     prediction_enabled: bool = True
     presets: PresetConfig = field(default_factory=PresetConfig)
     thresholds: Thresholds = field(default_factory=Thresholds)
+    # None = no preheat_now sensor configured (the probability/ETA rule applies).
+    preheat_now: bool | None = None
+    preheat_arrival: datetime | None = None  # expected arrival of the preheat_now sensor
+    # q25 (hours) of the expected remaining absence; None = no sensor / unknown.
+    expected_absence_hours: float | None = None
+    short_absence_hours: float = 12.0
 
 
 @dataclass(frozen=True)
@@ -145,6 +159,8 @@ def _return_candidate(inputs: ZoneInputs, current_preset: str | None) -> tuple[s
     """
     if not inputs.prediction_enabled:
         return None, "prediction ignored (not live)"
+    if inputs.preheat_now is not None:
+        return _preheat_now(inputs)
     candidates = list(inputs.return_candidates or ()) or [
         (inputs.house_probability, inputs.house_eta)
     ]
@@ -158,6 +174,18 @@ def _return_candidate(inputs: ZoneInputs, current_preset: str | None) -> tuple[s
             best = (preset, reason)
     assert best is not None
     return best
+
+
+def _preheat_now(inputs: ZoneInputs) -> tuple[str | None, str]:
+    """Return rule driven by an external ``preheat_now`` sensor."""
+    if not inputs.preheat_now:
+        return None, "preheat_now off"
+    arrival = max(inputs.preheat_arrival or inputs.now, inputs.now)
+    if inputs.schedule is not None and not schedule_active_at(
+        inputs.schedule[0], inputs.schedule[1], arrival
+    ):
+        return None, f"preheat_now on, zone not scheduled at arrival {arrival:%H:%M}"
+    return inputs.presets.comfort, f"preheat_now on, arrival {arrival:%H:%M}"
 
 
 def _single_return(
@@ -189,6 +217,15 @@ def _single_return(
 
 def decide_preset(inputs: ZoneInputs, current_preset: str | None) -> Decision:
     """Decide the VTherm preset for one zone (see module docstring for priority)."""
+    if (
+        not inputs.someone_home
+        and inputs.expected_absence_hours is not None
+        and inputs.expected_absence_hours < inputs.short_absence_hours
+    ):
+        # Short absence: the "absent" role is played by the short-absence preset.
+        inputs = replace(
+            inputs, presets=replace(inputs.presets, absent=inputs.presets.short_absence)
+        )
     presets = inputs.presets
     if inputs.protection_active:
         return Decision(None, "protection active (window/safety/power/off): not touching")

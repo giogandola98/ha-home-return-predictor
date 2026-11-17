@@ -19,8 +19,15 @@ views:
           - entity: sensor.house_return_probability
             name: House return probability
           - entity: sensor.house_next_return_eta
-            name: Next arrival
+            name: Next return (90-min ETA)
             format: time
+          # With Room Thermal Model: the arrival quantile it pre-heats for, and the
+          # expected empty time that picks the setback depth.
+          - entity: sensor.house_next_arrival
+            name: Next arrival (q25)
+            format: time
+          - entity: sensor.house_expected_absence
+            name: Expected absence
           - type: attribute
             entity: sensor.house_return_probability
             attribute: away_probability

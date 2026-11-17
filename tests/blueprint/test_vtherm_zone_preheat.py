@@ -361,3 +361,91 @@ async def test_candidates_each_checked_against_schedule(hass: HomeAssistant) -> 
     _climate(hass, "frost")
     _candidates(hass, 97, [("person.alice", 50, 10), ("person.bob", 95, 25)])
     assert await _run(hass, calls) == "eco"
+
+
+# ------------------------------------------- preheat_now sensor and short absences
+# Same cases as tests/model/test_preset_logic.py.
+
+PREHEAT_NOW = "binary_sensor.bedroom_preheat_now"
+ABSENCE = "sensor.house_expected_absence"
+
+
+def _preheat_now(hass: HomeAssistant, on: bool, arrival_min: float | None) -> None:
+    attrs = {}
+    if arrival_min is not None:
+        attrs["arrival_at_latch"] = (dt_util.now() + timedelta(minutes=arrival_min)).isoformat()
+    hass.states.async_set(PREHEAT_NOW, "on" if on else "off", attrs)
+
+
+async def test_new_inputs_empty_keep_the_table(hass: HomeAssistant) -> None:
+    defaults = _defaults(_load())
+    assert defaults["preheat_now_sensor"] == ""
+    assert defaults["expected_absence_sensor"] == ""
+    assert defaults["short_absence_hours"] == 12
+    assert defaults["short_absence_preset"] == "eco"
+    calls = await _setup(hass)
+    _house(hass, prob=90, eta_min=20)
+    _climate(hass, "frost")
+    assert await _run(hass, calls) == "comfort"
+    _house(hass, prob=0, eta_min=None)
+    _climate(hass, "eco")
+    assert await _run(hass, calls) == "frost"
+
+
+async def test_preheat_now_replaces_probability_and_window(hass: HomeAssistant) -> None:
+    calls = await _setup(hass, preheat_now_sensor=PREHEAT_NOW)
+    _climate(hass, "frost")
+    _house(hass, prob=5, eta_min=None)
+    _preheat_now(hass, True, 180)
+    assert await _run(hass, calls) == "comfort"
+    _climate(hass, "comfort")
+    _house(hass, prob=95, eta_min=10)
+    _preheat_now(hass, False, None)
+    assert await _run(hass, calls) == "frost"  # the old rule is not used
+    _climate(hass, "frost")
+    _house(hass, prob=5, eta_min=None, live=False)
+    _preheat_now(hass, True, 180)
+    assert await _run(hass, calls) is None  # act only in live mode
+
+
+async def test_preheat_now_on_but_schedule_inactive_at_arrival(hass: HomeAssistant) -> None:
+    calls = await _setup(
+        hass, preheat_now_sensor=PREHEAT_NOW, schedule_entity="schedule.bedroom", zone_type="night"
+    )
+    _climate(hass, "frost")
+    _house(hass, prob=5, eta_min=None)
+    _schedule(hass, False, 300)  # schedule starts in 5 h
+    _preheat_now(hass, True, 180)  # arrival in 3 h
+    assert await _run(hass, calls) is None  # stays frost
+    _preheat_now(hass, True, 330)
+    assert await _run(hass, calls) == "comfort"
+
+
+@pytest.mark.parametrize(("q25", "expected"), [(5.0, "eco"), (30.0, None), (None, None)])
+async def test_short_absence_preset(hass: HomeAssistant, q25, expected) -> None:
+    calls = await _setup(hass, expected_absence_sensor=ABSENCE)
+    attrs = {} if q25 is None else {"q25": q25, "absence_class": "day"}
+    hass.states.async_set(ABSENCE, "unknown" if q25 is None else str(q25 + 1), attrs)
+    _house(hass, prob=0, eta_min=None)
+    _climate(hass, "frost")
+    assert await _run(hass, calls) == expected  # None: stays frost
+
+
+async def test_short_absence_custom_and_return_unlikely(hass: HomeAssistant) -> None:
+    calls = await _setup(
+        hass,
+        expected_absence_sensor=ABSENCE,
+        short_absence_hours=4,
+        short_absence_preset="comfort",
+    )
+    hass.states.async_set(ABSENCE, "4", {"q25": 3.0})
+    _house(hass, prob=10, eta_min=10)
+    _climate(hass, "frost")
+    assert await _run(hass, calls) == "comfort"
+    _house(hass, home=1)
+    _climate(hass, "comfort")
+    assert await _run(hass, calls) is None
+    hass.states.async_set(ABSENCE, "7", {"q25": 6.0})
+    _house(hass, prob=10, eta_min=10)
+    _climate(hass, "eco")
+    assert await _run(hass, calls) == "frost"
