@@ -36,6 +36,23 @@ class Absence:
     kind: str
     destination_km: float
     drive_by_at: datetime | None = None
+    # Optional knobs (None = the historical random draw, so older timelines are unchanged)
+    seed: int | None = None  # trajectory seed: absences sharing it share the trajectory
+    kmh: float | None = None  # outbound speed
+    back_kmh: float | None = None  # speed of the drive home
+    drive_by_m: float | None = None  # closest distance of the drive-by
+    zone: str | None = None  # known zone at the destination (enter/exit events)
+    zone_passes: tuple[datetime, ...] = ()  # passes through ``pass_zone`` without stopping
+    pass_zone: str = "work"
+
+
+@dataclass(frozen=True)
+class ZoneEvent:
+    """Entering or leaving a known (non-home) zone."""
+
+    ts: datetime
+    zone: str
+    entered: bool
 
 
 @dataclass
@@ -47,6 +64,8 @@ class Timeline:
     absences: list[Absence] = field(default_factory=list)
     transitions: list[PresenceTransition] = field(default_factory=list)
     fixes: list[PositionFix] = field(default_factory=list)
+    zone_events: list[ZoneEvent] = field(default_factory=list)
+    style: str = "android"  # GPS reporting: "android" (dense) or "iphone" (sparse)
     _fix_times: list[datetime] = field(default_factory=list, repr=False)
 
     def fixes_between(self, start: datetime, end: datetime) -> list[PositionFix]:
@@ -64,7 +83,7 @@ def _local(day: date, minutes: float, tz: tzinfo) -> datetime:
 
 
 class _FixWriter:
-    """Generates noisy GPS fixes along piecewise trajectories."""
+    """Generates noisy GPS fixes along piecewise trajectories (dense reporting)."""
 
     def __init__(self, rng: random.Random) -> None:
         self.rng = rng
@@ -97,38 +116,84 @@ class _FixWriter:
             t += timedelta(minutes=self.rng.uniform(8, 20))
 
 
-def _build(name: str, tz: tzinfo, absences: list[Absence], rng: random.Random) -> Timeline:
+class _IPhoneWriter(_FixWriter):
+    """iPhone-like reporting: a fix every ~5 min on the move (sometimes a burst of 3
+    fixes within a minute), one fix shortly after stopping, then silence."""
+
+    def drive(self, start: datetime, d0: float, d1: float, kmh: float) -> datetime:
+        minutes = abs(d1 - d0) / 1000.0 / kmh * 60.0
+        t = self.rng.uniform(0.5, 2.0)
+        while t < minutes:
+            burst = self.rng.random() < IPHONE_BURST_RATE
+            for k in range(3 if burst else 1):
+                tk = min(t + 0.4 * k, minutes)
+                self._emit(start + timedelta(minutes=tk), d0 + (d1 - d0) * tk / minutes)
+            t += self.rng.uniform(4.0, 6.0)
+        return start + timedelta(minutes=minutes)
+
+    def stay(self, start: datetime, end: datetime, dist: float) -> None:
+        t = start + timedelta(minutes=self.rng.uniform(1, 3))
+        if t < end:
+            self._emit(t, dist)
+
+
+IPHONE_BURST_RATE = 0.1
+WRITERS: dict[str, type[_FixWriter]] = {"android": _FixWriter, "iphone": _IPhoneWriter}
+
+
+def _build(
+    name: str,
+    tz: tzinfo,
+    absences: list[Absence],
+    rng: random.Random,
+    style: str = "android",
+) -> Timeline:
     absences.sort(key=lambda a: a.left_at)
     clean: list[Absence] = []
     for ab in absences:
         if clean and ab.left_at < clean[-1].returned_at + timedelta(minutes=5):
             continue
         clean.append(ab)
-    writer = _FixWriter(rng)
+    writer = WRITERS[style](rng)
     transitions: list[PresenceTransition] = []
+    zone_events: list[ZoneEvent] = []
     for ab in clean:
         transitions.append(PresenceTransition(ab.left_at, False))
         transitions.append(PresenceTransition(ab.returned_at, True))
         total = (ab.returned_at - ab.left_at).total_seconds() / 60.0
         if total < 15:
             continue  # GPS bounce / tiny outing: no trajectory
+        tr = random.Random(ab.seed) if ab.seed is not None else rng
         dest = ab.destination_km * 1000.0
-        kmh = rng.uniform(40, 60)
-        here = writer.drive(ab.left_at, 0.0, dest, kmh)
+        kmh = tr.uniform(40, 60)
+        here = writer.drive(ab.left_at, 0.0, dest, ab.kmh or kmh)
+        if ab.kmh:
+            kmh = ab.kmh
         current = dest
+        if ab.zone is not None:
+            zone_events.append(ZoneEvent(here, ab.zone, True))
+        for ts in ab.zone_passes:
+            zone_events.append(ZoneEvent(ts, ab.pass_zone, True))
+            zone_events.append(ZoneEvent(ts + timedelta(minutes=3), ab.pass_zone, False))
         if ab.drive_by_at is not None:
-            closest = rng.uniform(200, 500)
+            closest = tr.uniform(200, 500)
+            if ab.drive_by_m is not None:
+                closest = ab.drive_by_m
             approach_start = ab.drive_by_at - timedelta(
                 minutes=(current - closest) / 1000.0 / kmh * 60.0
             )
             writer.stay(here, approach_start, current)
             writer.drive(approach_start, current, closest, kmh)
-            current = rng.uniform(5, 15) * 1000.0
+            current = tr.uniform(5, 15) * 1000.0
             here = writer.drive(ab.drive_by_at, closest, current, kmh)
-        back_kmh = rng.uniform(40, 60)
+        back_kmh = tr.uniform(40, 60)
+        if ab.back_kmh:
+            back_kmh = ab.back_kmh
         back_start = ab.returned_at - timedelta(minutes=current / 1000.0 / back_kmh * 60.0)
         if back_start < here:
             back_start = here
+        if ab.zone is not None:
+            zone_events.append(ZoneEvent(back_start, ab.zone, False))
         writer.stay(here, back_start, current)
         writer.drive(back_start, current, 60.0, back_kmh)
     fixes = sorted(writer.fixes, key=lambda f: f.ts)
@@ -138,6 +203,8 @@ def _build(name: str, tz: tzinfo, absences: list[Absence], rng: random.Random) -
         absences=clean,
         transitions=transitions,
         fixes=fixes,
+        zone_events=sorted(zone_events, key=lambda e: e.ts),
+        style=style,
         _fix_times=[f.ts for f in fixes],
     )
 
@@ -257,6 +324,184 @@ def rotating_shift_person(
                 out += _outings(rng, day, tz, [window], (30, 90))
         _maybe_bounce(rng, day, tz, out)
     return _build("shift", tz, out, rng)
+
+
+def _rebuild(timeline: Timeline, absences: list[Absence], seed: int, style: str) -> Timeline:
+    return _build(timeline.name, timeline.tz, list(absences), random.Random(seed), style)
+
+
+def iphone_fixes(timeline: Timeline, seed: int = 11) -> Timeline:
+    """The same absences reported like an iPhone: a fix every ~5 min on the move,
+    bursts of 3 fixes within a minute, silence once stopped."""
+    return _rebuild(timeline, timeline.absences, seed, "iphone")
+
+
+def trip(
+    timeline: Timeline,
+    start: datetime,
+    *,
+    seed: int = 12,
+    days: float | None = None,
+    km: float | None = None,
+) -> Timeline:
+    """Add a trip of 2-5 days to a destination 100-600 km away, leaving at ``start``.
+
+    Absences overlapping the trip are dropped; the GPS keeps the timeline's style.
+    """
+    rng = random.Random(seed)
+    days = days if days is not None else rng.uniform(2, 5)
+    km = km if km is not None else rng.uniform(100, 600)
+    end = start + timedelta(days=days)
+    kept = [
+        a
+        for a in timeline.absences
+        if a.returned_at + timedelta(minutes=10) < start or a.left_at > end + timedelta(minutes=10)
+    ]
+    speed = rng.uniform(80, 110)
+    kept.append(Absence(start, end, "trip", km, kmh=speed, back_kmh=speed))
+    return _rebuild(timeline, kept, seed, timeline.style)
+
+
+def couple(
+    days: int = 120,
+    seed: int = 21,
+    *,
+    together_share: float = 0.4,
+    start: date = DEFAULT_START,
+    tz: tzinfo = DEFAULT_TZ,
+    style: str = "iphone",
+) -> tuple[Timeline, Timeline]:
+    """Two persons with their own work days; ``together_share`` of the evening and
+    weekend outings are made together (same times, shared trajectory -> co-located
+    fixes)."""
+    rng = random.Random(seed)
+    a: list[Absence] = []
+    b: list[Absence] = []
+
+    def outing(day: date, lo: float, hi: float, dur: tuple[float, float]) -> None:
+        begin = rng.uniform(lo, hi)
+        minutes = rng.uniform(*dur)
+        left, back = _local(day, begin, tz), _local(day, begin + minutes, tz)
+        km = rng.uniform(2, 10)
+        if rng.random() < together_share:
+            shared = rng.randrange(1 << 30)
+            a.append(Absence(left, back, "together", km, seed=shared))
+            b.append(Absence(left, back, "together", km, seed=shared))
+        else:
+            (a if rng.random() < 0.5 else b).append(Absence(left, back, "errand", km))
+
+    for i in range(days):
+        day = start + timedelta(days=i)
+        if day.weekday() < 5:
+            a.append(
+                Absence(
+                    _local(day, 7 * 60 + 45 + rng.gauss(0, 10), tz),
+                    _local(day, 17 * 60 + 45 + rng.gauss(0, 15), tz),
+                    "work",
+                    rng.uniform(13, 17),
+                )
+            )
+            b.append(
+                Absence(
+                    _local(day, 8 * 60 + 30 + rng.gauss(0, 10), tz),
+                    _local(day, 18 * 60 + 15 + rng.gauss(0, 20), tz),
+                    "work",
+                    rng.uniform(6, 10),
+                )
+            )
+            if rng.random() < 0.4:
+                outing(day, 19 * 60 + 30, 20 * 60 + 30, (45, 150))
+        else:
+            outing(day, 9 * 60 + 30, 11 * 60 + 30, (60, 180))
+            if rng.random() < 0.6:
+                outing(day, 15 * 60 + 30, 18 * 60, (60, 180))
+    return (
+        _build("couple_a", tz, a, random.Random(seed + 1), style),
+        _build("couple_b", tz, b, random.Random(seed + 2), style),
+    )
+
+
+def zone_passby(
+    days: int = 120,
+    seed: int = 31,
+    *,
+    rate: float = 0.3,
+    start: date = DEFAULT_START,
+    tz: tzinfo = DEFAULT_TZ,
+    style: str = "iphone",
+    zone: str = "work",
+) -> Timeline:
+    """Office worker whose days hold passes at 300-800 m from home (work days) and
+    through the ``zone`` zone (weekend outings), none of them a return."""
+    rng = random.Random(seed)
+    out: list[Absence] = []
+    for i in range(days):
+        day = start + timedelta(days=i)
+        if day.weekday() < 5:
+            back = _local(day, 17 * 60 + 45 + rng.gauss(0, 15), tz)
+            drive_by = None
+            if rng.random() < rate:
+                drive_by = _local(day, rng.uniform(10 * 60 + 30, 13 * 60), tz)
+            out.append(
+                Absence(
+                    _local(day, 7 * 60 + 45 + rng.gauss(0, 10), tz),
+                    back,
+                    "work",
+                    rng.uniform(13, 17),
+                    drive_by,
+                    drive_by_m=rng.uniform(300, 800),
+                )
+            )
+        else:
+            begin = rng.uniform(9 * 60 + 30, 11 * 60)
+            minutes = rng.uniform(120, 240)
+            passes: tuple[datetime, ...] = ()
+            if rng.random() < rate:
+                passes = (_local(day, begin + rng.uniform(20, minutes - 30), tz),)
+            out.append(
+                Absence(
+                    _local(day, begin, tz),
+                    _local(day, begin + minutes, tz),
+                    "errand",
+                    rng.uniform(5, 15),
+                    zone_passes=passes,
+                    pass_zone=zone,
+                )
+            )
+    return _build("passby", tz, out, rng, style)
+
+
+def workplace_zone(
+    days: int = 120,
+    seed: int = 41,
+    *,
+    zone: str = "work",
+    zone_km: float = 12.0,
+    travel_minutes: float = 20.0,
+    start: date = DEFAULT_START,
+    tz: tzinfo = DEFAULT_TZ,
+    style: str = "iphone",
+) -> Timeline:
+    """Work days spent in the known zone ``zone``; leaving it is followed by the arrival
+    home after a stable ``travel_minutes`` (+-5 %)."""
+    rng = random.Random(seed)
+    out: list[Absence] = []
+    for i in range(days):
+        day = start + timedelta(days=i)
+        if day.weekday() >= 5:
+            continue
+        speed = zone_km * 60.0 / travel_minutes * rng.uniform(0.95, 1.05)
+        out.append(
+            Absence(
+                _local(day, 8 * 60 + rng.gauss(0, 10), tz),
+                _local(day, 17 * 60 + 30 + rng.gauss(0, 30), tz),
+                "work",
+                zone_km,
+                back_kmh=speed,
+                zone=zone,
+            )
+        )
+    return _build("workplace", tz, out, rng, style)
 
 
 @dataclass
