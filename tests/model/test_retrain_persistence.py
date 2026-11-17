@@ -17,11 +17,11 @@ from hrp_core.maturity import LogEntry, decode_entries, encode_entries
 from hrp_core.selection import (
     KERNEL_BAYES,
     LEARNED_FUSION,
-    chronological_split,
+    informative_split,
     recency_weights,
     weighted_brier,
 )
-from hrp_core.stacker import Stacker, apply_weights
+from hrp_core.stacker import Stacker, _served, apply_weights
 from hrp_core.synthetic import (
     DEFAULT_START,
     fixed_schedule_person,
@@ -124,10 +124,12 @@ def test_stacker_serves_the_evaluated_weights() -> None:
     st.fit(model._log.resolved, now, CONFIG.half_life_days)
     assert st.holdout_brier_learned is not None
     usable = [e for e in model._log.resolved if e.outcome is not None and e.features]
-    _, hold = chronological_split(usable[-1500:])
+    usable = usable[-1500:]
+    split = informative_split([int(e.outcome or 0) for e in usable], times=[e.ts for e in usable])
+    hold = usable[split:]
     w = recency_weights([e.ts for e in hold], now, CONFIG.half_life_days)
     served = weighted_brier(
-        [apply_weights(st.weights, e.features) for e in hold],
+        [_served(st.weights, e) for e in hold],  # as predict serves it (GPS floor)
         [int(e.outcome or 0) for e in hold],
         w,
     )
@@ -145,10 +147,11 @@ def test_challenger_installs_the_evaluated_fusion_weights() -> None:
     summary = model.train_challenger(now)
     assert summary["trained"]
     rows = model._challenger_rows()
-    _, hold = chronological_split(rows)
+    split = informative_split([int(e.outcome or 0) for e in rows], times=[e.ts for e in rows])
+    hold = rows[split:]
     w = recency_weights([e.ts for e in hold], now, CONFIG.half_life_days)
     served = weighted_brier(
-        [apply_weights(model.stacker.weights, e.features) for e in hold],
+        [_served(model.stacker.weights, e) for e in hold],
         [int(e.outcome or 0) for e in hold],
         w,
     )

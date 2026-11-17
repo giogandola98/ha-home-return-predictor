@@ -14,9 +14,10 @@ from datetime import datetime
 from typing import Any
 
 from .episodes import minutes_between
-from .fusion import P_MAX, P_MIN, PRIOR_CLAMP, clamp, logit, sigmoid
+from .fusion import P_MAX, P_MIN, PRIOR_CLAMP, clamp, gps_floor, logit, sigmoid
 from .maturity import LogEntry
 from .prior import DAY_MINUTES, recency_weight
+from .selection import informative_split
 
 FEATURE_NAMES: tuple[str, ...] = (
     "z_prior",
@@ -147,6 +148,13 @@ def _brier(
     return num / den if den > 0 else 0.0
 
 
+def _served(weights: Sequence[float], entry: LogEntry) -> float:
+    """Learned-fusion probability as ``predict`` serves it (GPS floor included)."""
+    f = entry.features
+    p_bayes = bayes_from_features(f)
+    return gps_floor(apply_weights(weights, f), p_bayes, entry.approach_class, math.exp(f[1]))[0]
+
+
 class Stacker:
     """Per-person learned fusion with holdout-gated activation."""
 
@@ -160,19 +168,22 @@ class Stacker:
     def predict(self, features: Sequence[float]) -> float:
         return apply_weights(self.weights, features)
 
-    def fit(self, entries: Sequence[LogEntry], now: datetime, half_life_days: float) -> None:
+    def fit(self, entries: Sequence[LogEntry], now: datetime, half_life_days: float) -> bool:
         """Refit on the last resolved entries and decide whether to activate.
 
-        With enough entries the weights are fit on the oldest 80 % and scored on
-        the newest 20 %; those evaluated weights are the ones kept and served.
+        With enough entries the weights are fit on the older entries and scored on
+        the newest ones (20 %, grown back until they hold a few real returns, see
+        ``informative_split``); those evaluated weights are the ones kept and served.
+        Returns False, leaving weights and scores untouched, when no holdout with
+        enough returns exists: such an evaluation must not drive the selection.
         """
         usable = [e for e in entries if e.outcome is not None and len(e.features) == N_FEATURES][
             -MAX_TRAIN_ENTRIES:
         ]
-        self.trained_on = len(usable)
         if not usable:
             self.weights, self.active = list(CENTRE), False
-            return
+            self.trained_on = 0
+            return True
 
         previous = list(self.weights)
 
@@ -187,22 +198,32 @@ class Stacker:
                 start=previous,
             )
 
+        split: int | None = None
+        if len(usable) >= MIN_ENTRIES_TO_ACTIVATE:
+            split = informative_split(
+                [int(e.outcome or 0) for e in usable],
+                HOLDOUT_FRACTION,
+                times=[e.ts for e in usable],
+            )
+            if split is None:
+                return False
+        self.trained_on = len(usable)
         self.active = False
         self.holdout_brier_learned = self.holdout_brier_bayes = None
-        if len(usable) < MIN_ENTRIES_TO_ACTIVATE:
+        if split is None:
             # Not evaluated, so never selected: keep the weights near the centre.
             self.weights = weights_for(usable)
-            return
-        split = int(len(usable) * (1 - HOLDOUT_FRACTION))
+            return True
         train, hold = usable[:split], usable[split:]
         w_train = weights_for(train)
         hl = half_life_days
-        learned = _brier(hold, [apply_weights(w_train, e.features) for e in hold], now, hl)
+        learned = _brier(hold, [_served(w_train, e) for e in hold], now, hl)
         bayes = _brier(hold, [bayes_from_features(e.features) for e in hold], now, hl)
         self.holdout_brier_learned, self.holdout_brier_bayes = learned, bayes
         self.active = learned < bayes * (1.0 - ACTIVATION_MARGIN)
         # Serve exactly the weights whose holdout Brier drives the selection.
         self.weights = w_train
+        return True
 
     def to_dict(self) -> dict[str, Any]:
         return {

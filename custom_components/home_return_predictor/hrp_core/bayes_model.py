@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import bisect
+import math
 import time
 from collections.abc import Iterable
 from datetime import date, datetime, timedelta
@@ -36,11 +37,17 @@ from .episodes import (
     to_local,
     to_utc,
 )
-from .evidence import CalibrationSegments, LRCalibrator, compute_evidence
+from .evidence import (
+    EXTENDED_WINDOW_FACTOR,
+    CalibrationSegments,
+    LRCalibrator,
+    compute_evidence,
+)
 from .fusion import (
     apply_feasibility,
     combine_eta,
     fuse_probability,
+    gps_floor,
     min_travel_minutes,
     position_eta_minutes,
 )
@@ -61,7 +68,7 @@ from .selection import (
     LEARNED_FUSION,
     RULES,
     Selector,
-    chronological_split,
+    informative_split,
     recency_weights,
     weighted_brier,
 )
@@ -211,7 +218,8 @@ class KernelBayesReturnModel(ReturnModel):
         cfg = self.config
         self.calibrator.reset()
         times = [to_utc(f.ts) for f in fixes]
-        window = timedelta(minutes=cfg.regression_window_minutes)
+        # fixes the regression may use, incl. the sparse-reporting fallback
+        window = timedelta(minutes=EXTENDED_WINDOW_FACTOR * cfg.regression_window_minutes)
         idx = 0
         segments = CalibrationSegments()
         for ep in sorted((*self._episodes, *self._trips), key=lambda e: e.left_at):
@@ -380,6 +388,7 @@ class KernelBayesReturnModel(ReturnModel):
             probability = self._challenger.predict_proba(row)
         else:
             probability = p_bayes
+        probability, floored = gps_floor(probability, p_bayes, ev.approach_class, lr)
 
         habit_min = (
             prior.eta_duration_minutes - minutes_away
@@ -417,6 +426,7 @@ class KernelBayesReturnModel(ReturnModel):
             "fusion": FUSION_ALIAS[active],
             "active_model": active,
             "probability_bayes": round(p_bayes, 4),
+            "gps_floor": floored,
             "feasible": feasible,
             "min_travel_minutes": round(travel_min, 1) if travel_min is not None else None,
         }
@@ -590,7 +600,9 @@ class KernelBayesReturnModel(ReturnModel):
         self._since_refit = 0
         if self._challenger_mode():
             return
-        self.stacker.fit(self._log.resolved, now, self.config.half_life_days)
+        if not self.stacker.fit(self._log.resolved, now, self.config.half_life_days):
+            self.selector.demote()  # no holdout with real returns: serve the reference
+            return
         self.selector.update(
             {
                 KERNEL_BAYES: self.stacker.holdout_brier_bayes,
@@ -659,14 +671,17 @@ class KernelBayesReturnModel(ReturnModel):
             "x": [e.x for e in rows],
             "f": [e.features for e in rows],
             "y": [int(e.outcome or 0) for e in rows],
+            "cls": [e.approach_class for e in rows],
         }
 
     @staticmethod
     def fit_challenger(snapshot: Any, now: datetime) -> Any:
         """Heavy part of the training: fit and evaluate all candidates (no model state).
 
-        Holdout = last 20 % of the resolved entries (chronological); the stacker and
-        the GBM are fit on the first 80 % for the evaluation, then the GBM is refit
+        Holdout = last 20 % of the resolved entries (chronological), grown back until it
+        holds a few real returns (``informative_split``; none -> no evaluation, the
+        selection stays as it is); the stacker and the GBM are fit on the older entries
+        for the evaluation, then the GBM is refit
         on everything for serving. The learned-fusion weights evaluated here are
         the ones installed (and served) by ``apply_challenger``.
         """
@@ -695,12 +710,22 @@ class KernelBayesReturnModel(ReturnModel):
 
         hl = snapshot["half_life_days"]
         ts, xs, fs, ys = snapshot["ts"], snapshot["x"], snapshot["f"], snapshot["y"]
-        idx_train, idx_hold = chronological_split(range(n))
+        split = informative_split(snapshot["y"], times=snapshot["ts"])
+        if split is None:
+            return done("uninformative_holdout")
+        idx_train, idx_hold = list(range(split)), list(range(split, n))
         w_all = recency_weights(ts, now, hl)
         w_train = [w_all[i] for i in idx_train]
         w_hold = [w_all[i] for i in idx_hold]
         y_train = [ys[i] for i in idx_train]
         y_hold = [ys[i] for i in idx_hold]
+
+        classes = snapshot.get("cls") or [None] * n
+
+        def floored(p: float, i: int) -> float:
+            """Score the candidate as it is served (GPS floor, see ``predict``)."""
+            p_bayes = bayes_from_challenger_features(xs[i])
+            return gps_floor(p, p_bayes, classes[i], math.exp(xs[i][1]))[0]
 
         weights = fit_weights([fs[i] for i in idx_train], y_train, w_train)
         candidate = GBMChallenger()
@@ -710,9 +735,18 @@ class KernelBayesReturnModel(ReturnModel):
                 [bayes_from_challenger_features(xs[i]) for i in idx_hold], y_hold, w_hold
             ),
             LEARNED_FUSION: weighted_brier(
-                [apply_weights(weights, fs[i]) for i in idx_hold], y_hold, w_hold
+                [floored(apply_weights(weights, fs[i]), i) for i in idx_hold], y_hold, w_hold
             ),
-            GBM: weighted_brier(candidate.predict_many([xs[i] for i in idx_hold]), y_hold, w_hold),
+            GBM: weighted_brier(
+                [
+                    floored(p, i)
+                    for p, i in zip(
+                        candidate.predict_many([xs[i] for i in idx_hold]), idx_hold, strict=True
+                    )
+                ],
+                y_hold,
+                w_hold,
+            ),
         }
         result["weights"] = weights
         serving = GBMChallenger()
@@ -745,6 +779,8 @@ class KernelBayesReturnModel(ReturnModel):
             return summary(False, status)
         self._last_training = to_utc(now)
         self._resolved_at_training = int(result["resolved_total"])
+        if status == "uninformative_holdout":
+            self.selector.demote()  # nothing can vouch for a learned champion now
         if status != "ok":
             return summary(False, status)
 

@@ -39,6 +39,11 @@ FUSION_ALIAS: dict[str, str] = {
     GBM: "gbm",
 }
 HOLDOUT_FRACTION = 0.2
+# The holdout must contain real returns: on a stretch without any (a trip, a long
+# absence) the candidate that always says "no" wins, whatever it does near home.
+MIN_HOLDOUT_RETURNS = 3
+MAX_HOLDOUT_FRACTION = 0.5  # the holdout may grow back to this share to find them
+RUN_GAP_MINUTES = 25.0  # > 2 x the 10-min log interval: the person was home in between
 
 
 @dataclass(frozen=True)
@@ -62,6 +67,50 @@ def chronological_split[T](
     """(train, holdout): the holdout is the most recent fraction of ``items``."""
     split = int(len(items) * (1.0 - holdout_fraction))
     return list(items[:split]), list(items[split:])
+
+
+def informative_split(
+    outcomes: Sequence[int],
+    holdout_fraction: float = HOLDOUT_FRACTION,
+    min_returns: int = MIN_HOLDOUT_RETURNS,
+    max_fraction: float = MAX_HOLDOUT_FRACTION,
+    times: Sequence[datetime] | None = None,
+) -> int | None:
+    """Start index of a chronological holdout holding ``min_returns`` returns, or None.
+
+    ``outcomes`` are the resolved entries in time order (1 = returned within the
+    horizon). A return is a run of consecutive positive entries; with ``times`` a gap
+    longer than ``RUN_GAP_MINUTES`` (the log only covers absences: a gap means the
+    person was home in between) also ends a run. The holdout is the newest
+    ``holdout_fraction``, grown back (up to ``max_fraction``) until it holds
+    ``min_returns`` returns, keeping a return whole when the bound allows; None when
+    even the largest holdout does not hold enough returns.
+    """
+    n = len(outcomes)
+    if times is not None and len(times) != n:
+        raise ValueError("times and outcomes differ in length")
+    split = int(n * (1.0 - holdout_fraction))
+    lowest = int(n * (1.0 - max(max_fraction, holdout_fraction)))
+    if split >= n:
+        return None
+
+    def joined(i: int) -> bool:
+        """Entry ``i`` continues the run of entry ``i - 1``."""
+        if not (outcomes[i] and outcomes[i - 1]):
+            return False
+        return times is None or minutes_between(times[i - 1], times[i]) <= RUN_GAP_MINUTES
+
+    returns = sum(1 for i in range(split, n) if outcomes[i] and (i == split or not joined(i)))
+    while returns < min_returns and split > lowest:
+        split -= 1
+        # a prepended positive entry starts a new run unless it joins the next one
+        if outcomes[split] and not joined(split + 1):
+            returns += 1
+    if returns < min_returns:
+        return None
+    while split > lowest and joined(split):
+        split -= 1  # keep a return whole on the holdout side
+    return split
 
 
 def recency_weights(times: Sequence[datetime], now: datetime, half_life_days: float) -> list[float]:
@@ -127,6 +176,12 @@ class Selector:
             self.streak = {}
         self.champion = champ
         return champ
+
+    def demote(self) -> str:
+        """Fall back to the reference model (no evaluation could vouch for another one)."""
+        self.champion = KERNEL_BAYES
+        self.streak = {}
+        return self.champion
 
     def to_dict(self) -> dict[str, Any]:
         return {

@@ -36,6 +36,10 @@ CALIBRATION_PRIOR_STRENGTH = 8.0
 MIN_FIXES = 3
 MIN_SPAN_MINUTES = 2.0
 DISTANCE_MAX_AGE_FACTOR = 3.0  # distance valid if last fix within 3 x window
+# A phone on the move often reports only every ~5 min, so three fixes rarely fit in the
+# regression window: the speed then falls back to the last MIN_FIXES fixes, as long as
+# they span at most EXTENDED_WINDOW_FACTOR x window and the newest one is within the window.
+EXTENDED_WINDOW_FACTOR = 2.0
 
 
 def haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -64,6 +68,31 @@ class Evidence:
     n_fixes: int
 
 
+def regression_fixes(
+    fixes: Sequence[PositionFix], now: datetime, window_minutes: float
+) -> list[PositionFix]:
+    """Fixes the speed regression uses (``fixes`` sorted by time, none in the future).
+
+    All fixes within ``window_minutes``. When they are fewer than ``MIN_FIXES`` or span
+    less than ``MIN_SPAN_MINUTES`` (sparse reporting while travelling, or a burst of
+    fixes within a minute), all fixes within ``EXTENDED_WINDOW_FACTOR`` x window are
+    used instead, provided the newest one is within the window.
+    """
+    recent = [f for f in fixes if minutes_between(f.ts, now) <= window_minutes]
+    if not recent or _usable(recent):
+        return recent
+    extended = [
+        f for f in fixes if minutes_between(f.ts, now) <= EXTENDED_WINDOW_FACTOR * window_minutes
+    ]
+    return extended if _usable(extended) else recent
+
+
+def _usable(fixes: Sequence[PositionFix]) -> bool:
+    return (
+        len(fixes) >= MIN_FIXES and minutes_between(fixes[0].ts, fixes[-1].ts) >= MIN_SPAN_MINUTES
+    )
+
+
 def compute_evidence(
     fixes: Sequence[PositionFix],
     now: datetime,
@@ -86,7 +115,7 @@ def compute_evidence(
         if minutes_between(last.ts, now) <= DISTANCE_MAX_AGE_FACTOR * window_minutes
         else None
     )
-    recent = [f for f in valid if minutes_between(f.ts, now) <= window_minutes]
+    recent = regression_fixes(valid, now, window_minutes)
     if len(recent) < MIN_FIXES:
         return Evidence(None, None, distance, len(recent))
     xs = [minutes_between(recent[0].ts, f.ts) for f in recent]
