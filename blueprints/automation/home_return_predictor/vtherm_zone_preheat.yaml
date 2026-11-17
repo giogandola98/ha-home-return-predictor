@@ -11,6 +11,9 @@ blueprint:
     person's ETA, judged on that person's own probability, only if the zone
     schedule is active at the expected arrival).
     With someone at home a predicted return can only *upgrade* a zone.
+    Optional (Room Thermal Model): a `preheat_now` sensor decides *when* to pre-heat
+    instead of probability and ETA, and an expected-absence sensor avoids the deep
+    setback when the house will be empty only for a few hours.
 
 
     One automation per zone. Disable VTherm's own presence and motion features:
@@ -118,6 +121,39 @@ blueprint:
                 - binary_sensor
                 - input_boolean
                 - device_tracker
+        preheat_now_sensor:
+          name: Pre-heat-now sensor (optional)
+          description: >
+            binary_sensor that is `on` when this zone must start pre-heating, e.g.
+            Room Thermal Model `binary_sensor.<zone>_preheat_now` fed by
+            `sensor.house_next_arrival`. When set, the predicted return is `on` ->
+            comfort (if the zone schedule is active at its `arrival_at_latch` /
+            `arrival` attribute), `off` -> no return; probability, ETA and pre-heat
+            time are not used. Empty = probability and ETA rule.
+          default: ""
+          selector:
+            entity:
+              domain: binary_sensor
+        expected_absence_sensor:
+          name: Expected absence sensor (optional)
+          description: >
+            `sensor.house_expected_absence`. With nobody home and its `q25` attribute
+            (hours) below the short-absence threshold, the short-absence preset is
+            used instead of the absent one. Empty = always the absent preset.
+          default: ""
+          selector:
+            entity:
+              domain: sensor
+        short_absence_hours:
+          name: Short absence threshold
+          description: Below this expected empty time no deep setback.
+          default: 12
+          selector:
+            number:
+              min: 0
+              max: 72
+              step: 1
+              unit_of_measurement: h
         act_only_live:
           name: Act on predictions only in live mode
           description: >
@@ -195,6 +231,20 @@ blueprint:
                 - eco
                 - comfort
                 - boost
+        short_absence_preset:
+          name: Short-absence preset
+          description: >
+            Nobody home but back within the short-absence threshold (only with the
+            expected absence sensor).
+          default: eco
+          selector:
+            select:
+              custom_value: true
+              options:
+                - frost
+                - eco
+                - comfort
+                - boost
         unused_preset:
           name: Unused-zone preset
           description: >
@@ -264,6 +314,7 @@ trigger_variables:
   t_schedule: !input schedule_entity
   t_bed: !input bed_switch
   t_occupancy: !input occupancy_sensor
+  t_preheat_now: !input preheat_now_sensor
 
 triggers:
   - trigger: homeassistant
@@ -294,6 +345,10 @@ triggers:
     value_template: "{{ t_occupancy != '' and is_state(t_occupancy, 'on') }}"
   - trigger: template
     value_template: "{{ t_occupancy != '' and is_state(t_occupancy, 'off') }}"
+  - trigger: template
+    value_template: "{{ t_preheat_now != '' and is_state(t_preheat_now, 'on') }}"
+  - trigger: template
+    value_template: "{{ t_preheat_now != '' and is_state(t_preheat_now, 'off') }}"
 
 variables:
   climates: !input climates
@@ -317,6 +372,10 @@ variables:
   medium_th: !input medium_threshold
   hyst: !input hysteresis
   log_decisions: !input log_decisions
+  preheat_now_entity: !input preheat_now_sensor
+  absence_entity: !input expected_absence_sensor
+  short_hours: !input short_absence_hours
+  short_preset: !input short_absence_preset
 
   climate_list: "{{ [climates] if climates is string else climates | list }}"
   now_ts: "{{ as_timestamp(now()) }}"
@@ -358,6 +417,25 @@ variables:
     {% elif sched_on %}{{ sched_next_ts == 0 or now_ts < sched_next_ts }}
     {% else %}{{ sched_next_ts != 0 and now_ts >= sched_next_ts }}{% endif %}
 
+  # ZoneInputs.expected_absence_hours (q25, -1 = none) and the short-absence rule:
+  # with nobody home and a short absence the "absent" role goes to short_preset.
+  absence_q25: >-
+    {% set v = state_attr(absence_entity, 'q25') if absence_entity not in ['', none] else none %}
+    {{ v | float if is_number(v) else -1 }}
+  absent_eff: >-
+    {{ short_preset if (not someone_home and absence_q25 | float >= 0
+                        and absence_q25 | float < short_hours | float)
+       else absent_preset }}
+  # ZoneInputs.preheat_now (none when no sensor) and preheat_arrival (0 = none)
+  use_preheat_now: "{{ preheat_now_entity not in ['', none] }}"
+  preheat_now_on: "{{ use_preheat_now and is_state(preheat_now_entity, 'on') }}"
+  preheat_arrival_ts: >-
+    {% if use_preheat_now %}
+      {% set a = state_attr(preheat_now_entity, 'arrival_at_latch')
+                 or state_attr(preheat_now_entity, 'arrival') %}
+      {{ as_timestamp(a, 0) | float(0) if a else 0 }}
+    {% else %}0{% endif %}
+
   bed_on: "{{ bed_switch not in ['', none] and is_state(bed_switch, 'on') }}"
   occupied_zone: "{{ occupancy_sensor not in ['', none] and is_state(occupancy_sensor, 'on') }}"
 
@@ -374,7 +452,7 @@ variables:
       {{ night_preset if zone_type == 'day' else comfort_preset }}
     {% else %}{% endif %}
   base_preset: >-
-    {% if not someone_home %}{{ absent_preset }}
+    {% if not someone_home %}{{ absent_eff | trim }}
     {% elif occupied_zone or not has_schedule or sched_active_now %}{{ comfort_preset }}
     {% else %}{{ unused_preset }}{% endif %}
   base_reason: >-
@@ -403,9 +481,27 @@ variables:
   # _single_return() part that does not depend on the current preset, per candidate:
   # ok = window reached (now >= eta - preheat, also when the ETA is already past)
   # and zone scheduled at arrival = max(eta, now).
+  # With a preheat_now sensor: one option, p = 100 (comfort) when on and the zone is
+  # scheduled at arrival = max(preheat arrival or now, now) (_preheat_now()).
   return_options: >-
     {% set ns = namespace(items=[]) %}
-    {% for c in return_candidates %}
+    {% if use_preheat_now %}
+      {% set arrival = [preheat_arrival_ts | float(0), now_ts] | max %}
+      {% set hhmm = arrival | timestamp_custom('%H:%M') %}
+      {% if not prediction_enabled %}
+        {% set ok, why = false, 'prediction ignored (not live)' %}
+      {% elif not preheat_now_on %}
+        {% set ok, why = false, 'preheat_now off' %}
+      {% else %}
+        {% if not has_schedule %}{% set ok = true %}
+        {% elif sched_on %}{% set ok = sched_next_ts == 0 or arrival < sched_next_ts %}
+        {% else %}{% set ok = sched_next_ts != 0 and arrival >= sched_next_ts %}{% endif %}
+        {% set why = ('preheat_now on, arrival ' ~ hhmm) if ok
+                     else 'preheat_now on, zone not scheduled at arrival ' ~ hhmm %}
+      {% endif %}
+      {% set ns.items = [{'p': 100, 'ok': ok, 'reason': why}] %}
+    {% endif %}
+    {% for c in (return_candidates if not use_preheat_now else []) %}
       {% set eta = c.eta | float(0) %}
       {% set hhmm = eta | timestamp_custom('%H:%M') if eta > 0 else '' %}
       {% if not prediction_enabled %}
@@ -456,7 +552,7 @@ actions:
                 {%- if p in [none, '', 'none'] -%}-1
                 {%- elif p == comfort_preset -%}2
                 {%- elif p == medium_preset -%}1
-                {%- elif p == absent_preset -%}0
+                {%- elif p == absent_eff | trim -%}0
                 {%- else -%}{{ {'frost': 0, 'away': 0, 'eco': 1, 'comfort': 2, 'boost': 3}.get(p, 1) }}
                 {%- endif -%}
               {%- endmacro %}
@@ -477,7 +573,7 @@ actions:
                   {% if not o.ok %}{% set c = '' %}
                   {% elif o.p >= hi %}{% set c = comfort_preset %}
                   {% elif o.p >= med %}{% set c = medium_preset %}
-                  {% else %}{% set c = absent_preset %}{% endif %}
+                  {% else %}{% set c = absent_eff | trim %}{% endif %}
                   {% if loop.first or (c != '' and rank(c) | int > rank(best.t) | int) %}
                     {% set best.t, best.r = c, o.reason %}
                   {% endif %}
@@ -493,7 +589,7 @@ actions:
                 {% elif cand != '' %}
                   {% set t, r = cand, return_reason | trim %}
                 {% else %}
-                  {% set t, r = absent_preset, base_reason | trim ~ '; ' ~ return_reason | trim %}
+                  {% set t, r = absent_eff | trim, base_reason | trim ~ '; ' ~ return_reason | trim %}
                 {% endif %}
               {% endif %}
               {{ {'preset': t, 'reason': r} }}

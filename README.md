@@ -318,6 +318,10 @@ Then create one automation per zone.
 | Medium probability threshold | 40% | ≥ threshold → medium-probability preset |
 | Hysteresis | 5% | Prevents ping-pong between presets |
 | Write decisions to the logbook | off | Useful to understand why a preset was chosen |
+| Pre-heat-now sensor | — | `binary_sensor.<zone>_preheat_now` from Room Thermal Model: when set it decides *when* to pre-heat (`on` → comfort if the schedule is active at its `arrival_at_latch`/`arrival`), probability/ETA/window are not used. See [below](#with-room-thermal-model) |
+| Expected absence sensor | — | `sensor.house_expected_absence`: with nobody home and `q25` below the threshold, the short-absence preset replaces the absent one |
+| Short absence threshold | 12 h | |
+| **Short-absence preset** | `eco` | Nobody home, back within the threshold |
 
 All presets are chosen **per zone** from `frost`/`eco`/`comfort`/`boost`, or by typing
 another VTherm preset name. If the chosen preset does not exist on a thermostat, that
@@ -438,7 +442,7 @@ thermal plugin.
 
 | Project | What it does | Compatibility with preset-based VTherm |
 |---|---|---|
-| [Room Thermal Model](https://github.com/giogandola98/ha-room-thermal-model) (companion integration) | Generic per-zone learnt RC thermal model (time constant, heating rate, dead time), trained on all history, with outdoor temperature / weather forecast. **Does not control anything**: sensors only. Per zone `sensor.<zone>_preheat_minutes`, `sensor.<zone>_model_maturity`, and with an arrival sensor (e.g. `sensor.house_next_return_eta`) `sensor.<zone>_preheat_start`, `binary_sensor.<zone>_preheat_now` | **Recommended**: use `sensor.<zone>_preheat_minutes` as the blueprint's pre-heat minutes sensor. Designed to pair with this integration, no second controller |
+| [Room Thermal Model](https://github.com/giogandola98/ha-room-thermal-model) (companion integration) | Generic per-zone learnt RC thermal model (time constant, heating rate, dead time), trained on all history, with outdoor temperature / weather forecast. **Does not control anything**: sensors only. Per zone `sensor.<zone>_preheat_minutes`, `sensor.<zone>_model_maturity`, and with an arrival sensor (`sensor.house_next_arrival`, see [below](#with-room-thermal-model)) `sensor.<zone>_preheat_start`, `binary_sensor.<zone>_preheat_now` | **Recommended**: use `sensor.<zone>_preheat_minutes` as the blueprint's pre-heat minutes sensor. Designed to pair with this integration, no second controller |
 | [Ecronika/ha-preheat](https://github.com/Ecronika/ha-preheat) (v2.11.x) | Learns per-zone thermal mass, heat loss and dead time (Radiator/Floor/AC profiles). **Does not write setpoints**: it is driven by its own blueprint (comfort/eco). Per-zone entities `binary_sensor.<zone>_preheat_active`, `sensor.<zone>_next_preheat_start`, `sensor.<zone>_predicted_duration` (minutes); house `sensor.preheat_house_next_arrival`, `binary_sensor.preheat_house_incoming`. Requires a per-zone occupancy `binary_sensor`; `schedule_entity` and `global_presence` optional. Has its own arrival predictor | **Good** alternative source of minutes: use `sensor.<zone>_predicted_duration` in our blueprint. **Do not** run its control blueprint at the same time (one controller only). Our ETA cannot be injected as its target; `binary_sensor.house_someone_returning` can be passed as a presence hint via the *presence bridge* blueprint (inferred usage, not documented by ha-preheat) |
 | [nic6911/ha-predictive-heating](https://github.com/nic6911/ha-predictive-heating) | Aimed at underfloor heating; writes setpoints with `climate.set_temperature` (an advisory mode exists); entities `sensor.*_recommended_setpoint`, `*_predicted_temperature`; no presence/occupancy/schedule/arrival inputs | **Not recommended** with radiators + VTherm: a manual temperature change sets the VTherm preset to `none` and conflicts with preset-based control |
 | [silkyclouds/ha-smart-preheat](https://github.com/silkyclouds/ha-smart-preheat) | YAML package for a single room; physical formula `minutes = 60·ΔT·C / (P − UA·(T_target − T_out))` with hand-tuned C, UA, P; exposes `sensor.preheat_minutes_needed`; writes setpoints itself via `script.preheat_apply` | Only as a **source of minutes**, removing the control script |
@@ -453,6 +457,26 @@ thermal plugin.
    ha-preheat (radiator profile) without its control blueprint; or, to start with, a
    fixed number (30–45 min for radiators).
 4. **VTherm**: presence and motion **disabled**; windows and safety **enabled**.
+
+### With Room Thermal Model
+
+The 90-minute return probability can give at most ~90 minutes of lead, while a
+living room after a night setback may need 3–4 hours. The recommended chain:
+
+1. Room Thermal Model, per zone: `arrival_sensor` = `sensor.house_next_arrival` (the
+   q25 of the first arrival, default; option `arrival_quantile`). Its
+   `binary_sensor.<zone>_preheat_now` turns on at `arrival - lead` (lead at its own
+   quantile, e.g. p80 of the warm-up time).
+2. This blueprint, per zone: **Pre-heat-now sensor** = `binary_sensor.<zone>_preheat_now`
+   (the probability/ETA rule is then skipped; the zone schedule is still checked at
+   the arrival), **Expected absence sensor** = `sensor.house_expected_absence`
+   (no deep setback for absences expected shorter than 12 h: below ~14 h a setback
+   saves only 6–10 % of the holding cost).
+3. Leave the new inputs empty to keep the previous behaviour.
+
+Blueprints imported earlier do **not** update by themselves: re-import
+`vtherm_zone_preheat.yaml` (Settings → Automations → Blueprints → ⋮ → Re-import) to see
+the new inputs. Existing automations keep working unchanged.
 
 ---
 

@@ -437,3 +437,82 @@ def test_candidates_upgrade_only_when_someone_home():
     assert decide_preset(home, "eco").preset == "comfort"
     low = replace(home, return_candidates=[(0.3, at(12, 10)), (0.3, at(12, 6))])
     assert decide_preset(low, "eco").preset == "eco"  # unused preset kept, never frost
+
+
+# ------------------------------------------- preheat_now sensor and short absences
+# Same cases as tests/blueprint (test_preheat_now_* / test_short_absence_*).
+
+
+def test_new_inputs_empty_keep_the_table() -> None:
+    base = ZoneInputs(now=at(17), house_probability=0.9, house_eta=at(17, 20))
+    assert decide_preset(base, "frost").preset == "comfort"
+    same = replace(base, preheat_now=None, expected_absence_hours=None)
+    assert decide_preset(same, "frost") == decide_preset(base, "frost")
+    nobody = ZoneInputs(now=at(10))
+    assert decide_preset(nobody, "eco").preset == "frost"
+
+
+def test_preheat_now_replaces_probability_and_window() -> None:
+    # far ETA and low probability: the external sensor decides
+    inputs = ZoneInputs(
+        now=at(15), house_probability=0.05, house_eta=None, preheat_now=True, preheat_arrival=at(18)
+    )
+    assert decide_preset(inputs, "frost").preset == "comfort"
+    off = replace(inputs, preheat_now=False, house_probability=0.95, house_eta=at(15, 10))
+    assert decide_preset(off, "comfort").preset == "frost"  # the old rule is not used
+    ignored = replace(inputs, prediction_enabled=False)
+    assert decide_preset(ignored, "frost").preset == "frost"
+
+
+def test_preheat_now_on_but_schedule_inactive_at_arrival() -> None:
+    # bedroom scheduled 20:00-07:00; preheat_now on for an arrival at 18:00
+    now = at(15)
+    inputs = ZoneInputs(
+        now=now,
+        zone_type="night",
+        schedule=sched(now, bedroom_blocks()),
+        preheat_now=True,
+        preheat_arrival=at(18),
+    )
+    # approximation of schedule_active_at: off now, next event 20:00 -> inactive at 18:00
+    assert decide_preset(inputs, "frost").preset == "frost"
+    later = replace(inputs, preheat_arrival=at(20, 30))
+    assert decide_preset(later, "frost").preset == "comfort"
+
+
+def test_preheat_now_with_someone_home_only_upgrades() -> None:
+    now = at(15)
+    inputs = ZoneInputs(
+        now=now,
+        someone_home=True,
+        schedule=sched(now, bedroom_blocks()),
+        preheat_now=False,
+    )
+    assert decide_preset(inputs, "eco").preset == "eco"  # unused zone, no downgrade
+
+
+@pytest.mark.parametrize(
+    ("q25_hours", "expected"), [(5.0, "eco"), (30.0, "frost"), (None, "frost")]
+)
+def test_short_absence_preset(q25_hours, expected) -> None:
+    inputs = ZoneInputs(now=at(10), expected_absence_hours=q25_hours)
+    assert decide_preset(inputs, "comfort").preset == expected
+
+
+def test_short_absence_custom_and_return_unlikely() -> None:
+    presets = PresetConfig(short_absence="comfort")
+    inputs = ZoneInputs(
+        now=at(10),
+        house_probability=0.1,
+        house_eta=at(10, 10),
+        expected_absence_hours=3.0,
+        short_absence_hours=4.0,
+        presets=presets,
+    )
+    d = decide_preset(inputs, "frost")
+    assert d.preset == "comfort"  # "return unlikely" -> the (short) absent preset
+    # someone home: the short-absence rule does not apply
+    home = replace(inputs, someone_home=True)
+    assert decide_preset(home, "eco").preset == "comfort"  # no schedule -> comfort anyway
+    long = replace(inputs, expected_absence_hours=6.0)
+    assert decide_preset(long, "eco").preset == "frost"
