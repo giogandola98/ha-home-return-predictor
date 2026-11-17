@@ -157,6 +157,8 @@ class ModelMaturitySensor(HRPPersonSensor):
                 fusion=getattr(report, "fusion", None),
                 active_model=result.active_model,
                 candidate_brier=dict(getattr(report, "candidate_brier", None) or {}),
+                return_recall=getattr(report, "return_recall", None),
+                false_alarms_per_return=getattr(report, "false_alarms_per_return", None),
                 challenger_enabled=self.coordinator.challenger_enabled,
                 numpy_available=self.coordinator.numpy_available,
                 sklearn_available=self.coordinator.numpy_available,  # deprecated alias

@@ -20,6 +20,15 @@ EPISODE_SCALE = 15.0  # data factor: 1 - e^(-n_eff / 15)
 # Full skill at BSS 0.5 vs the duration-only baseline (habits + GPS halve the Brier
 # of "how long has the person been away"); vs climatology it used to be 0.25.
 BSS_FULL = 0.5
+# Return-based skill (the per-person metrics of house_metric.py, on the prediction
+# log): share of real returns the signal p >= SIGNAL_P caught in the horizon before
+# the arrival, minus FALSE_ALARM_WEIGHT x false-alarm runs per return; full at
+# RECALL_FULL, defined after MIN_RETURNS_FOR_SKILL returns.
+SIGNAL_P = 0.5
+FALSE_ALARM_WEIGHT = 0.5
+RECALL_FULL = 0.8
+MIN_RETURNS_FOR_SKILL = 5
+ABSENCE_GAP_MINUTES = 25.0  # > 2 x the 10-min log interval: home in between
 
 
 @dataclass
@@ -304,6 +313,59 @@ def effective_episodes(
     )
 
 
+@dataclass(frozen=True)
+class ReturnSkill:
+    returns: float  # recency-weighted returns in the log
+    recall: float | None
+    false_alarms_per_return: float | None
+    count: int  # returns (unweighted)
+
+
+def return_skill(resolved: Sequence[LogEntry], now: datetime, half_life_days: float) -> ReturnSkill:
+    """Caught returns and false alarms of the signal ``p >= SIGNAL_P`` in the log.
+
+    The log holds absences only: a gap longer than ``ABSENCE_GAP_MINUTES`` or a
+    positive entry followed by a negative one starts a new absence. A return is caught
+    when one of its positive entries (horizon before the arrival) had p >= SIGNAL_P;
+    a false alarm is a run of p >= SIGNAL_P with no positive entry.
+    """
+    entries = sorted((e for e in resolved if e.outcome is not None), key=lambda e: e.ts)
+    absences: list[list[LogEntry]] = []
+    for e in entries:
+        if (
+            absences
+            and minutes_between(absences[-1][-1].ts, e.ts) <= ABSENCE_GAP_MINUTES
+            and not (absences[-1][-1].outcome == 1 and e.outcome == 0)
+        ):
+            absences[-1].append(e)
+        else:
+            absences.append([e])
+    w_ret = w_caught = w_false = 0.0
+    count = 0
+    for ab in absences:
+        w = recency_weight(minutes_between(ab[-1].ts, now) / DAY_MINUTES, half_life_days)
+        runs, run_has_pos, in_run = 0, False, False
+        for e in ab:
+            if e.p >= SIGNAL_P:
+                if not in_run:
+                    in_run, run_has_pos = True, False
+                run_has_pos = run_has_pos or e.outcome == 1
+            elif in_run:
+                runs += 0 if run_has_pos else 1
+                in_run = False
+        if in_run and not run_has_pos:
+            runs += 1
+        w_false += w * runs
+        if any(e.outcome == 1 for e in ab):
+            count += 1
+            w_ret += w
+            if any(e.outcome == 1 and e.p >= SIGNAL_P for e in ab):
+                w_caught += w
+    if w_ret <= 0:
+        return ReturnSkill(0.0, None, None, count)
+    return ReturnSkill(w_ret, w_caught / w_ret, w_false / w_ret, count)
+
+
 def maturity_report(
     episodes: Sequence[AbsenceEpisode],
     resolved: Sequence[LogEntry],
@@ -313,10 +375,12 @@ def maturity_report(
     active_model: str = "kernel_bayes",
     candidate_brier: dict[str, float | None] | None = None,
 ) -> MaturityReport:
-    """maturity = (1 - e^(-n_eff/15)) x clamp(BSS / 0.5, 0, 1).
+    """maturity = (1 - e^(-n_eff/15)) x return skill.
 
-    BSS is measured against the duration-only baseline, so maturity reflects the
-    value of learnt habits (and GPS) rather than plain base-rate knowledge.
+    Return skill = clamp((recall - 0.5 x false alarms per return) / 0.8, 0, 1) of the
+    signal p >= 0.5 over the logged absences (``return_skill``), 0 before 5 returns.
+    The Brier scores are still reported; they no longer drive the maturity (a few
+    long absences dominate a per-entry Brier).
     """
     n_eff = effective_episodes(episodes, now, half_life_days)
     data_factor = 1.0 - math.exp(-n_eff / EPISODE_SCALE)
@@ -327,8 +391,10 @@ def maturity_report(
         bs, ref = scores
         if ref > 1e-9:
             bss = 1.0 - bs / ref
-            if len(resolved) >= MIN_RESOLVED_FOR_SKILL:
-                skill = min(max(bss / BSS_FULL, 0.0), 1.0)
+    rs = return_skill(resolved, now, half_life_days)
+    if rs.count >= MIN_RETURNS_FOR_SKILL and rs.recall is not None:
+        raw = rs.recall - FALSE_ALARM_WEIGHT * (rs.false_alarms_per_return or 0.0)
+        skill = min(max(raw / RECALL_FULL, 0.0), 1.0)
     return MaturityReport(
         maturity=data_factor * skill,
         effective_episodes=n_eff,
@@ -340,4 +406,6 @@ def maturity_report(
         fusion=fusion,
         active_model=active_model,
         candidate_brier=dict(candidate_brier or {}),
+        return_recall=rs.recall,
+        false_alarms_per_return=rs.false_alarms_per_return,
     )

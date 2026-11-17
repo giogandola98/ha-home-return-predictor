@@ -1,52 +1,78 @@
-"""Optional gradient-boosting challenger: option, numpy on demand, background training."""
+"""Single kernel engine: the retired challenger option and v1 learned-engine state."""
 
 from __future__ import annotations
 
-import asyncio
-import logging
-import threading
-from collections.abc import Generator
-from datetime import datetime
+from datetime import timedelta
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
-import pytest
 from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResultType
-from homeassistant.requirements import RequirementsNotFound
+from homeassistant.util import dt as dt_util
 from pytest_homeassistant_custom_component.common import MockConfigEntry
 
 from custom_components.home_return_predictor.const import (
     CONF_ENABLE_CHALLENGER,
-    CONF_HALF_LIFE_DAYS,
-    CONF_HORIZON_MINUTES,
-    CONF_MATURITY_THRESHOLD,
     CONF_PERSONS,
-    CONF_RETURN_THRESHOLD,
-    CONF_UPDATE_INTERVAL_MINUTES,
     DOMAIN,
-    NUMPY_REQUIREMENT,
 )
-from custom_components.home_return_predictor.hrp_core import KernelBayesReturnModel
+from custom_components.home_return_predictor.hrp_core import KernelBayesReturnModel, ModelConfig
+from custom_components.home_return_predictor.hrp_core.base import PresenceTransition
+from custom_components.home_return_predictor.hrp_core.challenger import (
+    N_CHALLENGER_FEATURES,
+    GBMChallenger,
+)
+from custom_components.home_return_predictor.hrp_core.maturity import LogEntry
 
-from .conftest import ALICE, BOB
+from .conftest import ALICE, BOB, HOME_LAT, HOME_LON, person_attrs
 
 COORD = "custom_components.home_return_predictor.coordinator"
 
 
-@pytest.fixture
-def enable_calls() -> Generator[list[tuple[int, bool]]]:
-    """Record enable_challenger(model, enabled) calls."""
-    calls: list[tuple[int, bool]] = []
+def _v1_state_with_gbm_champion() -> dict[str, Any]:
+    """A state written by the previous release: gbm champion, stacker, challenger."""
+    model = KernelBayesReturnModel(ModelConfig())
+    now = dt_util.utcnow()
+    transitions = []
+    for i in range(1, 31):
+        left = now - timedelta(days=i)
+        transitions += [
+            PresenceTransition(left, False),
+            PresenceTransition(left + timedelta(hours=8), True),
+        ]
+    model.load_history(transitions)
+    for i in range(50):
+        ts = now - timedelta(hours=5, minutes=10 * i)
+        model._log.resolved.append(
+            LogEntry(
+                ts,
+                0.1,
+                0.1,
+                None,
+                ts + timedelta(minutes=90),
+                0,
+                [0.0] * 7,
+                0.1,
+                [0.0] * N_CHALLENGER_FEATURES,
+            )  # fmt: skip
+        )
+    gbm = GBMChallenger()
+    gbm.fit([[0.0] * N_CHALLENGER_FEATURES] * 4, [0, 0, 0, 0])
+    data = model.to_dict()
+    data.update(
+        version=1,
+        stacker={"weights": [0.1] * 8, "active": True, "trained_on": 400},
+        selection={"champion": "gbm", "streak": {}, "brier": {"gbm": 0.01}, "evaluations": 3},
+        challenger_enabled=True,
+        challenger=gbm.to_dict(),
+        last_training=now.isoformat(),
+    )
+    return data
 
-    def _enable(self: KernelBayesReturnModel, enabled: bool) -> None:
-        calls.append((id(self), enabled))
 
-    with patch.object(KernelBayesReturnModel, "enable_challenger", _enable):
-        yield calls
-
-
-def _enabled_entry(hass: HomeAssistant) -> MockConfigEntry:
+async def test_v1_state_with_gbm_champion_loads_on_the_kernel_engine(
+    hass: HomeAssistant, setup_home: None, hass_storage: dict[str, Any]
+) -> None:
     entry = MockConfigEntry(
         domain=DOMAIN,
         title="Home Return Predictor",
@@ -55,280 +81,69 @@ def _enabled_entry(hass: HomeAssistant) -> MockConfigEntry:
         options={CONF_PERSONS: [ALICE, BOB], CONF_ENABLE_CHALLENGER: True},
     )
     entry.add_to_hass(hass)
-    return entry
-
-
-async def _setup(hass: HomeAssistant, entry: MockConfigEntry) -> None:
-    assert await hass.config_entries.async_setup(entry.entry_id)
-    await hass.async_block_till_done(wait_background_tasks=True)
-
-
-async def test_options_flow_enables_challenger(
-    hass: HomeAssistant, loaded_entry: MockConfigEntry, enable_calls: list[tuple[int, bool]]
-) -> None:
-    """The boolean option is saved (historical key); the reload enables the challenger."""
-    assert loaded_entry.runtime_data.challenger_enabled is False
-    result = await hass.config_entries.options.async_init(loaded_entry.entry_id)
-    assert result["type"] is FlowResultType.FORM
-    user_input = {
-        CONF_PERSONS: [ALICE, BOB],
-        CONF_RETURN_THRESHOLD: 0.6,
-        CONF_MATURITY_THRESHOLD: 0.7,
-        CONF_HORIZON_MINUTES: 90,
-        CONF_HALF_LIFE_DAYS: 28,
-        CONF_UPDATE_INTERVAL_MINUTES: 2,
-        CONF_ENABLE_CHALLENGER: True,
+    stored = _v1_state_with_gbm_champion()
+    key = f"{DOMAIN}.{entry.entry_id}"
+    hass_storage[key] = {
+        "version": 1,
+        "minor_version": 1,
+        "key": key,
+        "data": {"schema": 1, "persons": {ALICE: {"model": stored, "is_home": True}}},
     }
     install = AsyncMock(return_value=None)
-    with (
-        patch(f"{COORD}.async_process_requirements", install),
-        patch(f"{COORD}.numpy_available", return_value=True),
-    ):
-        result = await hass.config_entries.options.async_configure(result["flow_id"], user_input)
-        await hass.async_block_till_done(wait_background_tasks=True)
-    assert result["type"] is FlowResultType.CREATE_ENTRY
-    assert loaded_entry.options[CONF_ENABLE_CHALLENGER] is True
-    assert loaded_entry.options["enable_sklearn_challenger"] is True  # stored key unchanged
-    install.assert_not_awaited()  # numpy importable: nothing to install
-    coordinator = loaded_entry.runtime_data
-    assert coordinator.challenger_requested is True
-    assert coordinator.challenger_enabled is True
-    models = {id(rt.model) for rt in coordinator.persons.values()}
-    assert {mid for mid, enabled in enable_calls if enabled} == models
-
-
-async def test_disabled_by_default_never_installs(
-    hass: HomeAssistant,
-    setup_home: None,
-    config_entry: MockConfigEntry,
-    enable_calls: list[tuple[int, bool]],
-) -> None:
-    """Default off: no install attempt, challenger explicitly disabled on every model."""
-    install = AsyncMock()
     with patch(f"{COORD}.async_process_requirements", install):
-        await _setup(hass, config_entry)
-    install.assert_not_awaited()
-    coordinator = config_entry.runtime_data
+        assert await hass.config_entries.async_setup(entry.entry_id)
+        await hass.async_block_till_done(wait_background_tasks=True)
+    install.assert_not_awaited()  # numpy is never installed any more
+    coordinator = entry.runtime_data
     assert coordinator.challenger_enabled is False
-    assert enable_calls and all(not enabled for _, enabled in enable_calls)
+    model = coordinator.persons[ALICE].model
+    assert len(model.episodes()) == len(stored["episodes"])
+    assert len(model._log.resolved) == 50  # prediction log kept
+    # leave: a defined prediction from the kernel engine
+    lat = HOME_LAT + 5_000 / 111_195
+    hass.states.async_set(ALICE, "not_home", person_attrs("Alice", lat, HOME_LON))
+    await hass.async_block_till_done()
+    await coordinator.async_refresh()
+    p = float(hass.states.get("sensor.alice_return_probability").state)
+    assert 0 < p < 100
     attrs = hass.states.get("sensor.alice_model_maturity").attributes
-    assert attrs["challenger_enabled"] is False
-    assert attrs["active_model"] == "kernel_bayes"
-    assert "candidate_brier" in attrs and "sklearn_available" in attrs
-    assert attrs["numpy_available"] == attrs["sklearn_available"]
+    assert attrs["active_model"] == "kernel_bayes" and attrs["challenger_enabled"] is False
     assert hass.states.get("binary_sensor.alice_returning").attributes["active_model"] == (
         "kernel_bayes"
     )
-    assert hass.states.get("sensor.alice_return_reason").attributes["active_model"] == (
-        "kernel_bayes"
-    )
+    saved = coordinator.persons[ALICE].model.to_dict()
+    assert saved["version"] == 2
+    assert not {"stacker", "selection", "challenger", "last_training"} & set(saved)
 
 
-async def test_enable_with_numpy_present_skips_install(
-    hass: HomeAssistant, setup_home: None, enable_calls: list[tuple[int, bool]]
-) -> None:
-    """numpy already importable (the usual HA case): no install attempt at all."""
-    entry = _enabled_entry(hass)
-    with (
-        patch(f"{COORD}.async_process_requirements", AsyncMock(return_value=None)) as install,
-        patch.object(KernelBayesReturnModel, "challenger_due", return_value=False),
-    ):
-        await _setup(hass, entry)  # the real numpy_available (numpy is a test dependency)
-    install.assert_not_awaited()
-    coordinator = entry.runtime_data
-    assert coordinator.challenger_enabled is True
-    assert coordinator.numpy_available is True
-    models = {id(rt.model) for rt in coordinator.persons.values()}
-    assert {mid for mid, enabled in enable_calls if enabled} == models
-    attrs = hass.states.get("sensor.alice_model_maturity").attributes
-    assert attrs["challenger_enabled"] is True
-    assert attrs["numpy_available"] is True
-    assert attrs["sklearn_available"] is True  # deprecated alias
-
-
-async def test_enable_install_success(
-    hass: HomeAssistant, setup_home: None, enable_calls: list[tuple[int, bool]]
-) -> None:
-    """numpy missing: it is installed (unversioned) and the challenger enabled."""
-    entry = _enabled_entry(hass)
-    with (
-        patch(f"{COORD}.async_process_requirements", AsyncMock(return_value=None)) as install,
-        patch(f"{COORD}.numpy_available", side_effect=[False, True]),
-        patch.object(KernelBayesReturnModel, "challenger_due", return_value=False),
-    ):
-        await _setup(hass, entry)
-    install.assert_awaited_once_with(hass, DOMAIN, ["numpy"])
-    coordinator = entry.runtime_data
-    assert coordinator.challenger_enabled is True
-    assert coordinator.numpy_available is True
-    assert coordinator.sklearn_available is True
-    models = {id(rt.model) for rt in coordinator.persons.values()}
-    assert {mid for mid, enabled in enable_calls if enabled} == models
-    attrs = hass.states.get("sensor.alice_model_maturity").attributes
-    assert attrs["challenger_enabled"] is True
-    assert attrs["sklearn_available"] is True
-
-
-async def test_enable_install_failure(
-    hass: HomeAssistant,
-    setup_home: None,
-    enable_calls: list[tuple[int, bool]],
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """A failed install only logs a warning; the champion keeps predicting."""
-    entry = _enabled_entry(hass)
-    install = AsyncMock(side_effect=RequirementsNotFound(DOMAIN, [NUMPY_REQUIREMENT]))
-    caplog.set_level(logging.WARNING)
-    with (
-        patch(f"{COORD}.async_process_requirements", install),
-        patch(f"{COORD}.numpy_available", return_value=False),
-    ):
-        await _setup(hass, entry)
-    coordinator = entry.runtime_data
-    assert coordinator.challenger_enabled is False
-    assert all(not enabled for _, enabled in enable_calls)
-    warnings = [r for r in caplog.records if "challenger stays disabled" in r.getMessage()]
-    assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
-    install.assert_awaited_once_with(hass, DOMAIN, [NUMPY_REQUIREMENT])
-    assert hass.states.get("sensor.alice_return_probability").state not in (
-        "unavailable",
-        "unknown",
-    )
-
-
-async def test_training_scheduled_once_at_a_time(
-    hass: HomeAssistant, setup_home: None, enable_calls: list[tuple[int, bool]]
-) -> None:
-    """Due challengers train in the background, one fit at a time, without the person lock.
-
-    snapshot (locked) -> fit (unlocked, heavy) -> apply (locked); updates proceed
-    while a fit is in flight.
-    """
-    entry = _enabled_entry(hass)
-    release = threading.Event()
-    guard = threading.Lock()
-    trained: list[int] = []
-    applied: list[int] = []
-    running = 0
-    max_running = 0
-
-    def _due(self: KernelBayesReturnModel, now: datetime) -> bool:
-        with guard:
-            return id(self) not in trained
-
-    def _snapshot(self: KernelBayesReturnModel) -> dict[str, Any]:
-        return {"model": id(self)}
-
-    def _fit(snapshot: dict[str, Any], now: datetime) -> dict[str, Any]:
-        nonlocal running, max_running
-        with guard:
-            running += 1
-            max_running = max(max_running, running)
-        release.wait(5)
-        with guard:
-            running -= 1
-            trained.append(snapshot["model"])
-        return {"model": snapshot["model"]}
-
-    def _apply(self: KernelBayesReturnModel, result: Any, now: datetime) -> dict[str, Any]:
-        assert result["model"] == id(self)
-        applied.append(id(self))
-        return {"trained": True, "reason": "ok", "rows": 0, "seconds": 0.0, "brier": {}}
-
-    with (
-        patch(f"{COORD}.async_process_requirements", AsyncMock(return_value=None)),
-        patch(f"{COORD}.numpy_available", return_value=True),
-        patch.object(KernelBayesReturnModel, "challenger_due", _due),
-        patch.object(KernelBayesReturnModel, "challenger_snapshot", _snapshot),
-        patch.object(KernelBayesReturnModel, "fit_challenger", staticmethod(_fit)),
-        patch.object(KernelBayesReturnModel, "apply_challenger", _apply),
-    ):
-        assert await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
-        coordinator = entry.runtime_data
-        for _ in range(200):  # wait for the challenger setup + refresh + first training
-            if running:
-                break
-            await asyncio.sleep(0.01)
-        assert running == 1
-        assert coordinator.training_persons == {ALICE, BOB}
-        # The fit runs without the person locks: an update completes meanwhile and
-        # schedules nothing new.
-        assert not any(rt.lock.locked() for rt in coordinator.persons.values())
-        await asyncio.wait_for(coordinator.async_refresh(), 5)
-        assert coordinator.last_update_success
-        assert running == 1 and not trained
-        release.set()
-        await hass.async_block_till_done(wait_background_tasks=True)
-    models = {id(rt.model) for rt in coordinator.persons.values()}
-    assert sorted(trained) == sorted(models)  # each person exactly once
-    assert sorted(applied) == sorted(models)
-    assert max_running == 1
-    assert coordinator.training_persons == set()
-
-
-async def test_reset_during_fit_discards_stale_result(
+async def test_options_flow_hides_and_keeps_the_retired_option(
     hass: HomeAssistant, setup_home: None
 ) -> None:
-    """A fit in flight while the person is reset must not touch the fresh model."""
-    entry = _enabled_entry(hass)
-    release = threading.Event()
-    started = threading.Event()
-    summaries: list[dict[str, Any]] = []
-    scheduled: set[int] = set()
-    real_apply = KernelBayesReturnModel.apply_challenger
-
-    def _due(self: KernelBayesReturnModel, now: datetime) -> bool:
-        if not scheduled:  # one training only (the first person checked)
-            scheduled.add(id(self))
-            return True
-        return False
-
-    def _fit(snapshot: dict[str, Any], now: datetime) -> dict[str, Any]:
-        started.set()
-        release.wait(5)
-        # A result that would promote gbm if it were applied.
-        return {
-            "status": "ok",
-            "rows": 5000,
-            "resolved_total": 1234,
-            "generation": snapshot["generation"],
-            "seconds": 0.0,
-            "brier": {"kernel_bayes": 0.2, "learned_fusion": 0.2, "gbm": 0.01},
-            "weights": [0.0] * 8,
-            "challenger": object(),
-        }
-
-    def _apply(self: KernelBayesReturnModel, result: Any, now: datetime) -> dict[str, Any]:
-        summary = real_apply(self, result, now)
-        summaries.append(summary)
-        return summary
-
-    with (
-        patch(f"{COORD}.async_process_requirements", AsyncMock(return_value=None)),
-        patch(f"{COORD}.numpy_available", return_value=True),
-        patch.object(KernelBayesReturnModel, "challenger_due", _due),
-        patch.object(KernelBayesReturnModel, "fit_challenger", staticmethod(_fit)),
-        patch.object(KernelBayesReturnModel, "apply_challenger", _apply),
-    ):
-        assert await hass.config_entries.async_setup(entry.entry_id)
-        await hass.async_block_till_done()
-        coordinator = entry.runtime_data
-        for _ in range(200):
-            if started.is_set():
-                break
-            await asyncio.sleep(0.01)
-        assert started.is_set()
-        await asyncio.wait_for(coordinator.async_reset(ALICE), 5)
-        await asyncio.wait_for(coordinator.async_reset(BOB), 5)
-        release.set()
-        await hass.async_block_till_done(wait_background_tasks=True)
-    assert len(summaries) == 1 and summaries[0]["reason"] == "stale"
-    assert summaries[0]["trained"] is False
-    for runtime in coordinator.persons.values():
-        model = runtime.model
-        assert model.generation == 1
-        assert model.selector.champion == "kernel_bayes"
-        assert model.selector.brier == {}
-        assert model._resolved_at_training == 0
-        assert model._last_training is None
+    entry = MockConfigEntry(
+        domain=DOMAIN,
+        title="Home Return Predictor",
+        unique_id=DOMAIN,
+        data={CONF_PERSONS: [ALICE, BOB], "home_zone": "zone.home"},
+        options={CONF_PERSONS: [ALICE, BOB], CONF_ENABLE_CHALLENGER: True},
+    )
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    result = await hass.config_entries.options.async_init(entry.entry_id)
+    assert result["type"] is FlowResultType.FORM
+    assert CONF_ENABLE_CHALLENGER not in {str(k) for k in result["data_schema"].schema}
+    result = await hass.config_entries.options.async_configure(
+        result["flow_id"],
+        {
+            CONF_PERSONS: [ALICE, BOB],
+            "return_threshold": 0.6,
+            "maturity_threshold": 0.7,
+            "horizon_minutes": 90,
+            "half_life_days": 28,
+            "update_interval_minutes": 2,
+        },
+    )
+    await hass.async_block_till_done()
+    assert result["type"] is FlowResultType.CREATE_ENTRY
+    assert entry.options[CONF_ENABLE_CHALLENGER] is True  # read and ignored, never deleted
+    assert entry.runtime_data.challenger_enabled is False

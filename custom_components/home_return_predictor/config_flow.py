@@ -8,7 +8,6 @@ import voluptuous as vol
 from homeassistant.config_entries import ConfigFlow, ConfigFlowResult, OptionsFlowWithReload
 from homeassistant.core import callback
 from homeassistant.helpers.selector import (
-    BooleanSelector,
     EntitySelector,
     EntitySelectorConfig,
     NumberSelector,
@@ -28,7 +27,6 @@ from .const import (
     CONF_RETURN_THRESHOLD,
     CONF_UPDATE_INTERVAL_MINUTES,
     DEFAULT_ARRIVAL_QUANTILE,
-    DEFAULT_ENABLE_CHALLENGER,
     DEFAULT_HALF_LIFE_DAYS,
     DEFAULT_HOME_ZONE,
     DEFAULT_HORIZON_MINUTES,
@@ -95,7 +93,11 @@ class HomeReturnPredictorOptionsFlow(OptionsFlowWithReload):
             if not user_input.get(CONF_PERSONS):
                 errors[CONF_PERSONS] = "no_persons"
             else:
-                return self.async_create_entry(data=user_input)
+                data = dict(user_input)
+                # Retired option: no longer shown, its stored value is kept untouched.
+                if CONF_ENABLE_CHALLENGER in self.config_entry.options:
+                    data[CONF_ENABLE_CHALLENGER] = self.config_entry.options[CONF_ENABLE_CHALLENGER]
+                return self.async_create_entry(data=data)
         entry = self.config_entry
         current = {
             CONF_PERSONS: entry.options.get(CONF_PERSONS) or entry.data.get(CONF_PERSONS, []),
@@ -104,10 +106,15 @@ class HomeReturnPredictorOptionsFlow(OptionsFlowWithReload):
             CONF_HORIZON_MINUTES: DEFAULT_HORIZON_MINUTES,
             CONF_HALF_LIFE_DAYS: DEFAULT_HALF_LIFE_DAYS,
             CONF_UPDATE_INTERVAL_MINUTES: DEFAULT_UPDATE_INTERVAL_MINUTES,
-            CONF_ENABLE_CHALLENGER: DEFAULT_ENABLE_CHALLENGER,
             CONF_ARRIVAL_QUANTILE: DEFAULT_ARRIVAL_QUANTILE,
         }
-        current.update({k: v for k, v in entry.options.items() if k != CONF_PERSONS})
+        current.update(
+            {
+                k: v
+                for k, v in entry.options.items()
+                if k not in (CONF_PERSONS, CONF_ENABLE_CHALLENGER)
+            }
+        )
         if user_input is not None:
             current.update(user_input)
         schema = vol.Schema(
@@ -121,7 +128,6 @@ class HomeReturnPredictorOptionsFlow(OptionsFlowWithReload):
                 vol.Optional(CONF_HOLIDAY_CALENDAR): EntitySelector(
                     EntitySelectorConfig(domain="calendar")
                 ),
-                vol.Optional(CONF_ENABLE_CHALLENGER): BooleanSelector(),
                 vol.Optional(CONF_ARRIVAL_QUANTILE): _number(0.05, 0.95, 0.05),
             }
         )

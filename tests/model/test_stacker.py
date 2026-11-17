@@ -2,19 +2,15 @@
 
 from __future__ import annotations
 
-import json
 import random
-from datetime import timedelta
 
 import pytest
-from model_helpers import CONFIG, local
+from model_helpers import local
 
-from hrp_core import KernelBayesReturnModel
 from hrp_core.evidence import LRCalibrator
 from hrp_core.fusion import fuse_probability
 from hrp_core.maturity import LogEntry
 from hrp_core.stacker import CENTRE, Stacker, bayes_from_features, build_features
-from hrp_core.synthetic import replay_online, rotating_shift_person
 
 
 def test_untrained_stacker_equals_bayes() -> None:
@@ -58,28 +54,3 @@ class InflatedCalibrator(LRCalibrator):
 
     def update(self, approach_class: str, returned: bool) -> None:
         return None
-
-
-def test_learned_fusion_beats_miscalibrated_bayes() -> None:
-    tl = rotating_shift_person(days=80, seed=6, drive_by_rate=0.6)
-    model = KernelBayesReturnModel(CONFIG)
-    model.calibrator = InflatedCalibrator()
-    cutoff = tl.absences[0].left_at + timedelta(days=50)
-    learned_sq = bayes_sq = 0.0
-    n = 0
-    for rec in replay_online(model, tl):
-        if rec.ts < cutoff:
-            continue
-        o = 1.0 if rec.truth else 0.0
-        learned_sq += (rec.prediction.probability - o) ** 2
-        bayes_sq += (rec.prediction.reason["probability_bayes"] - o) ** 2
-        n += 1
-    st = model.stacker
-    assert st.active and model.maturity(tl.absences[-1].returned_at).fusion == "learned"
-    assert st.holdout_brier_learned is not None and st.holdout_brier_bayes is not None
-    assert st.holdout_brier_learned < st.holdout_brier_bayes
-    assert learned_sq / n < bayes_sq / n
-    assert st.weights[2] < 1.0  # learned to trust the (inflated) GPS LR less
-
-    restored = KernelBayesReturnModel.from_dict(json.loads(json.dumps(model.to_dict())), CONFIG)
-    assert restored.stacker.weights == st.weights and restored.stacker.active

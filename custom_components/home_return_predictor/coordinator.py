@@ -318,7 +318,10 @@ class HRPCoordinator(DataUpdateCoordinator[HRPData]):
         self.persons: dict[str, PersonRuntime] = {}
         self.last_predictions: dict[str, Prediction] = {}
         self._lock = asyncio.Lock()
-        self.challenger_requested: bool = bool(
+        # The gradient-boosting challenger is retired (single kernel engine): its
+        # stored option is read and ignored, numpy is never installed.
+        self.challenger_requested: bool = False
+        self.challenger_option_ignored: bool = bool(
             options.get(CONF_ENABLE_CHALLENGER, DEFAULT_ENABLE_CHALLENGER)
         )
         self.challenger_enabled: bool = False  # requested and numpy importable

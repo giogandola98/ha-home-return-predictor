@@ -72,3 +72,28 @@ def test_duration_baseline_ignores_time_of_day() -> None:
     early = duration_baseline(keys, [], minutes_away=60, **kw)
     late = duration_baseline(keys, [], minutes_away=420, **kw)
     assert early < 0.15 and late > 0.8
+
+
+def test_return_skill_counts_caught_returns_and_false_alarms() -> None:
+    from datetime import timedelta
+
+    from hrp_core.maturity import return_skill
+
+    start = local(__import__("datetime").date(2026, 3, 2), 480)
+    entries = []
+
+    def absence(t0, ps_and_outcomes):
+        for i, (p, o) in enumerate(ps_and_outcomes):
+            ts = t0 + timedelta(minutes=10 * i)
+            entries.append(LogEntry(ts, p, None, None, ts + timedelta(minutes=90), outcome=o))
+
+    # caught, with an early false alarm before it
+    absence(start, [(0.1, 0), (0.7, 0), (0.1, 0), (0.1, 0), (0.6, 1), (0.8, 1)])
+    # missed
+    absence(start + timedelta(hours=5), [(0.1, 0), (0.2, 1), (0.3, 1)])
+    # signal on early and staying on until the return: not a false alarm
+    absence(start + timedelta(hours=10), [(0.6, 0), (0.7, 0), (0.9, 1)])
+    rs = return_skill(entries, entries[-1].ts, 1e6)
+    assert rs.count == 3
+    assert rs.recall == pytest.approx(2 / 3, abs=1e-6)
+    assert rs.false_alarms_per_return == pytest.approx(1 / 3, abs=1e-6)

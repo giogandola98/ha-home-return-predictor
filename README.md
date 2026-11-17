@@ -33,7 +33,7 @@ through the included blueprint, but the sensors can be used in any automation.
 13. [Thermal plugins: comparison and recommended setup](#thermal-plugins-comparison-and-recommended-setup)
 14. [Automation examples](#automation-examples)
 15. [The first days of learning](#the-first-days-of-learning)
-16. [Challenger model (gradient boosting, optional)](#challenger-model-gradient-boosting-optional)
+16. [Challenger model (retired)](#challenger-model-retired)
 17. [For developers: simulation and tests](#for-developers-simulation-and-tests)
 18. [Known limitations](#known-limitations)
 
@@ -110,12 +110,14 @@ These are two different numbers and should be read together.
 Maturity grows with:
 
 - **amount of data**: number of absences (recency-weighted);
-- **demonstrated skill**: the model logs its own predictions and later compares them
-  with what actually happened. It computes the **Brier score** (mean squared error,
-  lower = better) and compares it with a deliberately simple **baseline**: the return
-  probability computed only from "how long they have been away", without departure
-  time or weekday. The *Brier skill score* (`1 − brier / baseline`) therefore measures
-  how much the learnt habits are worth; at least 30 verified predictions are needed.
+- **demonstrated skill on returns**: the model logs its own predictions and later
+  compares them with what actually happened, **per return**: the share of real
+  returns that the signal `p ≥ 0.5` caught within the horizon before the arrival
+  (`return_recall`), minus half the false-alarm runs per return
+  (`false_alarms_per_return`); full skill at 0.8, defined after 5 returns. The
+  **Brier score** and its *skill score* against a duration-only baseline are still
+  reported as attributes but no longer drive the maturity: with one log entry every
+  10 minutes, a few long absences used to dominate it (maturity stuck around 20%).
 
 A 90% probability with 20% maturity is a guess; with 85% maturity it is a prediction
 you can act on.
@@ -130,7 +132,7 @@ Each person has a `select.<p>_mode`:
 |---|---|
 | `learning` | Everything is computed and published (including `returning`), but with attribute `advisory: true`. Meant for observing without acting. |
 | `live` | Fully operational predictions, `advisory: false`. |
-| `auto` (default) | Switches to live when maturity exceeds the threshold (default 70%) and back to learning if it drops below threshold − 10 points (**hysteresis**: no flip-flopping). |
+| `auto` (default) | Switches to live when maturity exceeds the threshold (default 70%) and back to learning if it drops below threshold − 10 points (**hysteresis**: no flip-flopping). Since the return-based maturity (state v2) it may reach live sooner than before: choose `learning` explicitly if you prefer to keep observing. |
 
 The house sensors have `mode: live` only if every away person (they all feed
 `away_probability`, `candidates` and the next ETA) is live; with nobody away, if at
@@ -192,7 +194,7 @@ Options (Configure):
 | Half-life | 28 days | How quickly old habits are forgotten |
 | Update interval | 2 min | Periodic recalculation (in addition to event-driven updates) |
 | Holiday calendar | — | Optional `calendar.*`: days with events are treated as holidays |
-| Challenger model (gradient boosting, numpy) | off | Trains an alternative numpy model in the background, used only if it is better (see [below](#challenger-model-gradient-boosting-optional)) |
+| Challenger model | — | Retired: no longer shown, a stored value is ignored (see [below](#challenger-model-retired)) |
 | Arrival quantile | 0.25 | Quantile of the first arrival published by `sensor.house_next_arrival`. Preheating `L` minutes before it = heating as soon as P(arrival within `L`) reaches this value: lower = warm more often, higher = save more |
 
 ---
@@ -206,7 +208,7 @@ For each person `<p>`:
 | `binary_sensor.<p>_returning` | binary | On when the probability exceeds the threshold. Attributes: `probability`, `eta`, `mode`, `advisory`, `reason`, `active_model` |
 | `sensor.<p>_return_probability` | % | Probability of returning within the horizon (100 when at home) |
 | `sensor.<p>_return_eta` | timestamp | Estimated ETA (published while the person is away) |
-| `sensor.<p>_model_maturity` | % | Maturity. Attributes: `episodes`, `brier_score`, `baseline_brier_score`, `brier_skill_score`, `active_model`, `candidate_brier`, `challenger_enabled`, `numpy_available` (`sklearn_available`: deprecated alias) |
+| `sensor.<p>_model_maturity` | % | Maturity. Attributes: `episodes`, `return_recall`, `false_alarms_per_return`, `brier_score`, `baseline_brier_score`, `brier_skill_score`, `active_model`, `candidate_brier`, `challenger_enabled`, `numpy_available` (`sklearn_available`: deprecated alias) |
 | `sensor.<p>_return_reason` | text | Human-readable explanation of the current estimate |
 | `select.<p>_mode` | select | `auto` / `learning` / `live` |
 
@@ -545,54 +547,21 @@ the shift worker. You can force `live` from the select if you trust it earlier.
 
 ---
 
-## Challenger model (gradient boosting, optional)
+## Challenger model (retired)
 
-A **champion/challenger** scheme: the built-in model (kernel Bayesian, pure Python)
-always remains the *champion*. If you enable the **Challenger model (gradient
-boosting, numpy)** option (off by default), the integration trains a *challenger* in
-the background on past verified predictions, and uses it **only when it is
-demonstrably better**.
+Earlier releases could train a gradient-boosting *challenger* (numpy) and a learnt
+fusion of the Bayesian terms, served only while they beat the built-in model on a
+holdout. Measured on the house metric (`scripts/replay/engine_compare.py`), the
+built-in kernel prior × calibrated GPS evidence was never worse, while the selection
+on autocorrelated log entries could keep a learnt champion after a trip. Since state
+version 2 **one engine serves** (`active_model` is always `kernel_bayes`):
 
-**Why not scikit-learn.** Early versions used scikit-learn's
-`HistGradientBoostingClassifier`. On a real Home Assistant OS install (Alpine Linux,
-musl, Python 3.14) installation failed: scikit-learn does not publish *musllinux*
-wheels, so pip tries to build it from source and stops (no meson or compiler in the
-container). numpy, on the other hand, has musl wheels and is already a Home Assistant
-dependency (version pinned in its constraints). The challenger is therefore now a
-home-grown gradient boosting implementation that uses only numpy (`hrp_core/gbm.py`).
-
-- **What it is**: histogram gradient boosting for binary log-loss: features binned
-  into ≤ 64 quantile bins, trees of depth ≤ 3 with at least 20 samples per leaf,
-  learning rate 0.1, ≤ 80 trees, L2 regularisation on leaves, recency weights. The
-  features are the same as in the prediction log (prior probability, GPS likelihood
-  ratio, time away, departure time and current time, holiday, distance, speed,
-  Bayesian probability).
-- **Nothing to install (usually)**: if numpy is already importable, as in normal Home
-  Assistant installs, no installation is attempted. Otherwise `numpy` is requested
-  without a version (HA's constraints resolve it). If that fails, a warning is logged
-  and the built-in model carries on; nothing breaks.
-- **Cost on an Intel N100**: a single thread, background training at most every 6
-  hours (or after 150 new verified predictions), one training at a time, never in the
-  Home Assistant event loop. Measured on an N100 (120-day simulation, log of 3000
-  predictions): on average ~0.35 s (max ~0.5 s) per training (evaluation + full
-  retraining). Prediction is pure Python (< 0.1 ms) and does not use numpy.
-- **Survives restarts**: the exported trees are a small JSON (about 40 KB per person)
-  saved with the state, so a promoted challenger keeps serving right after a restart,
-  without waiting for retraining.
-- **Automatic switch only when better**: the challenger becomes active only if, on
-  recent data **not seen in training** (the last 20% of verified predictions), it has
-  a Brier score at least **3%** better for **2 consecutive evaluations** and with at
-  least **400 verified predictions**. If it then does worse than the built-in model,
-  it switches back to the built-in model **immediately**.
-- **Which model is active**: see the attributes of `sensor.<p>_model_maturity`:
-  `active_model` (`kernel_bayes` = built-in, `learned_fusion` = learnt fusion, `gbm` =
-  challenger), `candidate_brier` (Brier of each candidate at the last evaluation;
-  lower is better), `challenger_enabled`, `numpy_available` (`sklearn_available` is
-  kept for one release as a deprecated alias). `active_model` also appears on
-  `binary_sensor.<p>_returning`, on `sensor.<p>_return_reason` (and in the explanation
-  text) and in the diagnostics. State saved under the old name `sklearn_gbm` is read
-  as `gbm`; the option key (`enable_sklearn_challenger`) is unchanged to preserve the
-  existing setting.
+- the option *Challenger model* is no longer shown; its stored value is read and
+  ignored (never deleted), numpy is never installed;
+- saved states of earlier releases load unchanged (episodes, trips, GPS calibration and
+  prediction log kept); their stacker / selection / challenger blocks are dropped;
+- `candidate_brier`, `challenger_enabled`, `numpy_available` / `sklearn_available`
+  stay as attributes for compatibility.
 
 ---
 
@@ -604,7 +573,6 @@ with no Home Assistant imports.
 ```bash
 python -m venv .venv && .venv/bin/pip install -r requirements_test.txt
 .venv/bin/python scripts/simulate.py          # months of synthetic data, accuracy/maturity curve
-.venv/bin/python scripts/simulate.py --gbm    # also the gradient boosting challenger (training times)
 .venv/bin/python -m pytest                    # all tests
 .venv/bin/python -m pytest tests/model -q     # model and preset_logic only (no HA)
 .venv/bin/python -m pytest tests/blueprint -q # VTherm blueprint run in a test HA
