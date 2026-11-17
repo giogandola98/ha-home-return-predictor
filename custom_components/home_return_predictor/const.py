@@ -19,9 +19,7 @@ CONF_HORIZON_MINUTES: Final = "horizon_minutes"
 CONF_HALF_LIFE_DAYS: Final = "half_life_days"
 CONF_UPDATE_INTERVAL_MINUTES: Final = "update_interval_minutes"
 CONF_HOLIDAY_CALENDAR: Final = "holiday_calendar"  # optional calendar.* entity
-# Challenger option. The stored key keeps its historical name (the challenger used
-# scikit-learn until scikit-learn proved uninstallable on HA OS) so that existing
-# config entries keep their setting; only the UI label changed.
+# Retired challenger option: no longer shown; a stored value is read and kept.
 CONF_ENABLE_CHALLENGER: Final = "enable_sklearn_challenger"
 # Quantile of the first arrival published by sensor.house_next_arrival: preheating
 # ``L`` minutes before it is the cost rule "P(arrival <= now + L) >= quantile".
@@ -41,10 +39,6 @@ MATURITY_HYSTERESIS: Final = 0.1
 RETURNING_OFF_HYSTERESIS: Final = 0.05  # returning stays on until p < threshold - this
 HOUSE_ETA_MIN_PROBABILITY: Final = 0.25  # away persons considered for the house ETA
 
-# Optional gradient-boosting challenger: needs numpy, installed at runtime only when
-# enabled and not already importable. No version: HA's package constraints pin numpy
-# (a musl wheel exists for the pinned version, unlike scikit-learn).
-NUMPY_REQUIREMENT: Final = "numpy"
 DEFAULT_ACTIVE_MODEL: Final = "kernel_bayes"
 
 # Modes
