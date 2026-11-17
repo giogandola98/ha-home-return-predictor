@@ -65,8 +65,20 @@ class Timeline:
     transitions: list[PresenceTransition] = field(default_factory=list)
     fixes: list[PositionFix] = field(default_factory=list)
     zone_events: list[ZoneEvent] = field(default_factory=list)
+    homeward: list[datetime] = field(default_factory=list)  # start of each drive home
     style: str = "android"  # GPS reporting: "android" (dense) or "iphone" (sparse)
     _fix_times: list[datetime] = field(default_factory=list, repr=False)
+
+    def recent_fixes(
+        self, now: datetime, lookback: timedelta, since: datetime | None = None
+    ) -> list[PositionFix]:
+        """Fixes within ``lookback`` plus the newest older one (after ``since``), like the
+        integration's buffer."""
+        recent = self.fixes_between(now - lookback, now)
+        lo = bisect.bisect_left(self._fix_times, now - lookback)
+        if lo > 0 and (since is None or self.fixes[lo - 1].ts >= since):
+            return [self.fixes[lo - 1], *recent]
+        return recent
 
     def fixes_between(self, start: datetime, end: datetime) -> list[PositionFix]:
         """Fixes with start <= ts <= end, oldest first."""
@@ -157,6 +169,7 @@ def _build(
     writer = WRITERS[style](rng)
     transitions: list[PresenceTransition] = []
     zone_events: list[ZoneEvent] = []
+    homeward: list[datetime] = []
     for ab in clean:
         transitions.append(PresenceTransition(ab.left_at, False))
         transitions.append(PresenceTransition(ab.returned_at, True))
@@ -196,6 +209,7 @@ def _build(
             zone_events.append(ZoneEvent(back_start, ab.zone, False))
         writer.stay(here, back_start, current)
         writer.drive(back_start, current, 60.0, back_kmh)
+        homeward.append(back_start)
     fixes = sorted(writer.fixes, key=lambda f: f.ts)
     return Timeline(
         name=name,
@@ -205,6 +219,7 @@ def _build(
         fixes=fixes,
         zone_events=sorted(zone_events, key=lambda e: e.ts),
         style=style,
+        homeward=homeward,
         _fix_times=[f.ts for f in fixes],
     )
 
@@ -537,7 +552,7 @@ def replay_online(
                 now=t,
                 is_home=False,
                 left_at=ab.left_at,
-                fixes=timeline.fixes_between(t - lookback, t),
+                fixes=timeline.recent_fixes(t, lookback, ab.left_at),
             )
             pred = model.predict(inp)
             logged = model.log_prediction(inp, pred)

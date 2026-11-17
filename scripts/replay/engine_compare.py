@@ -68,7 +68,7 @@ def replay(
                 now=t,
                 is_home=False,
                 left_at=ab.left_at,
-                fixes=timeline.fixes_between(t - lookback, t),
+                fixes=timeline.recent_fixes(t, lookback, ab.left_at),
             )
             champion = model.selector.champion
             for engine in ENGINES:

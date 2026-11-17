@@ -260,6 +260,11 @@ mode: live
 advisory: false
 ```
 
+Once per absence, on the rising edge; it is **re-armed** when the probability stays
+below the threshold for 30 minutes in the same absence, so an early false alarm no
+longer swallows the event of the real return. Automations that assumed exactly one
+event per absence may now see two (or more) on such days.
+
 **Services**
 
 | Service | Effect |
